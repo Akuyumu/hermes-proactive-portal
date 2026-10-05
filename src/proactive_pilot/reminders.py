@@ -987,9 +987,17 @@ def load_effective_policy(
         return policy, None, ""
     policy = apply_user_config(policy, loaded.config)
     # Event authorisation comes ONLY from explicit calendar accounts. Mail
-    # accounts are never unioned into calendar access.
+    # accounts are never unioned into calendar access. When the configuration
+    # marks calendar scope as "legacy library discovery" (migrated from a policy
+    # that omitted account scope), authorisation must follow that discovery
+    # instead of collapsing to an empty (deny-everything) list.
+    advanced = loaded.config.get("advanced") or {}
+    discovery = advanced.get("legacy_account_discovery") if isinstance(advanced, dict) else None
+    accounts = [str(name) for name in (loaded.config.get("calendar", {}).get("accounts") or [])]
+    if not accounts and isinstance(discovery, list) and "calendar" in discovery:
+        return policy, None, ""
     aliases: list[str] = []
-    for name in (loaded.config.get("calendar", {}).get("accounts") or []):
+    for name in accounts:
         if name not in aliases:
             aliases.append(name)
     return policy, aliases, ""
