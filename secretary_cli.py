@@ -1061,6 +1061,10 @@ def _write_user_config(path: Path, payload: dict[str, Any], force: bool) -> str:
     import json as _json
     if path.exists() and path.read_text(encoding="utf-8").strip() and not force:
         return "kept"
+    # Never persist internal/derived keys (``_warnings``, ``_explicit_version``):
+    # they are caller-facing diagnostics, and writing them makes every later load
+    # warn about an unknown config key.
+    payload = {key: value for key, value in payload.items() if not str(key).startswith("_")}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     with contextlib.suppress(OSError):
