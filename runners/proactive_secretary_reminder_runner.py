@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Native-cron runner: the requested-reminder dispatcher.
+
+Installed by ``hermes secretary setup`` into the profile's scripts directory and
+run by the native scheduler with ``--no-agent`` on the one-minute cadence: its
+stdout is the single permitted reminder line, or empty.
+
+Before doing ANY work the runner checks the shared native enable/disable gate
+(``runtime_gate``): a plugin disabled in ``plugins.enabled``/``plugins.disabled``
+— or a removed plugin root or unreadable config — exits silently with empty
+stdout and never imports the pipeline, reads the reminder registry, dispatches,
+or produces a delivery payload. With no arguments (the scheduler case) it uses
+the plugin's profile-safe state/policy/preferences paths. Explicit arguments are
+forwarded unchanged so the same file can be exercised offline by tests.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+_EMBEDDED_ROOT = r"{{PLUGIN_ROOT}}"
+if _EMBEDDED_ROOT.startswith("{{"):
+    PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+else:
+    PLUGIN_ROOT = Path(_EMBEDDED_ROOT)
+for _entry in (str(PLUGIN_ROOT / "src"), str(PLUGIN_ROOT)):
+    if _entry not in sys.path:
+        sys.path.insert(0, _entry)
+
+
+def _native_gate() -> bool:
+    """Fail-closed native toggle check, run before any pipeline work.
+
+    Prints only a diagnostic to stderr; disabled/removed/unreadable always
+    returns False so the caller exits 0 with empty stdout.
+    """
+    try:
+        from runtime_gate import plugin_enabled
+        allowed = plugin_enabled(PLUGIN_ROOT)
+    except Exception as exc:  # noqa: BLE001 - a broken gate must fail closed
+        print(f"proactive-secretary: skipping run (gate unavailable: {exc})",
+              file=sys.stderr)
+        return False
+    if not allowed:
+        print("proactive-secretary: plugin is not enabled "
+              "(plugins.enabled); skipping run", file=sys.stderr)
+        return False
+    return True
+
+
+def _default_argv() -> list[str]:
+    import paths  # noqa: E402 - resolved from the installed plugin root
+    return [
+        "--state-dir", str(paths.state_dir()),
+        "--policy", str(paths.policy_path()),
+        "--preferences", str(paths.preferences_path()),
+        "dispatch",
+    ]
+
+
+if __name__ == "__main__":
+    if not _native_gate():
+        raise SystemExit(0)
+    os.environ.setdefault("PROACTIVE_FOLLOWTHROUGH_ROOT", str(PLUGIN_ROOT))
+    from proactive_pilot.reminders import main as _reminders_main  # noqa: E402
+    _argv = sys.argv[1:] or _default_argv()
+    raise SystemExit(_reminders_main(_argv))

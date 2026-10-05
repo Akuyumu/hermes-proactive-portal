@@ -1,0 +1,47 @@
+# Runtime state / data directories
+var/
+state/
+plugin-data/
+**/plugin-data/
+.hermes/
+
+# Policy + preference artifacts that must never be committed populated
+policy/policy.json
+policy/preferences.json
+**/policy.json
+**/preferences.json
+**/reminders.json
+**/notify_state.json
+
+# Caches and Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Secrets / local environment
+.env
+.env.*
+*.secret
+credentials*.json
+auth.json
+
+# Locks and transient files
+*.lock
+*.tmp
+.tmp-*
+
+# Local tool/session logs (may contain local paths or private data)
+plugin-events.jsonl
+*.log
+
+# Worker/reference inputs and build artifacts — not part of the shipped plugin
+references/
+PLUGIN_BUILD_SCOPE.md
+PLUGIN_CHECKPOINT.md

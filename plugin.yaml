@@ -1,0 +1,24 @@
+name: hermes-proactive-secretary
+version: 0.1.0
+kind: standalone
+platforms:
+  - linux
+  - macos
+description: >-
+  Proactive secretary for your own authorised mail, calendar and tasks plus
+  public sources: read-only collectors, a zero-tool evaluator, bounded
+  notification gates, an explicit requested-reminder registry, and one-command
+  native-cron setup. One command installs and verifies the two native jobs; one
+  command truthfully disables them.
+author: Hermes Plugin Community
+license: MIT
+tags:
+  - secretary
+  - proactive
+  - notifications
+  - reminders
+  - cron
+provides_skills:
+  - proactive-secretary
+provides_cli_commands:
+  - secretary
