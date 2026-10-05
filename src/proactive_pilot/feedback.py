@@ -220,6 +220,33 @@ def apply_action(prefs: dict[str, Any], action: dict[str, Any], now: datetime) -
     return result
 
 
+def find_records(prefs: dict[str, Any], record_id: str) -> list[dict[str, Any]]:
+    """Exact read-back of every record with ``record_id`` (typed CLI readback)."""
+    found: list[dict[str, Any]] = []
+    for key in ("explicit", "inferred", "snoozes"):
+        for record in prefs.get(key, []) or []:
+            if isinstance(record, dict) and str(record.get("id")) == str(record_id):
+                found.append({"collection": key, **record})
+    return found
+
+
+def receipt_for_action(before: dict[str, Any], after: dict[str, Any],
+                       action: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """The exact record an action created/affected, for the CLI readback receipt.
+
+    Pure read of already-persisted state: never writes and never invents a record.
+    """
+    name = action.get("action")
+    if name in {"list", "show", "noop"}:
+        return {}
+    if name in {"pause", "resume"}:
+        return {"paused": dict(after.get("paused") or {})}
+    rid = _new_id(action, now)
+    for record in find_records(after, rid):
+        return record
+    return {}
+
+
 def load_preferences_file(path: Path, *, strict: bool = False) -> dict[str, Any]:
     """Load preferences; in strict mode a corrupt file raises instead of resetting."""
     if not path.exists():

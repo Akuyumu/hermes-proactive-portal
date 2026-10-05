@@ -28,12 +28,25 @@ class CorruptStateError(RuntimeError):
     """
 
 
+def _refuse_symlink(path: Path) -> None:
+    """Fail closed rather than chmod/write through a symlinked artifact path.
+
+    ``os.chmod`` follows symlinks, so a symlinked file or directory could
+    silently retarget an owner-only write outside the private state root.
+    """
+    if os.path.islink(str(path)):
+        raise CorruptStateError(f"refusing symlinked path: {Path(path).name}")
+
+
 @contextmanager
 def file_lock(path: Path) -> Iterator[bool]:
     """Non-blocking single-writer advisory lock for one artifact path."""
+    _refuse_symlink(path)
+    _refuse_symlink(path.parent)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        os.chmod(path.parent, 0o700)
+        if not path.parent.is_symlink():
+            os.chmod(path.parent, 0o700)
     except OSError:
         pass
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -56,8 +69,11 @@ def file_lock(path: Path) -> Iterator[bool]:
 
 
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
+    _refuse_symlink(path)
+    _refuse_symlink(path.parent)
     path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
+    if not path.parent.is_symlink():
+        os.chmod(path.parent, 0o700)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -80,8 +96,10 @@ class StateStore:
     def __init__(self, root: Path, clock: Clock):
         self.root = Path(root)
         self.clock = clock
+        _refuse_symlink(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.root, 0o700)
+        if not self.root.is_symlink():
+            os.chmod(self.root, 0o700)
 
     # -- locking ---------------------------------------------------------
     @contextmanager

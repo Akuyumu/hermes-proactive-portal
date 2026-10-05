@@ -32,7 +32,8 @@ Load it when the user wants to:
 - set the plugin up for the first time;
 - see whether it is running and what it monitors;
 - pause, resume, disable or uninstall it;
-- record or inspect notification feedback;
+- record or inspect notification feedback (assistant-mediated corrections);
+- refresh or inspect the bounded assistant-mediated context snapshot;
 - save or inspect a public watch;
 - add or cancel a requested reminder;
 - understand why an alert was (or was not) sent.
@@ -178,7 +179,20 @@ Every command accepts `--json` and exits non-zero on failure.
 
 ## Feedback
 
-Use the validated command, never hand-edit JSON:
+Feedback is **assistant-mediated, never conversation surveillance**. The
+assistant listens to the user's explicit correction in the current conversation,
+translates it into a typed command, writes it, reads it back and shows a receipt.
+There is no automatic capture hook and no monitoring of unrelated conversations.
+
+Assistant-mediated correction workflow (do all four steps):
+
+1. **Interpret** the correction. If it is ambiguous, ask one clarifying question
+   — do not guess and do not write anything yet.
+2. **Apply** the narrowest typed command that matches the intent.
+3. **Read back** the exact affected record (`show --id`, or the `receipt` field
+   returned by the write) and confirm it matches the user's words.
+4. **Receipt**: tell the user the preference id, scope and (for a snooze)
+   expiry, or that it was a no-op/needs clarification.
 
 ```bash
 hermes secretary feedback add-explicit --kind mail --match newsletter \
@@ -186,25 +200,76 @@ hermes secretary feedback add-explicit --kind mail --match newsletter \
 hermes secretary feedback add-explicit --kind mail --match career \
   --scope "generic career broadcasts" --provenance "user correction" \
   --conditional --exception "unusually fitting"
+hermes secretary feedback add-explicit --kind feed --match "formula one" \
+  --scope "F1 only" --provenance "user correction" \
+  --expires-at <timezone-aware ISO>          # time-boxed durable rule
 hermes secretary feedback add-inferred --kind mail --match career \
   --note "tentative pattern" --confidence low --provenance "observed replies"
 hermes secretary feedback snooze --kind mail --match career --scope "today only" \
-  --provenance "user said not today" --until <timezone-aware ISO>
+  --provenance "user said not today" --minutes 240
 hermes secretary feedback pause --provenance "user asked"
 hermes secretary feedback resume --provenance "user asked"
 hermes secretary feedback list
-hermes secretary feedback forget --id <exact existing id>
+hermes secretary feedback show --id <exact existing id>     # typed read-back
+hermes secretary feedback forget --id <exact existing id>  # revoke
+hermes secretary feedback noop                             # thanks/silence: writes nothing
 ```
 
 Rules:
-- Do **not** record "thanks" or silence as preferences.
-- Clear corrections are durable without asking again; inferred patterns stay
-  advisory and revisable.
-- "Not today" is a scoped, temporary snooze — never a permanent ban.
-- Conditional rules must keep their exception (career updates *unless unusually
-  fitting* is not "never career updates").
+- A clear correction is durable without asking again; inferred patterns stay
+  advisory and revisable. Conditional rules keep their exception (career updates
+  *unless unusually fitting* is not "never career updates").
+- "Not today" is a scoped, temporary snooze — never a permanent ban. Keep the
+  expiry; never widen a snooze into a suppression.
+- A plain "thanks", acknowledgement or silence is a **no-op** (`noop`, or simply
+  say nothing): it is never recorded as a preference.
 - Read back the exact affected preference after a write before claiming saved.
-- Bad input and corrupt artifacts fail closed (non-zero, nothing written).
+- Bad input and corrupt artifacts fail closed (non-zero, nothing written); an
+  explicit `forget` records a durable revocation so it cannot be revived.
+
+## Assistant-mediated context snapshot
+
+The assistant may hand the scheduled pipeline a **bounded, expiring** set of
+context entries it already knows from authorised memory/knowledge. This is a
+delivery cache, *not* a second memory backend: the pipeline never scrapes
+USER/MEMORY/Hindsight/Library, credentials, connectors or new allowlists itself.
+
+```bash
+hermes secretary feedback context-list                     # metadata only (no text)
+hermes secretary feedback context-show --id <entry id>     # explicit content read
+hermes secretary feedback context-update --note "planning a Japan trip in spring" \
+  --provenance "assistant:memory" --kind interest --expires-at <timezone-aware ISO>
+hermes secretary feedback context-update --note "prefers no calls before 9am" \
+  --provenance "user-stated" --kind preference --owner-declared
+hermes secretary feedback context-revoke --id <entry id>   # durable revoke
+```
+
+Rules:
+- Refresh the snapshot only when the user's relevant knowledge changes (setup or
+  an explicit session correction). Send a few bounded entries; never dump an
+  entire vault or guess consent. The existing native services stay authoritative.
+- Each entry carries a stable id, a provenance label, a timestamp/expiry and an
+  advisory-vs-owner-declared flag. `--provenance` must be one of the fixed
+  low-sensitivity labels `user-stated`, `assistant:memory`,
+  `assistant:knowledge` (default), `owner-config` or `synthetic-test`; an
+  arbitrary owner/account/path/request string is refused at write and read time
+  so metadata stays generic and portable. Expiry is **mandatory and bounded**: if
+  `--expires-at` is omitted the writer applies a 7-day default, and no entry may
+  outlive 30 days measured from `updated_at`. A stored entry with a
+  missing/malformed expiry, an unknown kind, a malformed id, a non-enum
+  provenance, an impossible timestamp order
+  (`created_at <= updated_at <= expires_at`), a far-future `updated_at`, or
+  injection/secret text makes the whole snapshot invalid at read time (fail
+  closed). Timestamps are normalised to UTC-aware (a naive stored value is read
+  as UTC, never crashed on). Default is empty; expired valid entries are ignored,
+  and invalid/missing entries are simply unavailable and are never fabricated or
+  refreshed in the background.
+- The snapshot is treated as **untrusted advisory evidence** by the evaluator
+  and proposer. It can never change permissions, settings or gates, and copied
+  identifiers/names/account details are structurally screened by the same
+  privacy boundary — a conservative fail-closed screen, not a proof that no
+  possible identifier can ever escape. Raw context is never written to
+  status/diagnostic logs.
 
 ## Requested reminders
 

@@ -14,6 +14,7 @@ process only writes a final line to stdout (or stays silent).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -22,8 +23,17 @@ from . import __version__
 from .candidates import build_packet, packet_digest
 from .clock import Clock, SeededClock
 from .collectors import default_sources
+from .contextsnapshot import inspect_metadata as snapshot_metadata
+from .contextsnapshot import load_context_snapshot
 from .evaluator import EvaluatorResult, FakeEvaluator, NativeEvaluator, fixture_packet, resolve_toolset_tools, validate_object
-from .feedback import FeedbackError, apply_action, load_preferences_file, save_preferences_file
+from .feedback import (
+    FeedbackError,
+    apply_action,
+    find_records,
+    load_preferences_file,
+    receipt_for_action,
+    save_preferences_file,
+)
 from .gates import (
     commit_coverage_notice,
     decide,
@@ -102,6 +112,34 @@ def _inferred_goals_enabled(policy: dict) -> bool:
 
 def _adaptive_work_enabled(policy: dict) -> bool:
     return _adaptive_enabled(policy) or _inferred_goals_enabled(policy)
+
+
+def _context_change_fingerprint(prefs: dict, assistant_entries: list[dict],
+                                previous_mentions: list[dict]) -> str:
+    """Keyed-eligibility fingerprint of the CONTEXT (not the evidence).
+
+    A change to the assistant-mediated snapshot or to the user's preferences must
+    re-EVALUATE the existing evidence within the normal cadence/gates, without
+    fabricating urgency or resetting notification dedup. It is stored separately
+    from the evidence digest so identical evidence + identical context stays a
+    no-op, while identical evidence + changed context wakes the evaluator.
+    """
+    normalized = [
+        {
+            "source": str(e.get("source") or "")[:64],
+            "kind": str(e.get("kind") or "")[:32],
+            "advisory": bool(e.get("advisory", True)),
+            "expires_at": str(e.get("expires_at") or "")[:64],
+            "text": str(e.get("text") or "")[:240],
+        }
+        for e in list(assistant_entries or [])
+    ]
+    body = json.dumps({
+        "preferences": prefs,
+        "assistant_context": normalized,
+        "previous_mentions": previous_mentions,
+    }, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def collect_public_and_adaptive(
@@ -332,6 +370,18 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
         # public/obligation reserved slots; in fixture mode it is a fresh ceiling.
         location_budget = None
         private_context = None
+        # Bounded assistant-mediated context snapshot. It is a delivery cache the
+        # assistant maintains explicitly from already-authorised context -- never
+        # an automatic memory scrape. A no-model run is a pure offline check and
+        # reads no snapshot, model or network. Missing/empty/malformed/stale
+        # yields no entries (fail closed); nothing is fabricated or refreshed.
+        snapshot_view = None
+        assistant_entries: list[dict] = []
+        assistant_texts: list[str] = []
+        if not getattr(args, "no_model", False):
+            snapshot_view = load_context_snapshot(store, clock.now())
+            assistant_entries = list(snapshot_view.entries)
+            assistant_texts = snapshot_view.texts()
 
         def _collect_private_context() -> dict | None:
             """Conditional local phone context; ZERO reads when not warranted.
@@ -362,6 +412,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             # read a private connector or the local location context.
             if not getattr(args, "no_model", False):
                 private_context = _collect_private_context()
+            context = _interest_context(results)
         else:
             from .collectors import Budget, SourceResult, safe_source_error
             # Fair category budgets over one overall 60 s wallclock. Each
@@ -384,7 +435,17 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             # expansion pass) so its time is drawn from the core allocation.
             private_context = _collect_private_context()
             # Awareness expansion runs on its reserved category allocation only.
+            # The SAME accepted context (task/calendar titles + the bounded
+            # assistant-mediated snapshot) reaches the inferred-interest proposer
+            # and its privacy boundary; the snapshot is screened exactly like the
+            # titles so a copied identifier can never become a public search.
             context = _interest_context(results)
+            # Explicitly source-separated merge: task/calendar titles keep their
+            # legacy proposer bound, accepted snapshot entries keep their own
+            # 12/500 bound, and the proposer renders snapshot-first with reserved
+            # task slots so a full calendar can never starve accepted memory.
+            from .interestproposal import merge_interest_context
+            proposer_context = merge_interest_context(context, assistant_texts)
             if policy.get("feeds_enabled", True) or _adaptive_work_enabled(policy):
                 # ONE public HTTP/source budget shared by ordinary feeds and the
                 # optional adaptive evidence path: no second additive cap. The
@@ -395,7 +456,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                                        parent=overall, label="public")
                 try:
                     results.extend(collect_public_and_adaptive(
-                        policy, clock, store=store, context=context,
+                        policy, clock, store=store, context=proposer_context,
                         public_budget=public_budget, overall_budget=overall,
                         planner=getattr(args, "adaptive_planner", None),
                         fetcher=getattr(args, "adaptive_fetcher", None),
@@ -424,19 +485,31 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                                                 checked_at=clock.now().isoformat()))
 
         packet = build_packet(results, clock=clock, policy=policy, baseline=state,
-                              private_context=private_context)
-        state["health"] = packet["coverage"]
+                              context=context, private_context=private_context,
+                              assistant_context=assistant_entries)
+        state["health"] = dict(packet["coverage"])
+        if snapshot_view is not None:
+            # Bounded, text-free health for the delivery cache: available /
+            # expired / invalid / unconfigured is visible without exposing text.
+            coverage_health = snapshot_view.metadata()
+            packet["context_snapshot"] = coverage_health
+            state["health"]["context_snapshot"] = coverage_health
         packet["previous_mentions"] = [
             {"key": row.get("key"), "kind": row.get("kind"), "at": row.get("first_seen")}
             for row in list(state.get("items", {}).values())[-20:]
             if row.get("emitted") or row.get("delivered")
         ]
-        import hashlib
-        digest = hashlib.sha256(json.dumps({
-            "material": packet_digest(packet),
-            "preferences": prefs,
-            "previous_mentions": packet["previous_mentions"],
-        }, sort_keys=True).encode()).hexdigest()
+        # Evidence digest governs whether the MATERIAL changed; the separate
+        # context/preference fingerprint governs re-evaluation eligibility. Both
+        # must be unchanged for a skip, but delivery dedup still keys on the
+        # candidate signature (a context-only change can never cause a repeat).
+        digest = packet_digest(packet)
+        context_digest = _context_change_fingerprint(
+            prefs, assistant_entries, packet["previous_mentions"])
+        # Real context is present when the accepted snapshot is nonempty OR the
+        # user has real preferences. Only used to un-stick a LEGACY state that
+        # predates the context fingerprint (see should_skip_inference).
+        context_present = bool(assistant_entries) or _preferences_have_context(prefs)
 
         if args.collect_only or args.check:
             from .obligations import health, load_obligations
@@ -445,6 +518,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                 "command": args.command,
                 "generated_at": packet["generated_at"],
                 "coverage": packet["coverage"],
+                "context_snapshot": packet.get("context_snapshot", {}),
                 "candidate_count": len(packet["candidates"]),
                 "digest": packet_digest(packet),
                 "expansion": {
@@ -474,7 +548,17 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             _emit("")
             return 0
 
-        if should_skip_inference(state, digest, clock.now(), policy):
+        if should_skip_inference(state, digest, clock.now(), policy,
+                                 context_fingerprint=context_digest,
+                                 context_present=context_present):
+            # Upgrade a LEGACY record that predates the context fingerprint and
+            # was skipped only because there is no real context: persist the key
+            # so the next run compares it instead of re-checking forever. When
+            # real context is present we never reach here (it re-evaluates once).
+            last = state.get("last_inference")
+            if (isinstance(last, dict) and last.get("context") is None
+                    and context_digest):
+                last["context"] = context_digest
             store.save("notify_state.json", state)
             if emit_skip_diagnostics:
                 _diag({
@@ -540,6 +624,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             state = record_delivery(state, decision, packet, clock, policy)
         state["last_inference"] = {
             "digest": digest,
+            "context": context_digest,
             "at": clock.now().isoformat(),
             "quiet_suppressed": bool(quiet_now and proposal.message and not decision.get("send")),
             "action": proposal.action,
@@ -587,16 +672,56 @@ def select_evaluator(args, policy: dict, injected=None):
     return NativeEvaluator(), "subprocess"
 
 
-def should_skip_inference(state: dict, digest: str, now, policy: dict) -> bool:
-    """True when the stable digest is unchanged and no wake is due.
+def _preferences_have_context(prefs: dict) -> bool:
+    """True when preferences carry real user context (rules/snooze/pause).
+
+    Used only to decide whether a LEGACY state (written before the context
+    fingerprint existed) must re-evaluate once so a preference correction is not
+    suppressed. A default empty preference set stays a genuine no-op.
+    """
+    if not isinstance(prefs, dict):
+        return False
+    paused = prefs.get("paused")
+    if isinstance(paused, dict) and paused.get("active"):
+        return True
+    return any(prefs.get(key) for key in ("explicit", "inferred", "snoozes"))
+
+
+def should_skip_inference(state: dict, digest: str, now, policy: dict,
+                          context_fingerprint: str | None = None,
+                          context_present: bool = False) -> bool:
+    """True when the evidence AND context/preference fingerprints are unchanged.
+
+    The evidence digest decides whether the material changed. A SEPARATE
+    context/preference fingerprint decides whether an unchanged evidence packet
+    still needs re-evaluation because the assistant-mediated snapshot or the
+    user's preferences changed. Both must match to skip. Delivery dedup is
+    unaffected: re-evaluation alone never re-sends an already-delivered item.
 
     Re-evaluates when the prior run produced a pending proposal (so a suppressed
     alert is retried) or when it was quiet-suppressed and quiet hours have now
     ended (deferred meaningful candidates are not discarded).
+
+    LEGACY MIGRATION: a state written before the context fingerprint existed has
+    no ``context`` key. Treating that as "evidence-only" would silently suppress
+    the FIRST context/preference change after migration. So when the prior state
+    has no stored context fingerprint AND real context is present (a nonempty
+    accepted snapshot or a real preference), we re-evaluate ONCE. A default empty
+    legacy state (``context_present`` False) still skips, and the caller persists
+    the context key, so there is no repeated re-evaluation and no repeat alert.
     """
     last = state.get("last_inference") or {}
     if not last or last.get("digest") != digest:
         return False
+    if context_fingerprint is not None:
+        prior_context = last.get("context")
+        if prior_context is None:
+            if context_present:
+                # Legacy record missing the fingerprint: re-evaluate once to pick
+                # up the new snapshot/preference instead of suppressing it.
+                return False
+        elif str(prior_context) != str(context_fingerprint):
+            return False
     if last.get("pending"):
         return False
     if last.get("quiet_suppressed") and not in_quiet_hours(policy, now):
@@ -631,6 +756,24 @@ def feedback_command(args: argparse.Namespace) -> int:
         if args.feedback == "list":
             print(json.dumps(prefs, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
+        if args.feedback == "show":
+            target = str(getattr(args, "id", "") or "")
+            if not target:
+                print("proactive-pilot feedback rejected: --id is required", file=sys.stderr)
+                return 2
+            matches = find_records(prefs, target)
+            print(json.dumps({"feedback": "show", "id": target,
+                              "found": len(matches), "records": matches},
+                             ensure_ascii=False, indent=2, sort_keys=True))
+            return 0 if matches else 1
+        if args.feedback == "noop":
+            # A clear "thanks"/silence message is a NO-OP: nothing is written and
+            # the preference version is not bumped. This is the documented
+            # assistant-mediated acknowledgement path, never a silent capture.
+            print(json.dumps({"feedback": "noop", "status": "no-op",
+                              "reason": "acknowledgement only; no preference recorded"},
+                             indent=2))
+            return 0
         action = {
             "action": args.feedback,
             "kind": args.kind,
@@ -651,11 +794,15 @@ def feedback_command(args: argparse.Namespace) -> int:
     except FeedbackError as exc:
         print(f"proactive-pilot feedback rejected: {exc}", file=sys.stderr)
         return 2
+    # Read back the exact persisted record so the assistant can show the user a
+    # truthful receipt and never claim a change that was not stored.
+    receipt = receipt_for_action(prefs, updated, action, now)
     print(json.dumps({
         "feedback": args.feedback,
         "status": "saved",
         "version": updated.get("version"),
         "updated_at": updated.get("updated_at"),
+        "receipt": receipt,
     }, indent=2))
     return 0
 
@@ -707,8 +854,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-model", action="store_true", help="deterministic silence evaluator (tests)")
     parser.add_argument("--feedback", choices=[
         "add-explicit", "add-inferred", "snooze", "pause", "resume", "forget", "list",
+        "show", "noop",
         "watch-add", "watch-list", "watch-change", "watch-stop", "watch-snooze",
         "watch-forget", "watch-feedback", "inferred-list", "inferred-revoke",
+        "context-list", "context-show", "context-update", "context-revoke",
     ], default=None)
     parser.add_argument("--watch-topic", default="")
     parser.add_argument("--include", default="")
@@ -736,6 +885,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--conditional", action="store_true")
     parser.add_argument("--exception", default="")
     parser.add_argument("--no-suppress", action="store_true")
+    parser.add_argument("--owner-declared", action="store_true",
+                        help="context-update: mark the entry owner-declared (not advisory)")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--collect-only", action="store_true")
     group.add_argument("--check", action="store_true")
@@ -760,6 +911,9 @@ def main(argv: list[str] | None = None) -> int:
             if str(args.feedback).startswith("inferred-"):
                 from .interestproposal import inferred_command
                 return inferred_command(args)
+            if str(args.feedback).startswith("context-"):
+                from .contextsnapshot import context_command
+                return context_command(args)
             return feedback_command(args)
         if args.self_test:
             return self_test(args)

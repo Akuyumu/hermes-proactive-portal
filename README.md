@@ -162,6 +162,59 @@ can then explain the coverage on your machine.
   copy, preferences). It is never written into the installed plugin tree.
 - The plugin declares no privileged capabilities and overrides no built-in tool.
 
+## Assistant-mediated context snapshot
+
+The conversational assistant can hand the scheduled pipeline a **bounded,
+expiring delivery cache** of context it already knows from the user's authorised
+memory/knowledge. This is deliberately *not* automatic whole-memory inheritance:
+the pipeline never scrapes USER/MEMORY/Hindsight/Library, credentials, connectors
+or a new allowlist on its own, and it never dumps an entire vault.
+
+```bash
+hermes secretary feedback context-list                     # metadata only (no text)
+hermes secretary feedback context-show --id <entry id>     # explicit content read
+hermes secretary feedback context-update --note "<a short fact>" \
+  --provenance "assistant:memory" --kind interest [--expires-at <ISO>] [--owner-declared]
+hermes secretary feedback context-revoke --id <entry id>   # durable revoke (tombstoned)
+```
+
+Properties:
+
+- Typed entries with a stable id, provenance label, created/updated/expiry
+  timestamps and an advisory-vs-owner-declared flag; entry and total-size caps;
+  owner-only atomic writes under a profile-local path. `--provenance` is a fixed
+  low-sensitivity enum (`user-stated`, `assistant:memory`, `assistant:knowledge`
+  — the default, `owner-config`, `synthetic-test`) so metadata is generic and
+  portable and never carries an owner/account/path/request excerpt. Default is
+  **empty**, so a fresh install behaves exactly as before.
+- Expiry is **mandatory and bounded**: a missing `--expires-at` defaults to 7
+  days and nothing may outlive 30 days measured from `updated_at` (a refresh may
+  preserve an older `created_at`). The **read boundary is authoritative**: exact
+  shapes/types/kind/id/provenance and every timestamp are validated, the order
+  `created_at <= updated_at <= expires_at` and a non-far-future `updated_at` are
+  enforced, naive timestamps are normalised to UTC-aware rather than crashing,
+  and any malformed entry (or an invalid tombstone) marks the whole snapshot
+  invalid. Missing/empty/malformed/expired means **unavailable** with a bounded
+  health reason; values are never fabricated and nothing is refreshed in the
+  background. Injection/secret-bearing entries are refused at write time *and*
+  re-checked at read time; diagnostics never echo untrusted ids/values/text.
+- Treated as **untrusted advisory evidence** everywhere downstream. It reaches
+  both the evaluator prompt and the inferred-interest proposer, but can never
+  change authority, settings or gates, and copied identifiers/names/account
+  details are structurally screened by the same privacy boundary. That boundary
+  is a conservative, fail-closed screen — not a proof that no possible
+  identifier can ever escape. Raw snapshot text is never written to status/log
+  output.
+- `pause`/disable and the model-free reminder dispatcher read no snapshot, model
+  or network.
+
+Feedback itself stays **assistant-mediated**: the assistant turns an explicit
+user correction into a typed command, reads the exact record back (`show --id` or
+the write's `receipt`) and shows a receipt. "Thanks"/silence is a no-op, not a
+recorded preference; there is no automatic capture hook or conversation
+surveillance. Existing explicit/inferred rules, snoozes, conditional exceptions,
+expiries, provenance and revocation tombstones keep their semantics.
+
 ## If you have no connectors
 
 Without an authorised mail/calendar/task connector you get **public-source

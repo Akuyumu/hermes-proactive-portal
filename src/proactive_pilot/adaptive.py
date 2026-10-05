@@ -596,11 +596,12 @@ def _rescreen_inferred_plan_queries(plan: dict[str, Any], context: list[str] | N
     from . import interestproposal as ip
 
     original = list(plan.get("queries") or [])
+    retained_context = ip.bound_interest_context(context)
     safe_queries: list[str] = []
     for query in original:
         try:
             ip._screen_public_safe(str(query), [], [])
-            ip._screen_context_copy(str(query), [], [], context)
+            ip._screen_context_copy(str(query), [], [], retained_context)
         except ip.InferredProposalError:
             continue
         safe_queries.append(str(query))

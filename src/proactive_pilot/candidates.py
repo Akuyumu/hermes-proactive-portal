@@ -188,6 +188,7 @@ def build_packet(
     baseline: dict[str, Any],
     context: list[str] | None = None,
     private_context: dict[str, Any] | None = None,
+    assistant_context: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the evaluator evidence packet.
 
@@ -318,6 +319,21 @@ def build_packet(
         # Deliberately excluded from packet_digest: supplementary context must not
         # churn the digest or fabricate urgency.
         packet["private_context"] = dict(private_context)
+    if assistant_context:
+        # Bounded assistant-mediated snapshot entries (see contextsnapshot). Each
+        # carries its provenance label and advisory/owner-declared flag so the
+        # evaluator can weigh it as UNTRUSTED advisory evidence with no authority.
+        # Deliberately excluded from packet_digest, like private_context.
+        packet["assistant_context"] = [
+            {
+                "source": str(e.get("source") or "")[:64],
+                "kind": str(e.get("kind") or "")[:32],
+                "advisory": bool(e.get("advisory", True)),
+                "expires_at": str(e.get("expires_at") or "")[:64],
+                "text": str(e.get("text") or "")[:MAX_PREVIEW_CHARS],
+            }
+            for e in list(assistant_context)[:MAX_CONTEXT_ITEMS]
+        ]
     return packet
 
 

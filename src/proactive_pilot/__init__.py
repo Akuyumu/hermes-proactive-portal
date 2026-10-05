@@ -4,4 +4,4 @@ Staged candidate only. Nothing here activates live jobs, sends messages, or edit
 existing Hermes core/config/routes. See report.md and DEPLOY.md.
 """
 
-__version__ = "0.2.0-candidate"
+__version__ = "0.3.0"
