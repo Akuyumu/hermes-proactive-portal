@@ -48,20 +48,39 @@ hermes secretary status
 
 This prepares owner-only policy/state and runs offline checks without installing schedules. The runtime root is `$HERMES_HOME/plugin-data/hermes-proactive-secretary/`, unless explicitly overridden with `HERMES_PROACTIVE_SECRETARY_DATA` or `--data-dir`.
 
-Apply only the user's agreed changes to the plugin's `policy.json`, preserving other fields. Do not hand-edit Hermes's main configuration. Preserve existing policy/preferences; `--force` is not a normal setup step.
+Write the validated per-user configuration, then review it before arming anything:
 
-- Set the confirmed `timezone`, quiet hours and notification limits.
+```bash
+hermes secretary configure init
+hermes secretary configure validate
+hermes secretary configure preview
+```
+
+Apply only the user's agreed changes, preserving other fields. Do not hand-edit Hermes's main configuration or store credential values anywhere. `user_config.json` is versioned and fail-closed; never overwrite a nonempty configuration without explicit consent (`--force` is not a normal step). If an existing deployment already has its own policy/preferences, migrate it explicitly instead of hand-copying:
+
+```bash
+hermes secretary configure migrate --from-policy '<policy.json>' --dry-run  # review
+hermes secretary configure migrate --from-policy '<policy.json>'            # write (keeps pause in preferences)
+```
+
+- Set the confirmed `timezone`, quiet hours and notification limits. When the host setting is unavailable and the user has not chosen, leave the neutral `UTC`.
 - Set a neutral or user-approved `persona`/`notify_address`; never assume the original owner's identity.
+- Name exactly the accounts/calendars/task lists that may be read (`mail.accounts`, `calendar.accounts`, `calendar.calendars`, `tasks.accounts`, `tasks.lists`). Task accounts are independent; credential presence alone is not permission.
+- Migration supports repeatable `--mail-account`, `--calendar-account`, `--calendar-id`, `--task-account`, `--task-list` and `--adapter`. Omitted options retain prior explicit policy fields, including empty arrays and mail aliases. Review the source mappings in the dry-run report.
+- Empty account arrays disable their connector. Empty calendar IDs retain selected/primary/holiday calendars within the configured accounts; nonempty IDs restrict event reads. Empty task lists retain all visible lists within configured task accounts; nonempty entries are exact case-sensitive IDs/titles (`id:ID`/`name:TITLE` disambiguate). Task adapters are empty, `tasks` or `productivity_secretary`; unsupported adapters fail closed.
+- Only explicit legacy migration may retain omitted calendar/task account discovery (`advanced.legacy_account_discovery`). Old user configs lacking `tasks.accounts` copy explicit calendar accounts with a warning; new neutral configs include empty independent task accounts.
 - Generic source seeds are empty. Add explicitly requested public watches with `hermes secretary watch add "<public topic>"`, then read back `hermes secretary watch list`.
 - If adaptive discovery is approved, consult the bundled skill and policy implementation before changing mode. Keep inferred-goal acquisition and semantic privacy review paired; never send raw private context in public queries. Do not claim that adding a watch enables autonomous adaptation.
+- The optional Google Workspace calendar adapter (`adapters.gws_calendar`) uses the installed skill's existing authorisation; enable it only after the user confirms that authorisation, and never broaden scopes or run a setup/reauthorisation flow.
 - Keep location off unless a supported integration and separate authorisation are verified.
 
 ### Connector limits — do not hide these
 
 The plugin is profile/path-safe, but it does **not** automatically support arbitrary services:
 
-- Mail currently expects existing Himalaya accounts named `formal`/`informal`. Arbitrary account names/providers are not automatically mapped. Do not rename accounts or expand access without permission.
-- Calendar/tasks require the external `productivity-secretary` library and its existing authorised configuration. That library is **not bundled** in this repository. `SECRETARY_SRC` or `PRODUCTIVITY_SECRETARY_SRC` may point to an existing installation; do not create a new dependency or new credentials silently.
+- Mail reads exactly the accounts named in `mail.accounts`. Legacy deployments keep the existing `formal`/`informal` Himalaya names; other accounts are supported only once explicitly named, and never shell-interpolated. Do not rename accounts or expand access without permission.
+- Calendar/tasks require the external `productivity-secretary` library and its existing authorised configuration, OR the optional bundled Google Workspace calendar adapter (installed skill + active `HERMES_HOME` authorisation). Neither is enabled by default. `SECRETARY_SRC` or `PRODUCTIVITY_SECRETARY_SRC` may point to an existing library installation; do not create a new dependency or new credentials silently.
+- The Google Workspace adapter is calendar-read only and has no verified Tasks command; there is no invented Tasks support. Its readiness probe does not read/refresh token values or call connector APIs.
 - Private obligation sources may depend on additional authorised native connectors. A healthy mail executable is not proof that every private source is available.
 - Without supported connectors, public-only operation is possible, but empty seeds/watches and disabled adaptation do not mean useful public coverage is already established.
 
@@ -85,7 +104,7 @@ Setup creates and records ownership of:
 - `hermes-proactive-secretary-pilot`: every 15 minutes; may use the native LLM for discovery/planning/judgment.
 - `hermes-proactive-secretary-reminders`: every minute; deterministic reminder script, no scheduled-agent LLM calls.
 
-Both are native script jobs with `--no-agent`; the monitoring script itself can invoke models. One-minute reminder checks use CPU and sometimes connector requests, not an LLM conversation per tick.
+Both are native script jobs with `--no-agent`; the monitoring script itself can invoke models. One-minute reminder checks use CPU and sometimes connector requests, not an LLM conversation per tick. On its normal schedule the monitoring runner invokes the registered `hermes secretary pipeline` handler with fixed argv and the same profile/data paths, so the host-built context (and thus the user's active model and native `get_config`) is authoritative; it does not import the pipeline directly unless the native CLI is verifiably unavailable before any work (which is reported). The reminder runner likewise enters the registered `hermes secretary reminders` handler, never calls a model and never accesses `ctx.llm`; event reads honour ONLY the explicit `calendar.accounts`/`calendar.calendars` (mail accounts are never unioned in), and a disabled or empty calendar scope reads no event source. A subprocess timeout/error after either native handler started fails closed: no second run and no fallback. Both production entries apply neutral generic defaults when no configuration is present, so a deleted/missing `user_config.json` never silently re-enables the legacy private sources.
 
 Verify exact script paths, schedules, ownership and delivery target through the native cron listing. Re-run setup with the same destination to verify idempotency; it must not duplicate jobs. A cron-name collision is a reason to stop, not permission to adopt someone else's job.
 

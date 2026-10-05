@@ -59,10 +59,64 @@ def _default_argv() -> list[str]:
     ]
 
 
+def _native_cli_bridge() -> int | None:
+    """Scheduled route: dispatch reminders through the registered native CLI.
+
+    The scheduler invokes this script with NO arguments. We call the registered
+    ``hermes secretary reminders dispatch`` handler with a fixed argv so native
+    plugin discovery builds/passes the host context (deterministic: no model, no
+    ``ctx.llm`` access) and the SAME active profile/data paths are used.
+
+    Fail-closed contract: the direct-import compatibility fallback is used ONLY
+    when the native CLI is verifiably unavailable BEFORE any work (returns
+    ``None``, reported on stderr). Any failure/timeout AFTER starting the native
+    dispatcher returns a non-zero code -- never a second dispatch and never a
+    bypass of a failed native context.
+    """
+    import shutil
+    import subprocess
+
+    hermes = os.environ.get("HERMES_BIN") or shutil.which("hermes")
+    if not hermes:
+        print("proactive-secretary: native hermes CLI unavailable; using the "
+              "direct-import compatibility fallback", file=sys.stderr)
+        return None
+    import paths  # noqa: E402 - resolved from the installed plugin root
+
+    # Parent CLI options must precede the REMAINDER positional: after
+    # 'dispatch', argparse forwards every token to the reminder-only parser.
+    argv = [hermes, "secretary", "reminders",
+            "--data-dir", str(paths.data_root()), "dispatch"]
+    try:
+        proc = subprocess.run(argv, shell=False, capture_output=True, text=True,
+                              timeout=300, check=False)
+    except subprocess.TimeoutExpired:
+        print("proactive-secretary: native reminder dispatch timed out AFTER "
+              "start; failing closed (no retry/fallback)", file=sys.stderr)
+        return 1
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"proactive-secretary: native reminder dispatch failed AFTER start "
+              f"({type(exc).__name__}); failing closed (no retry/fallback)",
+              file=sys.stderr)
+        return 1
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    if proc.returncode != 0:
+        return proc.returncode
+    out = (proc.stdout or "").strip()
+    if out:
+        sys.stdout.write(out + "\n")
+    return 0
+
+
 if __name__ == "__main__":
     if not _native_gate():
         raise SystemExit(0)
     os.environ.setdefault("PROACTIVE_FOLLOWTHROUGH_ROOT", str(PLUGIN_ROOT))
+    if not sys.argv[1:]:
+        _bridge_rc = _native_cli_bridge()
+        if _bridge_rc is not None:
+            raise SystemExit(_bridge_rc)
     from proactive_pilot.reminders import main as _reminders_main  # noqa: E402
     _argv = sys.argv[1:] or _default_argv()
     raise SystemExit(_reminders_main(_argv))

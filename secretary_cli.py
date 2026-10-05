@@ -37,6 +37,23 @@ from . import paths
 from . import runner_install
 from . import state_import
 
+# Host-built native context captured from the registered CLI handler closure.
+# It is only ever the context Hermes constructs and passes to ``register(ctx)``;
+# this module never builds one. Model calls through it stay host-owned and
+# gated. ``None`` until the host wires the plugin.
+_NATIVE_CONTEXT: Any = None
+
+
+def set_native_context(ctx: Any) -> None:
+    """Record the host-provided context from the plugin registration closure."""
+    global _NATIVE_CONTEXT
+    _NATIVE_CONTEXT = ctx
+
+
+def get_native_context() -> Any:
+    """Return the host-provided context (or ``None`` in an offline/test process)."""
+    return _NATIVE_CONTEXT
+
 
 def _ensure_src() -> None:
     src = str(paths.plugin_root() / "src")
@@ -74,8 +91,11 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
              ("run-once", "Dry, no-model run (never sends)"),
              ("watch", "Manage public watches (add | list | remove)"),
              ("feedback", "Record or inspect notification preferences"),
+             ("configure", "Validated per-user configuration (show | validate | preview | init | migrate)"),
+             ("pipeline", "Internal: scheduled ordinary pipeline via the native context bridge"),
+             ("reminders", "Requested reminders (dispatch | check | list | status | add | cancel)"),
              ("doctor", "Check the environment and wiring"),
-         )}
+          )}
     p["setup"].add_argument("--force", action="store_true",
                             help="overwrite an existing policy file (default: keep it)")
     p["setup"].add_argument("--no-cron", action="store_true",
@@ -94,6 +114,15 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                                help="run against a synthetic fixture instead of live sources")
     p["run-once"].add_argument("--check", action="store_true",
                                help="collect-only coverage check (implies dry, never sends)")
+    p["run-once"].add_argument("--model", action="store_true",
+                               help="use the host ctx.llm lane (default: deterministic no-model)")
+    p["pipeline"].add_argument("--fixture", default=None,
+                               help="run against a synthetic fixture instead of live sources")
+    p["pipeline"].add_argument("--check", action="store_true",
+                               help="collect-only coverage check (never sends)")
+    p["reminders"].add_argument("reminder_args", nargs=argparse.REMAINDER,
+                                help="arguments forwarded to the validated reminder CLI "
+                                     "(default: dispatch)")
     for _name in ("disable", "uninstall"):
         p[_name].add_argument("--purge", action="store_true",
                               help="also delete the owner-only runtime data directory")
@@ -104,6 +133,35 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p["watch"].add_argument("--cadence-minutes", type=int, default=None)
     p["feedback"].add_argument("feedback_args", nargs=argparse.REMAINDER,
                                help="arguments forwarded to the validated feedback CLI")
+    p["configure"].add_argument("action",
+                                choices=("show", "validate", "preview", "init", "migrate"),
+                                help="show/validate/preview the config, init a neutral "
+                                     "example, or migrate a legacy policy")
+    p["configure"].add_argument("--file", default=None,
+                                help="user configuration path (default: <data>/user_config.json)")
+    p["configure"].add_argument("--from-policy", default=None, metavar="POLICY",
+                                help="legacy policy.json to migrate from")
+    p["configure"].add_argument("--mail-account", action="append", default=None,
+                                metavar="NAME",
+                                help="migrate: copy an existing configured mail account (repeatable)")
+    p["configure"].add_argument("--calendar-account", action="append", default=None,
+                                metavar="NAME",
+                                help="migrate: copy an existing configured calendar account (repeatable)")
+    p["configure"].add_argument("--calendar-id", action="append", default=None,
+                                metavar="ID",
+                                help="migrate: copy an existing configured calendar id (repeatable)")
+    p["configure"].add_argument("--task-list", action="append", default=None,
+                                metavar="NAME",
+                                help="migrate: copy an existing configured task list (repeatable)")
+    p["configure"].add_argument("--task-account", action="append", default=None,
+                                metavar="NAME",
+                                help="migrate: copy an existing configured task account (repeatable)")
+    p["configure"].add_argument("--adapter", default=None,
+                                help="migrate: preserve the named compatibility adapter selection")
+    p["configure"].add_argument("--force", action="store_true",
+                                help="overwrite an existing nonempty configuration")
+    p["configure"].add_argument("--dry-run", action="store_true",
+                                help="preview only; write nothing")
     subparser.set_defaults(func=secretary_command)
 
 
@@ -165,6 +223,25 @@ def _write_policy(force: bool) -> dict[str, Any]:
     return {"policy": str(target), "action": "written"}
 
 
+def _ensure_user_config() -> dict[str, Any]:
+    """Prepare the neutral per-user configuration for a NEW generic install.
+
+    Idempotent and never overwriting: if a configuration already exists it is
+    kept. Only the shipped neutral example is written, so a fresh install starts
+    with generic defaults (no accounts, no seeds, adaptive off) instead of any
+    implicit private-account assumption.
+    """
+    target = paths.user_config_path()
+    if target.exists() and target.read_text(encoding="utf-8").strip():
+        return {"user_config": str(target), "action": "kept"}
+    example = paths.user_config_example_path()
+    if not example.is_file():
+        return {"user_config": str(target), "action": "missing-example"}
+    payload = json.loads(example.read_text(encoding="utf-8"))
+    status = _write_user_config(target, payload, force=False)
+    return {"user_config": str(target), "action": status}
+
+
 def _ensure_preferences() -> dict[str, Any]:
     _ensure_src()
     from proactive_pilot.clock import Clock
@@ -219,6 +296,17 @@ def _secretary_env_hint() -> str:
     return "SECRETARY_SRC (or PRODUCTIVITY_SECRETARY_SRC)"
 
 
+def _authoritative_config() -> Any:
+    """Load the authoritative validated configuration (native settings first).
+
+    Raises ``userconfig.ConfigError`` when a present native/file configuration is
+    invalid. A completely absent configuration is NOT an error (neutral defaults).
+    """
+    _ensure_src()
+    from proactive_pilot import userconfig
+    return userconfig.load_user_config(paths.user_config_path(), native=get_native_context())
+
+
 def _run_offline_checks(fixture: str) -> dict[str, Any]:
     _ensure_src()
     from proactive_pilot.selftest import run_self_test
@@ -239,6 +327,10 @@ def _run_offline_checks(fixture: str) -> dict[str, Any]:
         "--fixture", fixture, "--dry-run", "--no-model",
     ]
     ns = build_parser().parse_args(argv)
+    # Thread the host-built context so the authoritative (native) configuration
+    # is validated during the offline check too; a no-model fixture run reads no
+    # private connector and no location context.
+    ns.native_ctx = get_native_context()
     dry_rc = run_once(ns)
     return {
         "self_test_rc": test_rc,
@@ -274,7 +366,6 @@ def setup_command(args: argparse.Namespace, *, backend: cron_mod.CronBackend | N
         "warnings": [],
     }
     deliver_arg = getattr(args, "deliver", None)
-    deliver = str(deliver_arg).strip() if deliver_arg else "local"
     created: list[str] = []
     try:
         paths.ensure_data_dirs()
@@ -289,6 +380,41 @@ def setup_command(args: argparse.Namespace, *, backend: cron_mod.CronBackend | N
                           f"{imported['counts']['identical']} identical"})
         result["policy"] = _write_policy(bool(getattr(args, "force", False)))
         result["preferences"] = _ensure_preferences()
+        # Prepare the generic configuration on a NEW install BEFORE any runner or
+        # cron work. An existing deployment keeps its policy and must migrate its
+        # own configuration explicitly; a neutral config is never forced over it.
+        if result["policy"].get("action") == "written" and not import_from:
+            result["user_config"] = _ensure_user_config()
+        else:
+            _uc = paths.user_config_path()
+            result["user_config"] = {
+                "user_config": str(_uc),
+                "action": "kept" if (_uc.exists() and _uc.read_text(
+                    encoding="utf-8").strip()) else
+                    "deferred (existing policy; run `hermes secretary configure migrate`)",
+            }
+        # Validate the AUTHORITATIVE configuration with the host context BEFORE
+        # any runner or cron work. A present-but-invalid native/file setting is a
+        # hard failure: it can never be ignored by a fixture or a file default.
+        loaded_cfg = _authoritative_config()
+        result["user_config_effective"] = {
+            "present": bool(loaded_cfg.present),
+            "source": loaded_cfg.source,
+            "destination": loaded_cfg.config["notification"]["destination"],
+        }
+        # Effective notification destination: explicit --deliver wins, else a
+        # real configured destination. 'local' is the safe fallback (record but
+        # do not deliver), so it is not treated as a configured target; only when
+        # NEITHER is set do we warn.
+        configured_dest = (loaded_cfg.config["notification"]["destination"]
+                           if loaded_cfg.present else "").strip()
+        effective_dest = "" if configured_dest.lower() == "local" else configured_dest
+        if deliver_arg:
+            deliver = str(deliver_arg).strip()
+        elif effective_dest:
+            deliver = effective_dest
+        else:
+            deliver = "local"
         result["capabilities"] = detect_capabilities()
 
         # Verify BEFORE installing runners or arming cron.
@@ -313,7 +439,7 @@ def setup_command(args: argparse.Namespace, *, backend: cron_mod.CronBackend | N
             ownership_path=paths.runner_ownership_path(),
         )
         result["deliver"] = deliver
-        if not deliver_arg:
+        if not deliver_arg and not effective_dest:
             result["warnings"].append(
                 "no --deliver target given; defaulting to 'local'. Alerts will be recorded but "
                 "not delivered until a target is set "
@@ -523,6 +649,18 @@ def status_command(args: argparse.Namespace) -> int:
     reminders = _read_json(paths.state_dir() / "reminders.json")
     prefs = _prefs()
     caps = detect_capabilities()
+    # Same authoritative native-first configuration/settings as setup/doctor and
+    # the runtime pipeline (a present-but-invalid setting is reported, never
+    # silently replaced by a file/default).
+    config_error = ""
+    config_summary: dict[str, Any] = {}
+    destination = ""
+    try:
+        _loaded = _authoritative_config()
+        config_summary = _loaded.summary()
+        destination = _loaded.config["notification"]["destination"]
+    except Exception as exc:  # noqa: BLE001 - status must degrade, not crash
+        config_error = str(exc)
     active_reminders = sum(
         1 for r in reminders.get("reminders", {}).values()
         if isinstance(r, dict) and r.get("status") in {"pending", "uncertain"}
@@ -536,6 +674,9 @@ def status_command(args: argparse.Namespace) -> int:
         "jobs": _job_states(),
         "capabilities": caps,
         "monitoring": caps.get("monitoring", "public-only"),
+        "config": config_summary,
+        "config_error": config_error,
+        "deliver": destination or "local (default)",
         "last_pilot_run": (state.get("last_inference") or {}).get("at", ""),
         "coverage": state.get("health", {}),
         "counts": {
@@ -554,6 +695,8 @@ def status_command(args: argparse.Namespace) -> int:
         f"Proactive Secretary: {'DISABLED (paused)' if payload['paused'] else 'enabled'}",
         f"  data root     : {payload['data_root']}",
         f"  policy        : {'present' if payload['policy_present'] else 'MISSING'}",
+        f"  config        : {'invalid: ' + config_error if config_error else ('present' if config_summary.get('present') else 'defaults (neutral)')}",
+        f"  deliver       : {payload['deliver']}",
         f"  monitoring    : {monitoring}",
         f"  cron backend  : {'available' if payload['jobs'].get('available') else 'unavailable'}",
         f"  jobs          : {_jobs_human(payload['jobs'])}",
@@ -599,6 +742,35 @@ def doctor_command(args: argparse.Namespace) -> int:
     add("public_sources", True, "public-source monitoring works without mail/calendar/tasks",
         critical=False)
     add("monitoring_mode", True, caps.get("monitoring", "public-only"), critical=False)
+    # Validated user configuration + optional adapters (never credential reads).
+    # The AUTHORITATIVE native-first configuration is loaded with the host ctx;
+    # a present-but-invalid setting is a CRITICAL failure and can never be
+    # ignored via a fixture or a file default.
+    gws_enabled = False
+    try:
+        _loaded = _authoritative_config()
+        gws_enabled = bool(_loaded.config.get("adapters", {}).get("gws_calendar"))
+        _destination = _loaded.config["notification"]["destination"]
+        add("user_config_valid", True,
+            ("present" if _loaded.present else "defaults (no user configuration)")
+            + f"; deliver={_destination or 'local (default)'}",
+            critical=False)
+    except Exception as exc:  # noqa: BLE001 - invalid config is a hard doctor failure
+        add("user_config_valid", False,
+            f"invalid configuration: {exc} "
+            "(run `hermes secretary configure validate` or `configure migrate`)",
+            critical=True)
+    try:
+        from proactive_pilot.gws_calendar import readiness_report
+        gws = readiness_report({"gws_calendar_enabled": gws_enabled})
+        add("gws_calendar", bool(gws.get("ready")),
+            f"{gws.get('reason')} (backend={gws.get('backend') or 'none'})",
+            critical=False)
+    except Exception as exc:  # noqa: BLE001
+        add("gws_calendar", False, f"probe failed: {type(exc).__name__}", critical=False)
+    add("native_context", get_native_context() is not None,
+        "host ctx available" if get_native_context() is not None else "offline (subprocess route)",
+        critical=False)
     failed = [c for c in checks if c["critical"] and not c["ok"]]
     payload = {"ok": not failed, "checks": checks, "failed": [c["check"] for c in failed],
                "capabilities": caps}
@@ -751,12 +923,14 @@ def run_once_command(args: argparse.Namespace) -> int:
     as_json = bool(getattr(args, "json", False))
     _ensure_src()
     from proactive_pilot.main import build_parser, run_once
+    use_model = bool(getattr(args, "model", False))
     argv = [
         "--state-dir", str(paths.state_dir()),
         "--policy", str(paths.policy_path()),
         "--preferences", str(paths.preferences_path()),
-        "--no-model",
     ]
+    if not use_model:
+        argv.append("--no-model")
     if getattr(args, "check", False):
         argv.append("--check")
     else:
@@ -764,12 +938,74 @@ def run_once_command(args: argparse.Namespace) -> int:
     if getattr(args, "fixture", None):
         argv += ["--fixture", str(args.fixture)]
     ns = build_parser().parse_args(argv)
+    # The host-built context is threaded through the registered handler closure
+    # for EVERY operational command -- including no-model run-once and the
+    # scheduled pipeline -- so native settings validation and every model lane
+    # see the same context. This module never constructs one.
+    ns.native_ctx = get_native_context()
+    # Production entry: with no configuration present, apply neutral generic
+    # defaults (no implicit private/legacy sources) rather than the old policy.
+    ns.require_config = True
     rc = run_once(ns)
     payload = {"ok": rc == 0, "mode": "check" if getattr(args, "check", False) else "dry-run",
                "fixture": getattr(args, "fixture", None), "rc": rc}
     _emit(payload, as_json=as_json,
           human=f"run-once ({payload['mode']}) completed rc={rc}; nothing was sent.")
     return rc
+
+
+def pipeline_command(args: argparse.Namespace) -> int:
+    """Internal scheduled handler: run the ordinary pipeline in the host context.
+
+    The scheduled pilot runner invokes ``hermes secretary pipeline`` (fixed argv,
+    same profile/data paths) so the registered handler closure receives the
+    host-built ``ctx`` from native plugin discovery. That is what makes
+    ``ctx.llm`` and native ``get_config`` authoritative on the normal schedule;
+    the runner never constructs a context itself. A real ``--run`` pipeline is
+    used (NOT run-once's dry-run), and stdout remains the single alert line.
+    """
+    _ensure_src()
+    from proactive_pilot.main import build_parser, run_once
+    argv = [
+        "--state-dir", str(paths.state_dir()),
+        "--policy", str(paths.policy_path()),
+        "--preferences", str(paths.preferences_path()),
+    ]
+    if getattr(args, "check", False):
+        argv.append("--check")
+    if getattr(args, "fixture", None):
+        argv += ["--fixture", str(args.fixture)]
+    ns = build_parser().parse_args(argv)
+    ns.native_ctx = get_native_context()
+    # Production entry: a missing configuration must not silently re-enable the
+    # legacy private/formal+informal sources.
+    ns.require_config = True
+    return run_once(ns)
+
+
+def reminders_command(args: argparse.Namespace) -> int:
+    """Registered deterministic reminder handler (no model, no ``ctx.llm``).
+
+    Forwards the host-built native context to ``reminders.main`` so the SAME
+    validated per-user configuration precedence as monitoring is authoritative
+    for aliases/calendars. The command never builds a context and never requests
+    a model; the scheduled no-argv runner enters this handler.
+    """
+    _ensure_src()
+    from proactive_pilot.reminders import main as reminders_main
+    rest = [str(a) for a in (getattr(args, "reminder_args", []) or [])]
+    argv = [
+        "--state-dir", str(paths.state_dir()),
+        "--policy", str(paths.policy_path()),
+        "--preferences", str(paths.preferences_path()),
+        *rest,
+    ]
+    if not rest or not any(
+            a in ("dispatch", "check", "list", "status")
+            or a.startswith("--add") or a == "--cancel" or a == "--scheduler-command"
+            for a in rest):
+        argv.append("dispatch")
+    return reminders_main(argv, native_ctx=get_native_context(), require_config=True)
 
 
 def watch_command(args: argparse.Namespace) -> int:
@@ -813,6 +1049,127 @@ def feedback_command(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# configure (validated per-user configuration)
+# --------------------------------------------------------------------------- #
+
+def _config_path(args: argparse.Namespace) -> Path:
+    explicit = getattr(args, "file", None)
+    return Path(explicit) if explicit else paths.user_config_path()
+
+
+def _write_user_config(path: Path, payload: dict[str, Any], force: bool) -> str:
+    import json as _json
+    if path.exists() and path.read_text(encoding="utf-8").strip() and not force:
+        return "kept"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+    return "written"
+
+
+def configure_command(args: argparse.Namespace) -> int:
+    """Validated configuration surface: show | validate | preview | init | migrate."""
+    as_json = bool(getattr(args, "json", False))
+    _ensure_src()
+    from proactive_pilot import userconfig
+    from proactive_pilot.policy import load_policy
+
+    action = args.action
+    path = _config_path(args)
+
+    try:
+        if action in ("show", "validate"):
+            loaded = userconfig.load_user_config(path, native=get_native_context())
+            payload = {
+                "ok": True,
+                "action": action,
+                "path": str(path),
+                "schema": userconfig.schema_summary(),
+                "config": loaded.summary(),
+                "policy_overrides": userconfig.policy_overrides(loaded.config),
+                "native": {
+                    "context": get_native_context() is not None,
+                    "settings_preferred": loaded.source == "native",
+                },
+            }
+            human = (f"config: {'present' if loaded.present else 'defaults'} "
+                     f"({loaded.source}, version {loaded.version}); "
+                     f"timezone={loaded.config['timezone']}")
+            _emit(payload, as_json=as_json, human=human)
+            return 0
+
+        if action == "preview":
+            loaded = userconfig.load_user_config(path, native=get_native_context())
+            base = load_policy(paths.policy_path())
+            overrides = userconfig.policy_overrides(loaded.config)
+            changes = {k: {"from": base.get(k), "to": v}
+                       for k, v in overrides.items() if base.get(k) != v}
+            payload = {"ok": True, "action": "preview", "path": str(path),
+                       "present": loaded.present, "changes": changes}
+            human = (f"config preview: {len(changes)} policy key(s) would change"
+                     if loaded.present else "config preview: no user configuration present")
+            _emit(payload, as_json=as_json, human=human)
+            return 0
+
+        if action == "init":
+            example = paths.user_config_example_path()
+            if not example.is_file():
+                raise FileNotFoundError(f"shipped neutral example missing: {example}")
+            payload = json.loads(example.read_text(encoding="utf-8"))
+            if getattr(args, "dry_run", False):
+                _emit({"ok": True, "action": "init", "dry_run": True, "path": str(path)},
+                      as_json=as_json, human=f"config init (dry-run): nothing written to {path}")
+                return 0
+            status = _write_user_config(path, payload, bool(getattr(args, "force", False)))
+            _emit({"ok": True, "action": "init", "status": status, "path": str(path)},
+                  as_json=as_json,
+                  human=f"config init: {status} {path}")
+            return 0
+
+        if action == "migrate":
+            src = Path(getattr(args, "from_policy", None) or paths.policy_path())
+            if not src.is_file():
+                raise FileNotFoundError(f"legacy policy not found: {src}")
+            legacy = json.loads(src.read_text(encoding="utf-8"))
+            migrated, report = userconfig.migrate_legacy(
+                legacy if isinstance(legacy, dict) else {},
+                mail_accounts=getattr(args, "mail_account", None),
+                calendar_accounts=getattr(args, "calendar_account", None),
+                calendar_ids=getattr(args, "calendar_id", None),
+                task_lists=getattr(args, "task_list", None),
+                task_accounts=getattr(args, "task_account", None),
+                task_adapter=getattr(args, "adapter", None),
+            )
+            migrated = userconfig.validate_config(migrated)
+            if getattr(args, "dry_run", False):
+                _emit({"ok": True, "action": "migrate", "dry_run": True,
+                       "from_policy": str(src), "path": str(path),
+                       "report": report,
+                       "policy_overrides": userconfig.policy_overrides(migrated)},
+                      as_json=as_json, human=f"config migrate (dry-run): reviewed {src}")
+                return 0
+            status = _write_user_config(path, migrated, bool(getattr(args, "force", False)))
+            _emit({"ok": True, "action": "migrate", "status": status,
+                   "from_policy": str(src), "path": str(path), "report": report},
+                  as_json=as_json,
+                  human=f"config migrate: {status} {path} (from {src})")
+            return 0
+    except userconfig.ConfigError as exc:
+        _emit({"ok": False, "action": action, "error": str(exc),
+               "remedy": getattr(exc, "remedy", "")},
+              as_json=as_json, human=f"configure {action} FAILED: {exc}")
+        return 1
+    except (OSError, ValueError) as exc:
+        _emit({"ok": False, "action": action, "error": f"{type(exc).__name__}: {exc}"},
+              as_json=as_json, human=f"configure {action} FAILED: {exc}")
+        return 1
+    _emit({"ok": False, "error": f"unknown configure action {action!r}"}, as_json=as_json,
+          human=f"unknown configure action {action!r}")
+    return 2
+
+
+# --------------------------------------------------------------------------- #
 # dispatch
 # --------------------------------------------------------------------------- #
 
@@ -825,8 +1182,11 @@ _DISPATCH = {
     "uninstall": uninstall_command,
     "self-test": selftest_command,
     "run-once": run_once_command,
+    "pipeline": pipeline_command,
+    "reminders": reminders_command,
     "watch": watch_command,
     "feedback": feedback_command,
+    "configure": configure_command,
     "doctor": doctor_command,
 }
 
@@ -836,7 +1196,7 @@ def secretary_command(args: argparse.Namespace) -> int:
     sub = getattr(args, "secretary_command", None)
     if not sub:
         print("usage: hermes secretary {setup,status,pause,resume,disable,uninstall,"
-              "self-test,run-once,watch,feedback,doctor}")
+              "self-test,run-once,watch,feedback,configure,doctor}")
         return 2
     handler = _DISPATCH.get(sub)
     if handler is None:

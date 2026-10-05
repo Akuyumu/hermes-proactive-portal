@@ -115,6 +115,67 @@ def _insert_secretary_src() -> str:
 
 
 ALLOWED_MAIL_ACCOUNTS: tuple[str, ...] = ("formal", "informal")
+
+
+def configured_mail_accounts(policy: dict[str, Any] | None) -> tuple[str, ...]:
+    """Explicit mail account allowlist for this run.
+
+    When the validated user configuration supplies ``mail_accounts`` (mapped to
+    ``policy['mail_accounts']``), only those explicitly configured names are
+    read; an empty list means "no private mail". When the key is ABSENT the
+    legacy implicit behaviour (``formal``/``informal``) is preserved exactly, so
+    existing deployments and tests are unchanged.
+    """
+    if isinstance(policy, dict) and "mail_accounts" in policy:
+        raw = policy.get("mail_accounts")
+        if isinstance(raw, (list, tuple)):
+            out: list[str] = []
+            for item in raw:
+                name = str(item or "").strip()
+                if name and name not in out:
+                    out.append(name)
+            return tuple(out)
+    return ALLOWED_MAIL_ACCOUNTS
+
+
+def configured_calendar_accounts(policy: dict[str, Any] | None) -> list[str] | None:
+    """Configured calendar accounts, or ``None`` to keep library discovery.
+
+    ``None`` (key absent) preserves the legacy behaviour of using every alias
+    the compatibility library reports. An explicit list (even empty) narrows
+    reads to exactly the configured accounts -- credentials alone never widen
+    access.
+    """
+    if isinstance(policy, dict) and "calendar_accounts" in policy:
+        raw = policy.get("calendar_accounts")
+        if isinstance(raw, (list, tuple)):
+            return [str(item).strip() for item in raw if str(item or "").strip()]
+        return []
+    return None
+
+
+def _task_aliases(policy: dict[str, Any]) -> list[str]:
+    """Independent task scope; shared aliases only for legacy omitted scope."""
+    if "task_accounts" in policy:
+        raw = policy["task_accounts"]
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return list(dict.fromkeys(item.strip() for item in raw
+                                  if isinstance(item, str) and item.strip()))
+    return _google_aliases(policy)
+
+
+def source_enabled(policy: dict[str, Any], key: str) -> bool:
+    """Per-source enablement, defaulting ON to preserve legacy behaviour.
+
+    A validated user configuration always sets these keys; without one the
+    absent key means "on" exactly as before.
+    """
+    if isinstance(policy, dict) and key in policy:
+        return bool(policy.get(key))
+    return True
+
+
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGES = 20
 MAX_STDOUT = 512 * 1024
@@ -621,6 +682,7 @@ def collect_himalaya_native(
     pending_ids: Sequence[str] | None = None,
     preview_skip_ids: set[str] | None = None,
     query: str = "",
+    allowed_accounts: Sequence[str] | None = None,
 ) -> SourceResult:
     """Supported native Gmail metadata route (bounded, resumable, read-only).
 
@@ -652,7 +714,8 @@ def collect_himalaya_native(
     runner = runner or SubprocessRunner()
     name = f"mail:{account}"
     checked = _checked_at(clock)
-    if account not in ALLOWED_MAIL_ACCOUNTS:
+    allowed = tuple(allowed_accounts) if allowed_accounts is not None else ALLOWED_MAIL_ACCOUNTS
+    if account not in allowed:
         return SourceResult(name, "error", error="account not authorized", checked_at=checked)
 
     if not cutoff_date:
@@ -677,7 +740,7 @@ def collect_himalaya_native(
             runner=runner, timeout=timeout, preview_limit=preview_limit,
             preview_chars=preview_chars, preview_selector=preview_selector,
             preview_timeout=preview_timeout, preview_skip_ids=preview_skip_ids,
-            server_window=False,
+            server_window=False, allowed_accounts=allowed_accounts,
         )
 
     # Reuse the persisted page queue while it still has unvisited ids. Only when
@@ -829,6 +892,7 @@ def collect_himalaya(
     max_pages: int = MAX_PAGES,
     preview_skip_ids: set[str] | None = None,
     server_window: bool = False,
+    allowed_accounts: Sequence[str] | None = None,
 ) -> SourceResult:
     """Bounded Inbox metadata for one authorized Himalaya account (last window).
 
@@ -855,7 +919,8 @@ def collect_himalaya(
     runner = runner or SubprocessRunner()
     name = f"mail:{account}"
     checked = _checked_at(clock)
-    if account not in ALLOWED_MAIL_ACCOUNTS:
+    allowed = tuple(allowed_accounts) if allowed_accounts is not None else ALLOWED_MAIL_ACCOUNTS
+    if account not in allowed:
         return SourceResult(name, "error", error="account not authorized", checked_at=checked)
 
     now = clock.now()
@@ -1025,8 +1090,17 @@ def _google_access_token(alias: str) -> str:
     return token
 
 
-def _google_aliases() -> list[str]:
-    """Authorized Google account aliases (primary + configured aliases)."""
+def _google_aliases(policy: dict[str, Any] | None = None) -> list[str]:
+    """Authorized Google account aliases (primary + configured aliases).
+
+    Availability discovery is separate from explicit configured access: when a
+    validated user configuration names calendar accounts, only those are read
+    (an empty configured list means none). Without that key the legacy
+    library-discovered aliases are preserved.
+    """
+    configured = configured_calendar_accounts(policy)
+    if configured is not None:
+        return list(configured)
     try:
         _insert_secretary_src()
         from secretary.oauth import GOOGLE_ALIASES  # type: ignore
@@ -1139,6 +1213,7 @@ def collect_calendar(
     max_items: int = 20,
     timeout: int = 30,
     page_size: int = DEFAULT_PAGE_SIZE,
+    calendar_ids: list[str] | None = None,
 ) -> SourceResult:
     name = f"calendar:{alias}"
     checked = _checked_at(clock)
@@ -1155,6 +1230,8 @@ def collect_calendar(
             time_min = now.isoformat()
             time_max = (now + timedelta(hours=max(1, int(horizon_hours)))).isoformat()
             selected = _selected_calendars(client)
+            if calendar_ids:
+                selected = [cal for cal in selected if cal.get("id") in calendar_ids]
 
             def absorb(calendar_id: str, calendar: dict[str, Any], batch: list[dict[str, Any]]) -> None:
                 for event in batch:
@@ -1285,9 +1362,13 @@ def collect_tasks(
     max_items: int = 20,
     timeout: int = 30,
     page_size: int = DEFAULT_PAGE_SIZE,
+    task_lists: list[str] | None = None,
+    task_adapter: str = "",
 ) -> SourceResult:
     name = f"tasks:{alias}"
     checked = _checked_at(clock)
+    if task_adapter not in {"", "tasks", "productivity_secretary"}:
+        return SourceResult(name, "error", error="unsupported tasks adapter", checked_at=checked)
     missing = secretary_library_error()
     if missing:
         return SourceResult(name, "error", error=missing, checked_at=checked)
@@ -1305,6 +1386,17 @@ def collect_tasks(
             truncated = lists_truncated
             raw_cap = max(max_items, max_items * 3)
             for tasklist in lists:
+                # Bare entries are exact IDs or exact titles (case-sensitive).
+                # id:/name: disambiguate when an ID and title collide.
+                if task_lists and not any(
+                    (entry[3:] == tasklist.get("id") if entry.startswith("id:") else
+                     entry[5:] == tasklist.get("title") if entry.startswith("name:") else
+                     entry in (tasklist.get("id"), tasklist.get("title")))
+                    for entry in task_lists
+                ):
+                    continue
+                if not isinstance(tasklist.get("id"), str) or not tasklist["id"]:
+                    continue
                 remaining = raw_cap - len(raw)
                 if remaining <= 0:
                     truncated = True
@@ -1412,41 +1504,72 @@ def default_sources(policy: dict[str, Any], clock: Any,
     preview_timeout = int(policy.get("mail_preview_timeout_seconds", 2))
 
     factories: list[Callable[[], SourceResult]] = []
-    for alias in _google_aliases():
-        factories.append(
-            lambda alias=alias: _budgeted(
-                f"calendar:{alias}", budget,
-                lambda: collect_calendar(
-                    alias, clock=clock, horizon_hours=horizon, max_items=cal_limit,
-                    page_size=page_size, timeout=_clamp_timeout(budget, 25),
-                ),
+    calendar_on = source_enabled(policy, "calendar_enabled")
+    tasks_on = source_enabled(policy, "tasks_enabled")
+    mail_on = source_enabled(policy, "mail_enabled")
+    mail_accounts = configured_mail_accounts(policy)
+
+    # Optional Google Workspace calendar adapter: only when explicitly enabled
+    # AND explicit calendars are configured. A source call happens only here,
+    # never during registration/doctor probing.
+    gws_calendar_ids = list(policy.get("calendar_ids") or [])
+    if calendar_on and policy.get("gws_calendar_enabled") and gws_calendar_ids:
+        from .gws_calendar import GwsCalendarAdapter
+
+        adapter = GwsCalendarAdapter(policy)
+        for calendar_id in gws_calendar_ids:
+            factories.append(
+                lambda calendar_id=calendar_id: _budgeted(
+                    f"calendar:gws:{calendar_id}", budget,
+                    lambda: adapter.collect(clock, {**policy, "calendar_ids": [calendar_id]},
+                                            budget=budget),
+                )
             )
-        )
-        factories.append(
-            lambda alias=alias: _budgeted(
-                f"tasks:{alias}", budget,
-                lambda: collect_tasks(
-                    alias, clock=clock, horizon_days=task_days, max_items=task_limit,
-                    page_size=page_size, timeout=_clamp_timeout(budget, 25),
-                ),
+
+    compatibility_on = policy.get("productivity_secretary_enabled", True)
+    if calendar_on and compatibility_on:
+        for alias in _google_aliases(policy):
+            factories.append(
+                lambda alias=alias: _budgeted(
+                    f"calendar:{alias}", budget,
+                    lambda: collect_calendar(
+                        alias, clock=clock, horizon_hours=horizon, max_items=cal_limit,
+                        page_size=page_size, timeout=_clamp_timeout(budget, 25),
+                        calendar_ids=policy.get("calendar_ids"),
+                    ),
+                )
             )
-        )
-    for account in ALLOWED_MAIL_ACCOUNTS:
-        factories.append(
-            lambda account=account: _budgeted(
-                f"mail:{account}", budget,
-                lambda: collect_himalaya(
-                    account, mail_limit, clock=clock, window_hours=mail_window,
-                    page_size=page_size, preview_limit=previews,
-                    preview_timeout=preview_timeout,
-                    timeout=_clamp_timeout(budget, 20), max_pages=1,
-                    # The Gmail backend rejects the shared ``envelope search``
-                    # command, so production base mail goes straight to the
-                    # supported plain envelope list (no wasted failed call).
-                    server_window=False,
-                ),
+    if tasks_on and compatibility_on:
+        for alias in _task_aliases(policy):
+            factories.append(
+                lambda alias=alias: _budgeted(
+                    f"tasks:{alias}", budget,
+                    lambda: collect_tasks(
+                        alias, clock=clock, horizon_days=task_days, max_items=task_limit,
+                        page_size=page_size, timeout=_clamp_timeout(budget, 25),
+                        task_lists=policy.get("task_lists"),
+                        task_adapter=policy.get("task_adapter", ""),
+                    ),
+                )
             )
-        )
+    if mail_on:
+        for account in mail_accounts:
+            factories.append(
+                lambda account=account: _budgeted(
+                    f"mail:{account}", budget,
+                    lambda: collect_himalaya(
+                        account, mail_limit, clock=clock, window_hours=mail_window,
+                        page_size=page_size, preview_limit=previews,
+                        preview_timeout=preview_timeout,
+                        timeout=_clamp_timeout(budget, 20), max_pages=1,
+                        # The Gmail backend rejects the shared ``envelope search``
+                        # command, so production base mail goes straight to the
+                        # supported plain envelope list (no wasted failed call).
+                        server_window=False,
+                        allowed_accounts=mail_accounts,
+                    ),
+                )
+            )
     return factories
 
 

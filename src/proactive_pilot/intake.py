@@ -377,19 +377,49 @@ class NativeIntakeModel:
     def __init__(self, hermes_bin: str = "hermes", profile: str = "default",
                  toolset: str = "context_engine",
                  runner: Callable[[list[str], str, int], tuple[int, str, str]] | None = None,
-                 resolver: Callable[..., tuple[bool, list[str], str]] | None = None):
+                 resolver: Callable[..., tuple[bool, list[str], str]] | None = None,
+                 ctx: Any = None):
         self.hermes_bin = hermes_bin
         self.profile = profile
         self.toolset = toolset
         self.runner = runner
         self.resolver = resolver or resolve_toolset_tools
+        # Optional host-built context: when usable, intake extraction goes through
+        # the bounded host-owned ``ctx.llm`` lane; subprocess is the explicit
+        # compatibility fallback for an older runtime.
+        self.ctx = ctx
+        self.route = "subprocess"
         self.calls = 0
+
+    def _native_lane(self, policy: dict[str, Any]) -> Any:
+        if self.ctx is None:
+            return None
+        from .native_runtime import build_model_lane
+
+        lane = build_model_lane(self.ctx, policy, path="intake",
+                                purpose="secretary.intake")
+        return lane if lane.available else None
 
     def build_prompt(self, text: str) -> str:
         return INTAKE_SYSTEM + "\n\nREQUEST:\n" + text + "\n\nReturn only the JSON object."
 
     def extract(self, text: str, policy: dict[str, Any]) -> dict[str, Any]:
         cfg = policy.get("evaluator", {}) or {}
+        lane = self._native_lane(policy)
+        if lane is not None:
+            self.calls += 1
+            try:
+                self.route = "ctx.llm"
+                return lane.complete_json(
+                    instructions=self.build_prompt(text),
+                    schema_name="secretary.intake",
+                    max_tokens=int(policy.get("intake_max_tokens", 800)),
+                    timeout=float(policy.get("intake_timeout_seconds", 60)),
+                    temperature=0.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - sanitized, caller falls back
+                raise IntakeError(
+                    f"intake ctx.llm failed ({type(exc).__name__})") from exc
         resolved_ok, names, detail = self.resolver(
             self.toolset, hermes_bin=self.hermes_bin,
             timeout=int(cfg.get("resolve_timeout_seconds", 30)))
@@ -457,7 +487,8 @@ def intake_command(args: Any) -> int:
         watches = active_watches(load_watchstore(store), now)
     except Exception:  # noqa: BLE001 - no active watch simply disables corrections
         watches = []
-    model = NativeIntakeModel() if not getattr(args, "no_model", False) else None
+    model = (NativeIntakeModel(ctx=getattr(args, "native_ctx", None))
+             if not getattr(args, "no_model", False) else None)
     # Explicit CLI provenance is preserved verbatim; an absent/empty value gets
     # the honest trusted-intake default. Never overwrite a supplied (e.g.
     # synthetic test) provenance with a claim of a genuine user request.

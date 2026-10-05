@@ -55,6 +55,21 @@ def default_policy_path() -> Path:
     return plugin_root() / "policy" / "policy.default.json"
 
 
+def user_config_example_path() -> Path:
+    """The shipped neutral example user configuration (never installed as-is)."""
+    return plugin_root() / "policy" / "user-config.example.json"
+
+
+def user_config_path() -> Path:
+    """The validated per-user configuration written by ``configure``.
+
+    It lives beside ``policy.json`` in the owner-only data root; the runtime
+    reads it as a sibling of the policy path so scheduled runners resolve the
+    same file without hardcoding.
+    """
+    return data_root() / "user_config.json"
+
+
 def scripts_dir() -> Path:
     """The native scheduler's script directory: ``$HERMES_HOME/scripts``."""
     return hermes_home() / "scripts"

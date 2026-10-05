@@ -57,9 +57,65 @@ def _default_argv() -> list[str]:
     ]
 
 
+def _native_cli_bridge() -> int | None:
+    """Scheduled route: run the ordinary pipeline through the registered native CLI.
+
+    The scheduler invokes this script with NO arguments. Rather than importing the
+    pipeline directly (which would leave ``ctx.llm``/native settings unavailable),
+    we invoke the registered ``hermes secretary pipeline`` handler with fixed argv
+    so native plugin discovery builds and passes the host context.
+
+    Fail-closed contract:
+    * the direct-import compatibility fallback is used ONLY when the native CLI
+      is verifiably unavailable BEFORE any work starts (returning ``None``), and
+      that is reported on stderr;
+    * any failure or timeout AFTER the native pipeline was spawned (OSError,
+      SubprocessError/TimeoutExpired) returns a non-zero code so the caller NEVER
+      retries a second collector/model run and never bypasses a failed native
+      context. Stderr is forwarded separately; only the alert line ever reaches
+      stdout.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    hermes = os.environ.get("HERMES_BIN") or shutil.which("hermes")
+    if not hermes:
+        print("proactive-secretary: native hermes CLI unavailable; using the "
+              "direct-import compatibility fallback", file=sys.stderr)
+        return None
+    import paths  # noqa: E402 - resolved from the installed plugin root
+
+    argv = [hermes, "secretary", "pipeline", "--data-dir", str(paths.data_root())]
+    try:
+        proc = subprocess.run(argv, shell=False, capture_output=True, text=True,
+                              timeout=300, check=False)
+    except subprocess.TimeoutExpired:
+        print("proactive-secretary: native pipeline timed out AFTER start; "
+              "failing closed (no retry/fallback)", file=sys.stderr)
+        return 1
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"proactive-secretary: native pipeline failed AFTER start "
+              f"({type(exc).__name__}); failing closed (no retry/fallback)",
+              file=sys.stderr)
+        return 1
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    if proc.returncode != 0:
+        return proc.returncode
+    out = (proc.stdout or "").strip()
+    if out:
+        sys.stdout.write(out + "\n")
+    return 0
+
+
 if __name__ == "__main__":
     if not _native_gate():
         raise SystemExit(0)
+    if not sys.argv[1:]:
+        _bridge_rc = _native_cli_bridge()
+        if _bridge_rc is not None:
+            raise SystemExit(_bridge_rc)
     from proactive_pilot.main import main as _pilot_main  # noqa: E402
     _argv = sys.argv[1:] or _default_argv()
     raise SystemExit(_pilot_main(_argv))

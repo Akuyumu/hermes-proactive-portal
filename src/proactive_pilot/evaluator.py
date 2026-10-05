@@ -119,6 +119,7 @@ class EvaluatorResult:
     tools: int = 0
     latency_ms: int = 0
     error: str = ""
+    route: str = ""  # which model route was used (ctx.llm | subprocess | fixture)
 
 
 class Evaluator(Protocol):
@@ -342,6 +343,27 @@ def _iso_aware(value: str) -> tuple[bool, datetime | None]:
     return True, parsed
 
 
+def evaluator_prompt(packet: dict[str, Any], policy: dict[str, Any]) -> str:
+    """The bounded evidence prompt shared by every model route."""
+    prefs = policy.get("_preferences", {})
+    persona = str(policy.get("persona") or DEFAULT_PERSONA)
+    notify_address = str(policy.get("notify_address") or DEFAULT_NOTIFY_ADDRESS)
+    system_policy = (
+        SYSTEM_POLICY.replace("{persona}", persona)
+        .replace("{notify_address}", notify_address)
+    )
+    return (
+        system_policy
+        + "\n\nEVIDENCE PACKET:\n"
+        + json.dumps(packet, ensure_ascii=False, indent=2)
+        + "\n\nKNOWN EXPLICIT PREFERENCES:\n"
+        + json.dumps(prefs.get("explicit", []), ensure_ascii=False)
+        + "\n\nTENTATIVE INFERRED PREFERENCES (advisory):\n"
+        + json.dumps(prefs.get("inferred", []), ensure_ascii=False)
+        + "\n\nReturn only the JSON object."
+    )
+
+
 class NativeEvaluator:
     """Calls the native hermes CLI. Never pins model; no tools enabled."""
 
@@ -350,23 +372,7 @@ class NativeEvaluator:
         self.profile = profile
 
     def _prompt(self, packet: dict[str, Any], policy: dict[str, Any]) -> str:
-        prefs = policy.get("_preferences", {})
-        persona = str(policy.get("persona") or DEFAULT_PERSONA)
-        notify_address = str(policy.get("notify_address") or DEFAULT_NOTIFY_ADDRESS)
-        system_policy = (
-            SYSTEM_POLICY.replace("{persona}", persona)
-            .replace("{notify_address}", notify_address)
-        )
-        return (
-            system_policy
-            + "\n\nEVIDENCE PACKET:\n"
-            + json.dumps(packet, ensure_ascii=False, indent=2)
-            + "\n\nKNOWN EXPLICIT PREFERENCES:\n"
-            + json.dumps(prefs.get("explicit", []), ensure_ascii=False)
-            + "\n\nTENTATIVE INFERRED PREFERENCES (advisory):\n"
-            + json.dumps(prefs.get("inferred", []), ensure_ascii=False)
-            + "\n\nReturn only the JSON object."
-        )
+        return evaluator_prompt(packet, policy)
 
     def evaluate(self, packet: dict[str, Any], policy: dict[str, Any]) -> EvaluatorResult:
         import time
@@ -425,7 +431,64 @@ class NativeEvaluator:
         result = validate_object(obj, packet)
         result.tools = tools
         result.latency_ms = latency
+        result.route = "subprocess"
         return result
+
+
+class NativeLlmEvaluator:
+    """Evaluator over the host-owned ``ctx.llm`` lane.
+
+    Runs one bounded, zero-tool structured call on the user's active
+    provider/model, with the SAME strict output validation as the subprocess
+    route. It never requests a provider/model/agent/profile override and never
+    sees a credential. When the context is unavailable it fails closed with
+    ``action='error'`` so callers can fall back deliberately (with the route
+    reported), never silently.
+    """
+
+    def __init__(self, ctx: Any, policy: dict[str, Any] | None = None):
+        from .native_runtime import build_llm_route
+
+        self.route = build_llm_route(ctx, policy, path="evaluator",
+                                     purpose="secretary.evaluate")
+
+    def evaluate(self, packet: dict[str, Any], policy: dict[str, Any]) -> EvaluatorResult:
+        import time
+
+        started = time.monotonic()
+        if not self.route.available:
+            return EvaluatorResult("error", error=self.route.reason, route="ctx.llm")
+        cfg = policy.get("evaluator", {})
+        max_tokens = int(cfg.get("max_tokens", 1200))
+        timeout = int(cfg.get("timeout_seconds", 100))
+        prompt = evaluator_prompt(packet, policy)
+        try:
+            result = self.route.complete_structured(
+                instructions=prompt,
+                input=[{"type": "text", "text": "Evaluate the evidence packet above."}],
+                schema_name="secretary.evaluate",
+                system_prompt=(str(policy.get("persona") or DEFAULT_PERSONA)
+                               + ": output only the JSON verdict object"),
+                max_tokens=max_tokens,
+                timeout=timeout,
+                temperature=0.0,
+            )
+        except Exception as exc:  # noqa: BLE001 - sanitized route failure
+            return EvaluatorResult("error", error=f"ctx.llm unavailable: {type(exc).__name__}",
+                                   route="ctx.llm",
+                                   latency_ms=int((time.monotonic() - started) * 1000))
+        latency = int((time.monotonic() - started) * 1000)
+        parsed = getattr(result, "parsed", None)
+        raw_text = getattr(result, "text", "") or ""
+        obj = parsed if isinstance(parsed, dict) else _extract_json(raw_text)
+        if obj is None:
+            return EvaluatorResult("invalid", reason="unparseable JSON", raw=raw_text[-500:],
+                                   route="ctx.llm", latency_ms=latency)
+        out = validate_object(obj, packet)
+        out.tools = 0
+        out.latency_ms = latency
+        out.route = "ctx.llm"
+        return out
 
 
 class FakeEvaluator:

@@ -43,9 +43,42 @@ Read the repository's `AGENT_SETUP.md` before installing or configuring a new
 user's deployment. Discover the active profile and existing connectors, obtain
 an explicitly authorised destination, review timezone/quiet hours and public
 interests, and prepare with `setup --no-cron` before arming jobs. The repository
-is private and requires access. Mail account names and calendar/task connector
-requirements are currently specific, not automatically mapped to arbitrary
-services; report missing coverage instead of silently expanding access.
+is private and requires access.
+
+Write and validate the generic per-user configuration instead of hand-editing:
+
+```bash
+hermes secretary configure init        # neutral example (timezone UTC, no accounts)
+hermes secretary configure validate    # fail-closed; non-zero on bad/corrupt config
+hermes secretary configure preview     # policy keys that would change
+hermes secretary configure migrate --from-policy '<policy.json>' --dry-run
+```
+
+Name exactly the mail accounts, calendar accounts/IDs and independent task accounts/lists that may be
+read; credential presence is never permission. The configuration is versioned,
+rejects credential values, and never silently rewrites a nonempty file. Optional
+private connectors (productivity-secretary library, Google Workspace calendar)
+are off unless explicitly enabled; report missing coverage instead of silently
+expanding access.
+
+Source schema: `mail.accounts`/`mail.aliases`, `calendar.accounts`/
+`calendar.calendars`, `tasks.accounts`/`tasks.lists`/`tasks.adapter`. New defaults
+have empty account arrays and disabled sources/adapters. Empty account arrays
+read no connector; empty calendar IDs retain selected/primary/holiday calendars
+within configured accounts, and empty task lists retain all visible lists within
+configured task accounts. Nonempty IDs/lists restrict actual requests; task list
+entries are exact case-sensitive IDs/titles (`id:ID` or `name:TITLE` disambiguate).
+Supported task adapters: empty, `tasks`, `productivity_secretary`; other values
+fail closed. Tasks use the compatibility library, not the Google Workspace route.
+
+Migration options: repeatable `--mail-account`, `--calendar-account`,
+`--calendar-id`, `--task-account`, `--task-list`, plus `--adapter`. Inputs win;
+omission preserves prior explicit scope, aliases, interests and adapters,
+including empty arrays. Review `report.source_mappings`. Explicit legacy
+migration alone may record formerly omitted account discovery in
+`advanced.legacy_account_discovery`; old user configs without `tasks.accounts`
+copy explicit calendar accounts with a warning. Set task accounts explicitly to
+separate them, including task-only monitoring with calendars disabled.
 
 ## One-command setup
 
@@ -138,6 +171,7 @@ uninstall. Already-delivered messages are not revoked; only future runs stop.
 | `hermes secretary watch list` | List public watches |
 | `hermes secretary watch remove <id>` | Remove a public watch |
 | `hermes secretary feedback <action> [options]` | Record/inspect preferences (see below) |
+| `hermes secretary configure <show\|validate\|preview\|init\|migrate>` | Validated per-user configuration (accounts, calendars, sources, bounds) |
 | `hermes secretary doctor` | Environment and wiring diagnostics |
 
 Every command accepts `--json` and exits non-zero on failure.
@@ -174,19 +208,26 @@ Rules:
 
 ## Requested reminders
 
-Use the durable registry, never an untracked time-only cron job:
+Use the durable registry, never an untracked time-only cron job. The registered
+`hermes secretary reminders` handler is deterministic (zero model calls) and
+runs with the same validated configuration precedence as monitoring:
 
 ```bash
-# Bind to an exact authorised calendar event (validated by a fresh read):
-hermes secretary feedback watch ...        # (public watches use the watch command)
+hermes secretary reminders list          # inspect the registry
+hermes secretary reminders status
+hermes secretary reminders dispatch      # scheduled path (one bounded stdout line)
 ```
 
 Event-bound and time-only reminders are created by the underlying registry
-command (the plugin forwards `hermes secretary feedback` actions). Prefer:
-ask for the exact event, the authorised alias / calendar ID / event ID,
-timezone and requested lead time; only then register. Inspect with the registry
-list/status and cancel by exact id. Never fabricate provenance or bind to an
-ambiguous message.
+command with `--add-time`/`--add-event` (public watches use the separate
+`watch` command). Prefer: ask for the exact event, the authorised alias /
+calendar ID / event ID, timezone and requested lead time; only then register.
+Inspect with the registry list/status and cancel by exact id. Never fabricate
+provenance or bind to an ambiguous message. Event reads are authorised ONLY by
+the explicit `calendar.accounts`/`calendar.calendars`; mail accounts are never
+unioned in, a disabled or empty calendar scope reads no event source, and the
+optional Google Workspace adapter reports event fresh-get as explicitly
+unsupported (non-destructive).
 
 Requested reminders bypass ordinary quiet hours / daily cap / cooldown (the user
 explicitly asked) but **never** a global pause and never the explicit-provenance

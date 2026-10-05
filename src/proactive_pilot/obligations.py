@@ -27,6 +27,7 @@ from .collectors import (
     ALLOWED_MAIL_ACCOUNTS,
     SourceResult,
     collect_himalaya_native,
+    configured_mail_accounts,
     safe_source_error,
 )
 
@@ -582,7 +583,8 @@ def collect_obligations(
     # Rotate which account starts, so a slow core pass can never indefinitely
     # starve the second obligation account. The cursor is persisted and flips
     # each run, but at least one account is always attempted.
-    accounts = list(ALLOWED_MAIL_ACCOUNTS)
+    # Explicit configured access wins; ABSENT config keeps the legacy accounts.
+    accounts = list(configured_mail_accounts(policy))
     account_cursor = int(data.get("account_cursor", 0)) % max(1, len(accounts))
     ordered_accounts = accounts[account_cursor:] + accounts[:account_cursor]
     data["account_cursor"] = (account_cursor + 1) % max(1, len(accounts))
@@ -678,6 +680,7 @@ def collect_obligations(
                 start_token=start_token, start_offset=start_offset,
                 pending_ids=start_pending,
                 timeout=timeout, preview_skip_ids=skip_ids,
+                allowed_accounts=accounts,
             )
         except Exception as exc:  # noqa: BLE001 - surface as coverage failure
             cursor["last_error"] = safe_source_error(exc, kind="obligation")

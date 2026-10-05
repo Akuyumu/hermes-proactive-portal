@@ -15,9 +15,13 @@ limits, configuration, verification and safe uninstall.
 
 This repository is currently **private**. Other users need repository access or
 an authorised distribution of the package; this is not a public catalog listing.
-The package is profile/path-safe, but its private-source connectors are not yet
-universal. Calendar/tasks need an external library; mail expects existing
-`formal`/`informal` Himalaya accounts. See the guide before promising compatibility.
+The package is profile/path-safe. Its configured source/account mapping is
+explicit: without configuration it keeps the legacy `formal`/`informal` Himalaya
+accounts and the external productivity-secretary library; with a validated user
+configuration you name the accounts, calendars and task lists that are read.
+Calendar/tasks via the bundled optional Google Workspace adapter still need the
+installed skill and its existing authorisation. See the guide before promising
+compatibility.
 
 ## Quickstart
 
@@ -29,10 +33,15 @@ hermes plugins enable hermes-proactive-secretary
 # 2. prepare policy/state without schedules; review timezone, coverage and interests
 hermes secretary setup --no-cron
 
-# 3. arm the verified jobs with an explicitly authorised destination
+# 3. write/validate the validated per-user configuration (generic neutral defaults)
+hermes secretary configure init
+hermes secretary configure validate
+hermes secretary configure preview
+
+# 4. arm the verified jobs with an explicitly authorised destination
 hermes secretary setup --deliver '<verified-delivery-target>' # or --deliver local
 
-# 4. verify
+# 5. verify
 hermes secretary status
 hermes secretary doctor
 hermes secretary self-test
@@ -98,12 +107,29 @@ can then explain the coverage on your machine.
 - Collects (read-only, bounded, fixed-argv) from whichever connectors are
   available:
   - calendar + tasks through an external productivity-secretary library when
-    installed and authorised (not bundled with this plugin);
-  - mail metadata through the Himalaya CLI when present (`formal`/`informal`
-    accounts only), never message bodies beyond a short redacted preview;
+    installed and authorised (not bundled with this plugin), or through the
+    optional Google Workspace calendar adapter when explicitly enabled;
+  - mail metadata through the Himalaya CLI using exactly the accounts named in
+    the validated user configuration (legacy deployments keep `formal`/
+    `informal`), never message bodies beyond a short redacted preview;
   - public feeds/pages when a user saves a public watch.
 - Builds a bounded evidence packet and asks the native evaluator (resolved to a
-  **zero-tool** toolset) whether anything merits interrupting you now.
+  **zero-tool** toolset) whether anything merits interrupting you now. Every
+  judgment lane -- evaluator, semantic planner, inferred-interest proposer,
+  privacy verifier and conversational intake -- prefers the host-owned `ctx.llm`
+  lane (the user's active model) and reports which route was used; the native
+  zero-tool subprocess route remains only an explicit compatibility fallback for
+  an older runtime that cannot provide a context.
+- On the normal schedule the pilot runner does **not** import the pipeline
+  directly: it invokes the registered `hermes secretary pipeline` handler with
+  fixed argv and the same profile/data paths, so the host-built `ctx` from native
+  plugin discovery (and therefore `ctx.llm` plus native `get_config`) is
+  authoritative. The reminder runner likewise enters the registered
+  `hermes secretary reminders` handler: it is deterministic, makes zero model
+  calls and never touches `ctx.llm`. A subprocess timeout/error AFTER the native
+  handler was started fails closed (no second collector/model run and no
+  fallback); the direct-import compatibility path is used only when the native
+  CLI is verifiably unavailable before any work, and that is reported.
 - Applies deterministic envelope guards: quiet hours, daily cap, cooldown,
   dedupe, expiry, stale-source handling, a single-writer lock, and your
   explicit preferences.
@@ -142,10 +168,117 @@ Without an authorised mail/calendar/task connector you get **public-source
 monitoring only** (`feed`/`obligation` evidence from public pages you
 explicitly save). No personal sources are read.
 
+## Validated per-user configuration
+
+Beyond the runtime policy, the plugin reads an optional **validated per-user
+configuration** from `plugins.entries.hermes-proactive-secretary.settings.user_config`
+(native settings, preferred) or from `user_config.json` beside `policy.json`.
+The generic neutral example ships at `policy/user-config.example.json` (timezone
+`UTC`, no accounts, no seeds, adaptive off, no owner identifiers).
+
+```bash
+hermes secretary configure init        # write the neutral example, idempotent
+hermes secretary configure show        # schema + effective config + overrides
+hermes secretary configure validate    # fail-closed validation (non-zero on error)
+hermes secretary configure preview     # policy keys that would change
+hermes secretary configure migrate --from-policy <legacy-policy.json> [--dry-run]
+```
+
+Rules the configuration layer enforces:
+
+Compatibility source scope: task accounts are independent of calendar and mail
+accounts; a task-only configuration works with calendars disabled. Empty account
+arrays read no connector. Within configured calendar accounts, an empty
+`calendar.calendars` array retains the library's selected/primary/holiday
+calendars; a nonempty array intersects those with exact calendar IDs **before**
+event reads, including the birthday pass and page-token requests. Requested
+reminders use the same selected-calendar and ID boundary. Within configured task
+accounts, empty `tasks.lists` retains all visible lists; nonempty entries match
+exact case-sensitive IDs or titles before task reads. Use `id:LIST_ID` or
+`name:LIST_TITLE` to disambiguate. `tasks.adapter` supports `""`, `"tasks"` and
+`"productivity_secretary"` (the same compatibility client); other values fail
+closed. The compatibility route also requires `adapters.productivity_secretary`.
+
+Migration inputs override prior fields; omission preserves prior explicit
+accounts, aliases, IDs, lists, adapters and interests, including empty arrays.
+For old user configs omitting `tasks.accounts`, validation copies only their
+explicit calendar accounts and reports a warning; setting `tasks.accounts: []`
+opts out. Explicit legacy-policy migration records formerly omitted calendar/task
+account scopes in `advanced.legacy_account_discovery`, preserving the original
+library alias discovery without reading connectors during migration. This marker
+is absent from neutral defaults. Review `report.source_mappings` before writing.
+
+- **Versioned and fail-closed.** An unknown/corrupt or newer version is refused;
+  a stale version needs the explicit `migrate` step and is never rewritten
+  silently. A nonempty configuration is not overwritten without `--force`.
+  A present-but-malformed native `user_config` setting (bad JSON, non-object, or
+  an unreadable settings accessor) fails closed; it never silently falls back to
+  a local file or built-in defaults. An *absent* setting is simply unset.
+- **Complete migration parity.** `migrate` retains every remaining effective
+  legacy policy field as an explicit, reported compatibility passthrough (see
+  `advanced.legacy_policy` and `report.retained_effective_fields`), and explicit
+   `--mail-account`/`--calendar-account`/`--calendar-id`/`--task-account`/`--task-list`/`--adapter`
+  inputs preserve an existing configured scope verbatim instead of hardcoding it.
+- **One semantics for monitoring and reminders.** The deterministic reminder
+  dispatcher loads/validates the exact same configuration precedence, timezone,
+  quiet hours, limits and authorised scope, and never falls back to a broad
+  account list when an explicit configuration restricts it. Event reads use ONLY
+  the explicit `calendar.accounts`/`calendar.calendars`; mail accounts are never
+  unioned into calendar authorisation. A disabled calendar or an empty explicit
+  calendar account set makes zero event getter/source calls (the reminder stays
+  active), while exact-time reminders keep working.
+- **Production entries require configuration.** The scheduled pipeline and the
+  `run-once`/`reminders` production commands thread the host `ctx` and apply the
+  neutral generic defaults when no configuration is present (or fail closed on a
+  malformed one), so a deleted/missing `user_config.json` can never silently
+  re-enable the legacy private `formal`/`informal` sources. The legacy low-level
+  API remains available only through an explicit flag for tests/back-compat.
+- **No credential values.** Credential-shaped keys (`token`, `api_key`,
+  `client_secret`, `password`, ...) are rejected; no token store lives here.
+- **Explicit access.** `mail.accounts`, `calendar.accounts`, `calendar.calendars`,
+   `tasks.accounts` and `tasks.lists` name what may be read. Credential presence alone never widens
+  access. Unknown account names are supported through bounded fixed-argv calls
+  once you name them.
+- **Configuration ≠ preferences ≠ state.** Learned preferences stay in
+  `preferences.json` and mutable state in `var/`; migration never moves a global
+  pause, so it can never silently pause or unpause.
+
+| Section | Example | Meaning |
+|---|---|---|
+| `timezone` | `"UTC"` | IANA timezone; neutral `UTC` when unset |
+| `notification.destination` | `"local"` | Native `--deliver` target (empty = keep existing) |
+| `notification.quiet_start_hour` / `quiet_end_hour` | `0` / `8` | Quiet hours |
+| `notification.daily_normal_cap` / `cooldown_minutes` | `3` / `30` | Envelope limits |
+| `sources.*` | `false` | Per-source enablement (public feeds, obligations, mail, calendar, tasks) |
+| `mail.accounts` | `[]` | Explicit Himalaya accounts (empty = no private mail) |
+| `calendar.accounts` / `calendar.calendars` | `[]` | Explicit calendar account/ID selection |
+| `tasks.lists` / `tasks.adapter` | `[]` / `""` | Task lists and adapter name |
+| `public_interests` / `public_sources` | `[]` | Public interests and vetted source specs |
+| `adaptive.mode` / `privacy_review` / `inferred_goals` | `"disabled"` | Adaptive discovery + paired privacy review |
+| `bounds.*` | `60` | Collector budget, candidate cap, per-run source cap |
+| `adapters.productivity_secretary` | `false` | Optional compatibility calendar/tasks library |
+| `adapters.gws_calendar` | `false` | Optional Google Workspace calendar adapter |
+
+### Optional Google Workspace calendar adapter
+
+When `adapters.gws_calendar` is enabled and calendars are named, calendar reads
+go through the already-installed `productivity/google-workspace` skill CLI
+(`google_api.py calendar list`) using the active `HERMES_HOME` authorisation.
+The adapter runs a fixed, read-only argv, parses the native JSON contract and
+requires absolute offsets; it fails closed (naming the disabled capability) on a
+missing skill, missing dependency, absent token, unsupported account routing,
+malformed response, non-zero exit or timeout. Readiness probing never refreshes
+or reads a token value and never calls a connector API; a real source call only
+happens after you explicitly enable the adapter. There is no Google Tasks
+command in that surface, so no Tasks adapter is invented.
+
 ## Configuration reference
 
 A generic default ships at `policy/policy.default.json`. Setup copies it to the
-data directory as `policy.json`. Notable keys:
+data directory as `policy.json`. This legacy policy file remains the runtime
+default (its shipped timezone is `Asia/Singapore`); the neutral user
+configuration above defaults to `UTC` and only overrides what it defines.
+Notable keys:
 
 | Key | Default | Meaning |
 |---|---|---|

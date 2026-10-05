@@ -41,6 +41,13 @@ def register(ctx) -> None:
         if src_str not in sys.path:
             sys.path.insert(0, src_str)
 
+    # Keep the host-built context for the registered handler closure so the
+    # ordinary pipeline can use the supported ctx.llm lane when invoked from
+    # the plugin CLI. This is the context Hermes created and passed in; the
+    # plugin never constructs one.
+    from . import secretary_cli as _cli
+    _cli.set_native_context(ctx)
+
     skill = root / "skills" / "proactive-secretary" / "SKILL.md"
     if skill.is_file():
         ctx.register_skill("proactive-secretary", skill,

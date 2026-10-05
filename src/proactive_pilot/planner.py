@@ -245,12 +245,19 @@ class NativePlanner:
     def __init__(self, hermes_bin: str = "hermes", profile: str = "default",
                  toolset: str = "context_engine",
                  runner: Callable[[list[str], str, int], tuple[int, str, str]] | None = None,
-                 resolver: Callable[..., tuple[bool, list[str], str]] | None = None):
+                 resolver: Callable[..., tuple[bool, list[str], str]] | None = None,
+                 ctx: Any = None):
         self.hermes_bin = hermes_bin
         self.profile = profile
         self.toolset = toolset
         self.runner = runner
         self.resolver = resolver or resolve_toolset_tools
+        # Optional host-built context: when present and usable, planning goes
+        # through the bounded host-owned ``ctx.llm`` lane instead of a raw
+        # subprocess. The subprocess route is retained ONLY as the explicit
+        # compatibility fallback for a runtime whose context cannot be reached.
+        self.ctx = ctx
+        self.route = "subprocess"
         self.calls = 0
 
     def build_prompt(self, watch: dict[str, Any]) -> str:
@@ -285,8 +292,40 @@ class NativePlanner:
                 + "\n\nORIGIN GUIDANCE: " + guidance
                 + "\n\nReturn only the JSON object.")
 
+    def _native_lane(self, policy: dict[str, Any]) -> Any:
+        if self.ctx is None:
+            return None
+        from .native_runtime import build_model_lane
+
+        lane = build_model_lane(self.ctx, policy, path="planner",
+                                purpose="secretary.plan")
+        return lane if lane.available else None
+
     def plan(self, watch: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
         cfg = policy.get("evaluator", {}) or {}
+        prompt = self.build_prompt(watch)
+        lane = self._native_lane(policy)
+        if lane is not None:
+            self.calls += 1
+            try:
+                obj = lane.complete_json(
+                    instructions=prompt,
+                    schema_name="secretary.plan",
+                    max_tokens=int(policy.get("adaptive_max_tokens", 1200)),
+                    timeout=float(policy.get("adaptive_plan_timeout_seconds", 60)),
+                    temperature=0.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - sanitized route failure
+                raise PlannerError(
+                    f"planner ctx.llm failed ({type(exc).__name__})") from exc
+            self.route = "ctx.llm"
+            try:
+                plan = validate_plan(obj, policy, watch=watch)
+            except PlannerError as exc:
+                raise PlannerInvalid(f"planner output failed validation: {exc}") from exc
+            plan["semantic"] = True
+            plan["provenance"] = "model"
+            return plan
         resolved_ok, names, detail = self.resolver(
             self.toolset, hermes_bin=self.hermes_bin,
             timeout=int(cfg.get("resolve_timeout_seconds", 30)),
@@ -295,7 +334,6 @@ class NativePlanner:
             raise PlannerError(f"toolset resolution failed: {detail}")
         if names:
             raise PlannerError(f"planner toolset exposes {len(names)} tools; refusing")
-        prompt = self.build_prompt(watch)
         argv = [
             self.hermes_bin, "-p", self.profile, "chat", "-Q",
             "--query-file", "-", "--source", "tool",
@@ -325,6 +363,7 @@ class NativePlanner:
             raise PlannerInvalid(f"planner output failed validation: {exc}") from exc
         # The native invocation OWNS provenance/semantic: generated labels are
         # never trusted as evidence of a real semantic model plan.
+        self.route = "subprocess"
         plan["semantic"] = True
         plan["provenance"] = "model"
         return plan

@@ -122,6 +122,7 @@ def collect_public_and_adaptive(
     resolver=None,
     interest_proposer=None,
     privacy_verifier=None,
+    native_ctx=None,
 ) -> list:
     """Collect the public category: ordinary feeds + (when enabled) adaptive.
 
@@ -150,20 +151,22 @@ def collect_public_and_adaptive(
     if adaptive_on:
         if planner is None:
             # Native zero-tool planner is the DEFAULT when the feature is enabled;
-            # tests inject a fake planner explicitly.
-            planner = NativePlanner()
+            # tests inject a fake planner explicitly. When the host-built context
+            # is available it uses the bounded ctx.llm lane; the subprocess route
+            # remains the explicit compatibility fallback.
+            planner = NativePlanner(ctx=native_ctx)
         if inferred_on and interest_proposer is None:
             # Native zero-tool PROPOSER is the default when inferred goals are on,
             # so enabling the flag never silently does zero goal selection.
             from .interestproposal import NativeInterestProposer
-            interest_proposer = NativeInterestProposer()
+            interest_proposer = NativeInterestProposer(ctx=native_ctx)
         if (inferred_on and privacy_verifier is None
                 and bool(policy.get("adaptive_privacy_review_enabled", False))):
             # Opt-in separate zero-tool SEMANTIC privacy review. Default OFF, so
             # enabling inferred goals adds zero extra model calls unless set. The
             # always-on STRUCTURAL privacy boundary runs regardless.
             from .interestproposal import NativePrivacyVerifier
-            privacy_verifier = NativePrivacyVerifier()
+            privacy_verifier = NativePrivacyVerifier(ctx=native_ctx)
         if adaptive_first is None:
             adaptive_first = next_public_rotation(store)
         prepared = prepare_adaptive_plan(policy, clock, store=store, planner=planner,
@@ -245,6 +248,33 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
         args.command = "run"
     clock = SeededClock(args.seeded_clock) if args.seeded_clock else Clock()
     policy = load_policy(args.policy)
+    # Optional validated per-user configuration lives beside the policy file.
+    # A present-but-invalid configuration fails CLOSED (no collection, no
+    # delivery) instead of silently running on defaults.
+    try:
+        from .userconfig import ConfigError, apply_user_config, default_config, load_user_config
+        _uc_path = Path(args.policy).with_name("user_config.json") if args.policy else None
+        _loaded = load_user_config(_uc_path, native=getattr(args, "native_ctx", None))
+        if _loaded.present:
+            policy = apply_user_config(policy, _loaded.config)
+            if _loaded.warnings:
+                for _warning in _loaded.warnings:
+                    print(f"proactive-pilot: config warning: {_warning}", file=sys.stderr)
+        elif getattr(args, "require_config", False):
+            # Production entry with no configuration (fresh install, or config
+            # deleted after setup): apply the NEUTRAL generic defaults so the run
+            # never reports the old policy and then reads legacy private sources.
+            # Exact-time reminders are unaffected; only explicit configuration
+            # re-enables any private source.
+            policy = apply_user_config(policy, default_config())
+            print("proactive-pilot: no user configuration present; applying neutral "
+                  "generic defaults (run `hermes secretary configure init|migrate`)",
+                  file=sys.stderr)
+    except ConfigError as exc:
+        print(f"proactive-pilot: user configuration invalid, failing closed: {exc}",
+              file=sys.stderr)
+        _emit("")
+        return 1
     try:
         prefs = load_preferences(args.preferences, strict=True)
     except FeedbackError as exc:
@@ -328,7 +358,10 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             from .collectors import Budget as _FixtureBudget
             location_budget = _FixtureBudget(
                 float(policy.get("collector_budget_seconds", 60)), label="location-fixture")
-            private_context = _collect_private_context()
+            # A no-model fixture diagnostic is a pure offline check: it must never
+            # read a private connector or the local location context.
+            if not getattr(args, "no_model", False):
+                private_context = _collect_private_context()
         else:
             from .collectors import Budget, SourceResult, safe_source_error
             # Fair category budgets over one overall 60 s wallclock. Each
@@ -372,6 +405,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                         resolver=getattr(args, "dns_resolver", None),
                         interest_proposer=getattr(args, "interest_proposer", None),
                         privacy_verifier=getattr(args, "privacy_verifier", None),
+                        native_ctx=getattr(args, "native_ctx", None),
                     ))
                 except Exception as exc:  # noqa: BLE001
                     results.append(SourceResult("feed:error", "error",
@@ -424,7 +458,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
         if args.dry_run:
             # Dry-run evaluates but never emits a deliverable message. The
             # proposal diagnostic goes to stderr so stdout stays empty.
-            ev = evaluator or (FakeEvaluator(EvaluatorResult("silence")) if args.no_model else NativeEvaluator())
+            ev, route = select_evaluator(args, policy, evaluator)
             proposal = ev.evaluate(packet, policy)
             _diag({
                 "command": args.command,
@@ -435,6 +469,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                 "reason": proposal.reason or proposal.error,
                 "tools": proposal.tools,
                 "latency_ms": proposal.latency_ms,
+                "route": proposal.route or route,
             })
             _emit("")
             return 0
@@ -453,7 +488,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
         if args.fixture:
             ev = evaluator or _fixture_evaluator(args.fixture)
         else:
-            ev = evaluator or (FakeEvaluator(EvaluatorResult("silence")) if args.no_model else NativeEvaluator())
+            ev, _route = select_evaluator(args, policy, evaluator)
 
         proposal = ev.evaluate(packet, policy)
         quiet_now = in_quiet_hours(policy, clock.now())
@@ -529,6 +564,27 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
         store.save("notify_state.json", state)
         _emit(decision.get("message", ""))
         return 0
+
+
+def select_evaluator(args, policy: dict, injected=None):
+    """Resolve the evaluator route, preferring the supported native ``ctx.llm``.
+
+    Returns ``(evaluator, route_name)``. A host context is only ever the one
+    injected by the registered CLI handler closure (``args.native_ctx``); it is
+    never constructed here. When no host lane is available the existing native
+    subprocess evaluator is used, and the route is reported explicitly.
+    """
+    if injected is not None:
+        return injected, "injected"
+    if getattr(args, "no_model", False):
+        return FakeEvaluator(EvaluatorResult("silence")), "no-model"
+    ctx = getattr(args, "native_ctx", None)
+    if ctx is not None:
+        from .evaluator import NativeLlmEvaluator
+        llm_evaluator = NativeLlmEvaluator(ctx, policy)
+        if llm_evaluator.route.available:
+            return llm_evaluator, "ctx.llm"
+    return NativeEvaluator(), "subprocess"
 
 
 def should_skip_inference(state: dict, digest: str, now, policy: dict) -> bool:

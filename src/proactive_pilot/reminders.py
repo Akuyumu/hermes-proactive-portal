@@ -206,16 +206,41 @@ class SecretaryEventGetter:
         timeout: float = GET_TIMEOUT_SECONDS,
         client_factory: Callable[[str], Any] | None = None,
         aliases: list[str] | None = None,
+        policy: dict[str, Any] | None = None,
     ) -> None:
         self.timeout = float(timeout)
         self._client_factory = client_factory
         self._aliases = list(aliases) if aliases is not None else None
+        self._policy = policy or {}
+        # Explicit calendar scope. When the validated configuration DISABLES the
+        # calendar source, no event getter/source call is ever made. When it
+        # names an explicit (possibly empty) account set, only those aliases are
+        # authorised -- mail accounts are NEVER unioned in.
+        self._enabled = bool(self._policy.get("calendar_enabled", True))
+        configured_ids = self._policy.get("calendar_ids")
+        self._calendar_ids = [str(c) for c in configured_ids] if isinstance(
+            configured_ids, (list, tuple)) and configured_ids else None
+
+    @property
+    def event_reads_allowed(self) -> bool:
+        """False when no event source read may happen at all.
+
+        A disabled calendar, or an explicit configuration with an empty account
+        set, means the dispatcher must not even call :meth:`get` for an event:
+        the reminder stays active/deferred rather than reading a default/foreign
+        account. Legacy (no configuration) keeps library discovery.
+        """
+        if not self._enabled:
+            return False
+        if self._aliases is None:
+            return True
+        return bool(self._aliases)
 
     def _authorized_aliases(self) -> list[str]:
         if self._aliases is None:
             from .collectors import _google_aliases
 
-            self._aliases = list(_google_aliases())
+            self._aliases = list(_google_aliases(self._policy))
         return self._aliases
 
     def _client(self, alias: str) -> Any:
@@ -226,8 +251,29 @@ class SecretaryEventGetter:
         return _calendar_client(alias)
 
     def get(self, alias: str, calendar_id: str, event_id: str) -> dict[str, Any]:
+        # Explicit configuration cannot be bypassed: a disabled calendar or an
+        # empty explicit account set makes event verification explicitly
+        # unavailable WITHOUT touching any client or source.
+        if not self._enabled:
+            return {"ok": False, "status": "unsupported",
+                    "error": "calendar source disabled by configuration"}
+        if self._aliases is not None and not self._aliases:
+            return {"ok": False, "status": "unsupported",
+                    "error": "no explicit calendar accounts configured"}
+        # The optional Google Workspace adapter has NO verified read-only
+        # fresh-event GET on this surface, so when it is the selected calendar
+        # source (and the compatibility library is not), event verification is
+        # explicitly UNSUPPORTED. It must never silently fall back to the
+        # compatibility library or fetch a foreign/default account. The caller
+        # treats this as a non-destructive deferred/uncertain state.
+        if self._policy.get("gws_calendar_enabled") and not self._policy.get(
+                "productivity_secretary_enabled"):
+            return {"ok": False, "status": "unsupported",
+                    "error": "event verification unsupported on the gws calendar adapter"}
         if alias not in self._authorized_aliases():
             return {"ok": False, "status": "error", "error": "alias not authorised"}
+        if self._calendar_ids is not None and calendar_id not in self._calendar_ids:
+            return {"ok": False, "status": "error", "error": "calendar not explicitly configured"}
         try:
             client = self._client(alias)
             from .collectors import _selected_calendars
@@ -738,6 +784,11 @@ def plan_dispatch(
             _reject(plan, rem, "no explicit provenance consent")
             continue
         if rem.get("kind") == "event":
+            # No configuration authorises calendar reads (disabled source or an
+            # empty explicit account set): never call the getter/source. The
+            # event reminder stays active/deferred, deterministically.
+            if not bool(getattr(getter, "event_reads_allowed", True)):
+                continue
             if not _cadence_due(rem, now):
                 continue
             if event_reads >= max(1, int(max_event_reads)):
@@ -896,7 +947,61 @@ def _load_prefs(path: str) -> dict[str, Any]:
     return load_preferences_file(Path(path), strict=True)
 
 
-def main(argv: list[str] | None = None, *, getter: EventGetter | None = None) -> int:
+def load_effective_policy(
+    policy_path: Any,
+    *,
+    native: Any = None,
+    require_config: bool = False,
+) -> tuple[dict[str, Any], list[str] | None, str]:
+    """Return ``(policy, authorised_aliases, error)`` for the reminder path.
+
+    This applies the SAME validated per-user configuration precedence as the
+    monitoring pipeline (native settings preferred, then the file beside the
+    policy). A present-but-invalid configuration fails closed (error returned, no
+    dispatch). ``authorised_aliases`` is ``None`` only when NO configuration is
+    present (legacy compatibility); when a configuration is present it is the
+    explicit configuration's calendar account set -- possibly empty -- so the
+    dispatcher never silently falls back to the broad ``_google_aliases`` list or
+    unions mail accounts into calendar authorisation.
+
+    ``require_config`` is the production-entry contract: with no configuration
+    present a neutral, source-disabled configuration is applied (exact-time
+    reminders still work deterministically; no legacy private source is read).
+    """
+    policy = load_policy(policy_path)
+    try:
+        from .userconfig import ConfigError, apply_user_config, default_config, load_user_config
+    except Exception:  # noqa: BLE001 - config layer unavailable -> legacy behaviour
+        return policy, None, ""
+    uc_path = Path(policy_path).with_name("user_config.json") if policy_path else None
+    try:
+        loaded = load_user_config(uc_path, native=native)
+    except ConfigError as exc:
+        return policy, None, str(exc)
+    if not loaded.present:
+        if require_config:
+            # Neutral no-config production default: no explicit calendar accounts
+            # => the empty alias set forbids every event getter/source call.
+            policy = apply_user_config(policy, default_config())
+            return policy, [], ""
+        return policy, None, ""
+    policy = apply_user_config(policy, loaded.config)
+    # Event authorisation comes ONLY from explicit calendar accounts. Mail
+    # accounts are never unioned into calendar access.
+    aliases: list[str] = []
+    for name in (loaded.config.get("calendar", {}).get("accounts") or []):
+        if name not in aliases:
+            aliases.append(name)
+    return policy, aliases, ""
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    getter: EventGetter | None = None,
+    native_ctx: Any = None,
+    require_config: bool = False,
+) -> int:
     args = _default_parser().parse_args(argv)
     command = str(args.command or "dispatch")
     if command == "check":
@@ -929,6 +1034,12 @@ def main(argv: list[str] | None = None, *, getter: EventGetter | None = None) ->
         except FeedbackError as exc:
             print(f"proactive-followthrough: preferences corrupt, failing closed: {exc}", file=sys.stderr)
             return 1
+        policy, configured_aliases, cfg_error = load_effective_policy(
+            args.policy, native=native_ctx, require_config=require_config)
+        if cfg_error:
+            print(f"proactive-followthrough: user configuration invalid, failing closed: {cfg_error}",
+                  file=sys.stderr)
+            return 1
         with store.lock() as acquired:
             if not acquired:
                 _diag({"diagnostic": "skip-lock", "reason": "another run holds the lock"})
@@ -946,7 +1057,8 @@ def main(argv: list[str] | None = None, *, getter: EventGetter | None = None) ->
                     entry = add_event(reg, text=args.text, alias=args.alias, calendar_id=args.calendar_id,
                                       event_id=args.event_id, lead_minutes=args.lead_minutes,
                                       provenance=args.provenance, now=now,
-                                      getter=getter or SecretaryEventGetter(),
+                                      getter=getter or SecretaryEventGetter(
+                                          aliases=configured_aliases, policy=policy),
                                       late_grace_minutes=args.late_grace_minutes)
             except ReminderError as exc:
                 _diag({"diagnostic": "rejected", "reason": str(exc)})
@@ -997,19 +1109,27 @@ def main(argv: list[str] | None = None, *, getter: EventGetter | None = None) ->
         return 0
 
     # dispatch (default) or check
-    return _dispatch(store, args, clock, now, getter=getter, check=bool(args.check))
+    return _dispatch(store, args, clock, now, getter=getter, check=bool(args.check),
+                     native_ctx=native_ctx, require_config=require_config)
 
 
 def _dispatch(store: StateStore, args: Namespace, clock: Clock, now: datetime, *,
-              getter: EventGetter | None, check: bool) -> int:
+              getter: EventGetter | None, check: bool, native_ctx: Any = None,
+              require_config: bool = False) -> int:
     try:
         prefs = _load_prefs(args.preferences)
     except FeedbackError as exc:
         print(f"proactive-followthrough: preferences corrupt, failing closed: {exc}", file=sys.stderr)
         _emit("")
         return 1
-    policy = load_policy(args.policy)
-    getter = getter or SecretaryEventGetter()
+    policy, configured_aliases, cfg_error = load_effective_policy(
+        args.policy, native=native_ctx, require_config=require_config)
+    if cfg_error:
+        print(f"proactive-followthrough: user configuration invalid, failing closed: {cfg_error}",
+              file=sys.stderr)
+        _emit("")
+        return 1
+    getter = getter or SecretaryEventGetter(aliases=configured_aliases, policy=policy)
     with store.lock() as acquired:
         if not acquired:
             _diag({"diagnostic": "skip-lock", "reason": "another run holds the lock"})
