@@ -226,7 +226,10 @@ def _plan(legacy_root: Path, *, state_dir: Path, policy_path: Path,
 
 
 def _default_targets() -> tuple[Path, Path, Path, Path, Path]:
-    import paths  # resolved from the plugin root
+    if __package__:
+        from . import paths
+    else:
+        import paths  # standalone test/tool invocation from the plugin root
     return (paths.state_dir(), paths.policy_path(), paths.preferences_path(),
             paths.data_root(), paths.migration_manifest_path())
 

@@ -60,6 +60,18 @@ class ImportTestCase(unittest.TestCase):
             else:
                 os.environ[key] = value
 
+    def test_packaged_defaults_without_top_level_plugin_path(self):
+        """Hermes loads a package; root is not necessarily on sys.path."""
+        module = importlib.import_module(f"{_PKG.__name__}.state_import")
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path if p != str(ROOT)]
+            targets = module._default_targets()
+        finally:
+            sys.path[:] = saved
+        self.assertEqual(targets[0], paths.state_dir())
+        self.assertEqual(targets[3], paths.data_root())
+
     def _legacy(self) -> Path:
         legacy = self.root / "legacy"
         (legacy / "var" / "registries" / "nested").mkdir(parents=True, exist_ok=True)
