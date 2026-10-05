@@ -37,6 +37,16 @@ Load it when the user wants to:
 - add or cancel a requested reminder;
 - understand why an alert was (or was not) sent.
 
+## First-time agent-assisted installation
+
+Read the repository's `AGENT_SETUP.md` before installing or configuring a new
+user's deployment. Discover the active profile and existing connectors, obtain
+an explicitly authorised destination, review timezone/quiet hours and public
+interests, and prepare with `setup --no-cron` before arming jobs. The repository
+is private and requires access. Mail account names and calendar/task connector
+requirements are currently specific, not automatically mapped to arbitrary
+services; report missing coverage instead of silently expanding access.
+
 ## One-command setup
 
 ```bash

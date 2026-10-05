@@ -9,17 +9,30 @@ It is deliberately quiet: silence is the default, and an alert only goes out for
 a genuine, evidence-backed, time-bound reason. It never sends mail, mutates
 calendars or tasks, books, purchases, or expands permissions.
 
+For agent-assisted installation, give your agent [AGENT_SETUP.md](AGENT_SETUP.md).
+It covers environment discovery, the few choices that require consent, connector
+limits, configuration, verification and safe uninstall.
+
+This repository is currently **private**. Other users need repository access or
+an authorised distribution of the package; this is not a public catalog listing.
+The package is profile/path-safe, but its private-source connectors are not yet
+universal. Calendar/tasks need an external library; mail expects existing
+`formal`/`informal` Himalaya accounts. See the guide before promising compatibility.
+
 ## Quickstart
 
 ```bash
 # 1. install + enable the plugin (standalone repo, installed under ~/.hermes/plugins)
-hermes plugins install <owner>/hermes-proactive-secretary
+hermes plugins install Akuyumu/hermes-proactive-secretary --no-enable
 hermes plugins enable hermes-proactive-secretary
 
-# 2. one-command, idempotent setup (policy, state, the two native cron jobs, verification)
-hermes secretary setup
+# 2. prepare policy/state without schedules; review timezone, coverage and interests
+hermes secretary setup --no-cron
 
-# 3. verify
+# 3. arm the verified jobs with an explicitly authorised destination
+hermes secretary setup --deliver '<verified-delivery-target>' # or --deliver local
+
+# 4. verify
 hermes secretary status
 hermes secretary doctor
 hermes secretary self-test
@@ -63,11 +76,15 @@ already delivered are not revoked.
 
 ## Offline verification vs. live cutover
 
-The automatic setup, the runner gate, the state import and the tests are all
-exercised **offline** against fake profiles: no live/private source is read, no
-network is used, and no real cron job is created or removed. Actual end-to-end
-native-cron behaviour, installed-copy promotion, publication and the live
-legacy-to-plugin cutover remain the parent's verified manual steps.
+The release was checked with an offline suite and with an installed Linux
+profile: setup, state migration, idempotency, native disable and both real
+scheduler paths were exercised. This is not certification for every fresh host
+or connector. The one-minute reminder runner is deterministic and model-free;
+the 15-minute monitoring runner may invoke LLMs internally even though both
+cron jobs use `--no-agent`.
+
+Each new installation still needs its own capability, destination and schedule
+verification. Migration does not pause or remove old jobs automatically.
 
 ## Agent-guided alternative
 
@@ -80,8 +97,8 @@ can then explain the coverage on your machine.
 
 - Collects (read-only, bounded, fixed-argv) from whichever connectors are
   available:
-  - calendar + tasks through the shipped productivity-secretary library when
-    present;
+  - calendar + tasks through an external productivity-secretary library when
+    installed and authorised (not bundled with this plugin);
   - mail metadata through the Himalaya CLI when present (`formal`/`informal`
     accounts only), never message bodies beyond a short redacted preview;
   - public feeds/pages when a user saves a public watch.
@@ -107,8 +124,10 @@ can then explain the coverage on your machine.
 
 ## Permissions and privacy
 
-- Everything runs locally except the existing native evaluator/model call that
-  judges the evidence packet.
+- Collectors, searches and fetches can contact external authorised services and
+  public sources. Native LLM calls for judgment and optional adaptive planning /
+  privacy review use the user's configured provider; this is not an offline-only
+  automation.
 - Source content is treated as untrusted evidence, never as instructions.
 - Credential/OTP messages are never fetched; URLs and codes are redacted from
   previews.
@@ -195,7 +214,7 @@ hermes plugins remove hermes-proactive-secretary
 
 `uninstall` pauses collection/delivery and removes only this plugin's own jobs.
 Runtime data — including anything brought in by `--import-from` — is preserved;
-add `--purge` to delete it. A native `hermes plugins disable` on its own leaves
+add `--purge` only with explicit approval to delete it. A native `hermes plugins disable` on its own leaves
 the schedules inert but present, so run `hermes secretary disable` before a
 native removal to clean up this plugin's own jobs and launchers.
 
