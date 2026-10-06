@@ -69,11 +69,13 @@ _SAFE_CALENDAR = re.compile(r"^[A-Za-z0-9._@:+/-]{1,128}$")
 # characters, but spaces and ordinary punctuation are allowed.
 _SAFE_LABEL = re.compile(r"^[^\n\r\t\x00]{1,160}$")
 _SAFE_TIMEZONE = re.compile(r"^[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+)*$")
+# MCP server/tool names are identifiers, never an endpoint URL or a credential.
+_SAFE_MCP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 _SECTIONS = (
     "schema", "version", "timezone", "notification", "sources", "mail",
     "calendar", "tasks", "public_interests", "public_sources", "adaptive",
-    "bounds", "adapters", "advanced",
+    "bounds", "adapters", "retrieval", "advanced",
 )
 
 
@@ -113,6 +115,21 @@ def default_config() -> dict[str, Any]:
             "collector_budget_seconds": 60,
             "max_candidates_per_kind": 60,
             "feed_max_sources_per_run": 2,
+        },
+        # Optional routed retrieval. Neutral/off by default; the server and tool
+        # are NAMED here (never an endpoint or a credential). The native Hermes
+        # OAuth connection and the operator's MCP allowlist stay host-owned.
+        "retrieval": {
+            "firecrawl_enabled": False,
+            "firecrawl_consent": False,
+            "server": "",
+            "tool": "",
+            "max_attempts_per_cycle": 1,
+            "max_attempts_per_day": 10,
+            "concurrency": 1,
+            "timeout_seconds": 30,
+            "cooldown_minutes": 60,
+            "cache_ttl_minutes": 60,
         },
         "adapters": {
             "productivity_secretary": False,
@@ -352,6 +369,36 @@ def validate_config(raw: Any) -> dict[str, Any]:
         adapters.get("gws_calendar"), "adapters.gws_calendar",
         config["adapters"]["gws_calendar"])
 
+    # Optional routed retrieval (native MCP Firecrawl). Off/neutral by default;
+    # the server/tool are names only, never an endpoint or a credential value.
+    retrieval = _require_mapping(raw.get("retrieval") or {}, "retrieval")
+    for key in ("firecrawl_enabled", "firecrawl_consent"):
+        config["retrieval"][key] = _bounded_bool(
+            retrieval.get(key), f"retrieval.{key}", config["retrieval"][key])
+    for key in ("server", "tool"):
+        value = retrieval.get(key, "")
+        if value is None:
+            value = ""
+        if not isinstance(value, str) or (value and not _SAFE_MCP_NAME.fullmatch(value.strip())):
+            raise ConfigError(
+                f"retrieval.{key} must be empty or a safe MCP name",
+                remedy="name an already-configured MCP server/tool, never a URL or a key",
+            )
+        config["retrieval"][key] = value.strip()
+    for key, low, high in (
+            ("max_attempts_per_cycle", 0, 100),
+            ("max_attempts_per_day", 0, 1000),
+            ("concurrency", 1, 8),
+            ("timeout_seconds", 1, 600),
+            ("cooldown_minutes", 0, 10080),
+            ("cache_ttl_minutes", 0, 10080)):
+        config["retrieval"][key] = _bounded_int(
+            retrieval.get(key), f"retrieval.{key}", low, high, config["retrieval"][key])
+    if config["retrieval"]["firecrawl_enabled"] and not config["retrieval"]["firecrawl_consent"]:
+        warnings.append(
+            "retrieval.firecrawl_enabled is on without retrieval.firecrawl_consent; "
+            "the route stays unavailable until explicit consent is set")
+
     # Explicit, reported compatibility passthrough of the remaining effective
     # legacy policy fields (migration parity). This is the ONLY place arbitrary
     # legacy policy scalars are retained; unknown keys are never silently dropped
@@ -444,6 +491,16 @@ def policy_overrides(config: dict[str, Any]) -> dict[str, Any]:
         "feed_max_sources_per_run": config["bounds"]["feed_max_sources_per_run"],
         "productivity_secretary_enabled": config["adapters"]["productivity_secretary"],
         "gws_calendar_enabled": config["adapters"]["gws_calendar"],
+        "firecrawl_enabled": config["retrieval"]["firecrawl_enabled"],
+        "firecrawl_consent": config["retrieval"]["firecrawl_consent"],
+        "firecrawl_mcp_server": config["retrieval"]["server"],
+        "firecrawl_mcp_tool": config["retrieval"]["tool"],
+        "firecrawl_max_attempts_per_cycle": config["retrieval"]["max_attempts_per_cycle"],
+        "firecrawl_max_attempts_per_day": config["retrieval"]["max_attempts_per_day"],
+        "firecrawl_concurrency": config["retrieval"]["concurrency"],
+        "firecrawl_timeout_seconds": config["retrieval"]["timeout_seconds"],
+        "firecrawl_cooldown_minutes": config["retrieval"]["cooldown_minutes"],
+        "firecrawl_cache_ttl_minutes": config["retrieval"]["cache_ttl_minutes"],
         "_user_config_version": config.get("version", CONFIG_VERSION),
     }
     overrides.update(typed)
@@ -553,6 +610,7 @@ class LoadedConfig:
             "calendars": list(self.config["calendar"]["calendars"]),
             "adaptive_mode": self.config["adaptive"]["mode"],
             "adapters": dict(self.config["adapters"]),
+            "retrieval": dict(self.config.get("retrieval", {})),
             "warnings": list(self.warnings),
         }
 
@@ -750,6 +808,24 @@ def migrate_legacy(
         policy.get("feed_max_sources_per_run"), "feed_max_sources_per_run", 0, 20, 2)
     report["mapped"].append("bounds")
 
+    # Routed-retrieval parity: enable/consent, named server/tool and local caps.
+    config["retrieval"]["firecrawl_enabled"] = _bounded_bool(
+        policy.get("firecrawl_enabled"), "firecrawl_enabled", False)
+    config["retrieval"]["firecrawl_consent"] = _bounded_bool(
+        policy.get("firecrawl_consent"), "firecrawl_consent", False)
+    config["retrieval"]["server"] = str(policy.get("firecrawl_mcp_server") or "")
+    config["retrieval"]["tool"] = str(policy.get("firecrawl_mcp_tool") or "")
+    for src, dst in (
+            ("firecrawl_max_attempts_per_cycle", "max_attempts_per_cycle"),
+            ("firecrawl_max_attempts_per_day", "max_attempts_per_day"),
+            ("firecrawl_concurrency", "concurrency"),
+            ("firecrawl_timeout_seconds", "timeout_seconds"),
+            ("firecrawl_cooldown_minutes", "cooldown_minutes"),
+            ("firecrawl_cache_ttl_minutes", "cache_ttl_minutes")):
+        if policy.get(src) is not None:
+            config["retrieval"][dst] = policy[src]
+    report["mapped"].append("retrieval")
+
     # Preserve the compatibility adapter and the shipped secretary library route.
     config["adapters"]["productivity_secretary"] = _bounded_bool(
         policy.get("productivity_secretary_enabled"), "productivity_secretary_enabled", True)
@@ -767,6 +843,11 @@ def migrate_legacy(
         "feed_seed_sources", "adaptive_mode", "adaptive_privacy_review_enabled",
         "adaptive_inferred_goals_enabled", "collector_budget_seconds",
         "max_candidates_per_kind", "feed_max_sources_per_run",
+        "firecrawl_enabled", "firecrawl_consent", "firecrawl_mcp_server",
+        "firecrawl_mcp_tool", "firecrawl_max_attempts_per_cycle",
+        "firecrawl_max_attempts_per_day", "firecrawl_concurrency",
+        "firecrawl_timeout_seconds", "firecrawl_cooldown_minutes",
+        "firecrawl_cache_ttl_minutes",
     }
     retained = {k: copy.deepcopy(policy[k]) for k in policy if k not in _mapped_keys}
     config["advanced"] = {"legacy_policy": retained}

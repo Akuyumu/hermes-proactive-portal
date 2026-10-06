@@ -307,6 +307,15 @@ requirement. Delivery is best-effort; do not promise hard punctuality.
   not promise complete coverage.
 - Public feed items are tentative public evidence, not obligations. A forecast
   is a forecast, not an active warning.
+- A 200 JavaScript shell is not content; the optional v0.4.0 render fallback and
+  the Firecrawl route are **off by default**, consent-gated, and reported candidly
+  by `status`/`doctor`. A challenge/interstitial/paywall page is terminal and is
+  never rendered or bypassed. Firecrawl runs only through the host-owned
+  `ctx.call_mcp` connection and a named server/tool; every call is a locally
+  capped, persisted attempt (per cycle and per UTC day, with a 429 cooldown), and
+  local attempts are not provider billing credits. Never enable a paid/consented
+  route on the user's behalf, never supply a key, and never fabricate fallback
+  success.
 - The evaluator is conservative: silence is the default and always acceptable.
 - "Emitted" means the plugin wrote a message; **actual delivery is owned by the
   native scheduler** and is not confirmed by the plugin.

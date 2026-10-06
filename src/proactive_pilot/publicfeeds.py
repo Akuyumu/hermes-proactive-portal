@@ -1403,6 +1403,43 @@ def parse_web_page(body: bytes, *, max_items: int = DEFAULT_MAX_ITEMS) -> list[d
     return out
 
 
+_MARKDOWN_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+
+
+def parse_markdown_page(body: bytes, *, max_items: int = DEFAULT_MAX_ITEMS) -> list[dict[str, Any]]:
+    """Bounded evidence from a PUBLIC page already converted to markdown.
+
+    Used ONLY by the opt-in native MCP fallback for a page the direct transport
+    served as a JavaScript shell. It re-runs the same anti-bot classification on
+    the markdown text, never follows links, and never fabricates metadata: the
+    title is the first markdown heading (or first non-empty line) and the summary
+    is bounded, de-linked plain text.
+    """
+    classification = classify_web_page(body)
+    if classification:
+        raise WebPageUnavailable(classification)
+    text = body.decode("utf-8", "replace")
+    heading = _MARKDOWN_HEADING_RE.search(text)
+    title = strip_html(heading.group(1), max_chars=200) if heading else ""
+    if not title:
+        for line in text.splitlines():
+            cleaned = strip_html(line, max_chars=200)
+            if cleaned:
+                title = cleaned
+                break
+    summary = strip_html(_MARKDOWN_LINK_RE.sub(lambda m: m.group(1), text), max_chars=400)
+    if not title and not summary:
+        raise FeedFailed("markdown page: no bounded content found")
+    return [{
+        "title": title or summary[:200],
+        "summary": summary,
+        "link": "",
+        "id": hashlib.sha256((title or summary).encode("utf-8")).hexdigest()[:16],
+        "published": "",
+    }]
+
+
 def parse_source(
     body: bytes,
     kind: str,
@@ -1410,6 +1447,8 @@ def parse_source(
     max_items: int = DEFAULT_MAX_ITEMS,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
+    if kind == "markdown_page":
+        return parse_markdown_page(body, max_items=max_items)
     if kind == "github_releases":
         return parse_github_releases(body, max_items=max_items)
     if kind == "github_search":
@@ -1965,6 +2004,8 @@ def _collect_one(
     fetcher: Callable[..., FetchResponse],
     reddit_budget: int,
     reddit_ledger: Any = None,
+    renderer: Callable[[str], Any] | None = None,
+    firecrawl: Any = None,
 ) -> tuple[SourceResult, int]:
     sid = str(rec.get("id") or "")
     kind = str(rec.get("kind") or "rss")
@@ -2083,7 +2124,54 @@ def _collect_one(
                                 failure=label), used
 
     try:
-        parsed = parse_source(response.body, kind,
+        # V0.4.0 routed fallback: a 200 JavaScript shell on a PUBLIC page may be
+        # rendered by an opt-in, consent-gated, injected approved renderer. A
+        # challenge/interstitial/paywall/login page (`blocked`) is terminal and is
+        # NEVER rendered, bypassed, or treated as evidence. Defaults (renderer
+        # None, flags off) leave the direct-transport byte path unchanged.
+        parse_body = response.body
+        parse_kind = kind
+        if (renderer is not None
+                and kind in {"web_page", "ntu_opportunity"}
+                and bool(policy.get("native_render_fallback_enabled", False))
+                and bool(policy.get("native_render_consent", False))
+                and classify_web_page(parse_body) == PAGE_DYNAMIC):
+            try:
+                from .routed_retrieval import render_js_shell
+                rendered = render_js_shell(
+                    url, renderer=renderer, policy=policy,
+                    timeout=int(policy.get("feed_timeout_seconds", DEFAULT_TIMEOUT)),
+                    max_bytes=int(policy.get("retrieval_fallback_max_bytes", DEFAULT_MAX_BYTES)),
+                )
+            except Exception:  # noqa: BLE001 - failed fallback keeps the honest failure
+                rendered = b""
+            if rendered:
+                parse_body = rendered
+        # V0.4.0 metered Firecrawl/native-MCP fallback: attempted ONLY when the
+        # direct fetch (and any approved local render) still shows a JavaScript
+        # shell on a PUBLIC page. The adapter itself enforces enable/consent,
+        # configured server/tool, the persisted per-cycle/day attempt ceilings,
+        # concurrency and the provider 429 cooldown. A `blocked` challenge or a
+        # private/rejected URL is never eligible here and never consumes budget.
+        if (firecrawl is not None
+                and kind in {"web_page", "ntu_opportunity"}
+                and classify_web_page(parse_body) == PAGE_DYNAMIC):
+            try:
+                scraped = firecrawl.scrape(
+                    url,
+                    timeout=int(policy.get("feed_timeout_seconds", DEFAULT_TIMEOUT)),
+                    max_bytes=int(policy.get("retrieval_fallback_max_bytes", DEFAULT_MAX_BYTES)),
+                    now=now,
+                )
+            except Exception:  # noqa: BLE001 - failed fallback keeps the honest failure
+                scraped = b""
+            if scraped:
+                parse_body = scraped
+                if kind == "web_page":
+                    # Firecrawl returns markdown, not HTML: parse it as bounded
+                    # markdown evidence rather than pretending it is a web page.
+                    parse_kind = "markdown_page"
+        parsed = parse_source(parse_body, parse_kind,
                               max_items=int(policy.get("feed_max_items", DEFAULT_MAX_ITEMS)),
                               now=now)
     except FeedExpired:
@@ -2201,6 +2289,8 @@ def collect_public_feeds(
     budget: Any | None = None,
     attempt_ledger: Any | None = None,
     reddit_ledger: Any | None = None,
+    renderer: Callable[[str], Any] | None = None,
+    firecrawl: Any = None,
 ) -> list[SourceResult]:
     """Collect bounded public feeds. Never raises; failures are labelled.
 
@@ -2277,7 +2367,8 @@ def collect_public_feeds(
         try:
             res, used = _collect_one(rec, policy=policy, clock=clock, now=now,
                                      fetcher=fetcher, reddit_budget=reddit_budget,
-                                     reddit_ledger=reddit_ledger)
+                                     reddit_ledger=reddit_ledger, renderer=renderer,
+                                     firecrawl=firecrawl)
         except Exception as exc:  # noqa: BLE001 - one bad source never breaks the run
             res = SourceResult(f"feed:{rec.get('id','unknown')}", "error",
                                error=safe_source_error(exc, kind="feed"), checked_at=now.isoformat())

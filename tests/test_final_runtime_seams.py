@@ -85,7 +85,60 @@ REMINDER_RUNNER = _load_runner("proactive_secretary_reminder_runner.py")
 
 def _ok_checks(_fixture):
     return {"self_test_rc": 0, "self_test": {"total": 1, "passed": 1, "failed": 0},
-            "dry_run_rc": 0}
+             "dry_run_rc": 0}
+
+
+class NativeScheduledBootstrapSeam(unittest.TestCase):
+    def _run_pipeline(self, *, enabled=True, paused=False, block=True):
+        from proactive_pilot.native_bootstrap import NativeBootstrapError
+        config = {"schema": 1, "version": 1, "retrieval": {
+            "firecrawl_enabled": enabled, "firecrawl_consent": True,
+            "server": "firecrawl", "tool": "firecrawl_scrape"}}
+        ctx = FakeCtx({"user_config": config})
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            root = Path(tmp)
+            policy = root / "policy.json"
+            policy.write_text("{}", encoding="utf-8")
+            prefs = root / "preferences.json"
+            prefs.write_text(json.dumps({"schema": 1, "version": 1, "paused": {"active": paused}}), encoding="utf-8")
+            with mock.patch.object(paths, "policy_path", return_value=policy), \
+                 mock.patch.object(paths, "preferences_path", return_value=prefs), \
+                 mock.patch.object(paths, "state_dir", return_value=root / "state"), \
+                 mock.patch.object(sc, "get_native_context", return_value=ctx), \
+                 mock.patch("proactive_pilot.native_bootstrap.require_native",
+                            side_effect=NativeBootstrapError("effective_config_empty") if block else None) as boot, \
+                 mock.patch.object(main_mod, "load_context_snapshot", side_effect=RuntimeError("collection-boundary")) as collect, \
+                 contextlib.redirect_stdout(io.StringIO()) as out, \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                try:
+                    rc = sc.pipeline_command(argparse.Namespace(check=False, fixture=None))
+                except RuntimeError as exc:
+                    self.assertEqual(str(exc), "collection-boundary")
+                    rc = "collection-boundary"
+            return rc, boot.call_args_list, collect.called, out.getvalue(), err.getvalue(), ctx
+
+    def test_plain_scheduled_pipeline_bootstraps_native_before_collection(self):
+        rc, calls, collected, stdout, stderr, ctx = self._run_pipeline()
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [mock.call(ctx, "firecrawl")])
+        self.assertFalse(collected)
+        self.assertEqual(stdout.strip(), "")
+        self.assertIn("effective_config_empty", stderr)
+
+    def test_successful_bootstrap_precedes_collection_on_same_context(self):
+        rc, calls, collected, _, _, ctx = self._run_pipeline(block=False)
+        self.assertEqual(rc, "collection-boundary")
+        self.assertTrue(collected)
+        self.assertEqual(calls, [mock.call(ctx, "firecrawl")])
+
+    def test_pause_and_disabled_optin_do_not_bootstrap(self):
+        rc, calls, collected, _, _, _ = self._run_pipeline(paused=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [])
+        self.assertFalse(collected)
+        rc, calls, collected, _, _, _ = self._run_pipeline(enabled=False)
+        self.assertEqual(rc, "collection-boundary")
+        self.assertEqual(calls, [])
 
 
 # --------------------------------------------------------------------------- #

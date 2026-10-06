@@ -23,6 +23,8 @@ Ask together, only when not already explicitly established:
 3. Coverage: public sources only, or supported, already authorised private connectors too? Ask for public interests/source URLs if the user wants public monitoring.
 4. Adaptive discovery: whether to enable model-driven public-interest discovery, with the paired privacy review. It is off in the generic defaults and can add model/search usage.
 
+Optional v0.4.0 routed-retrieval fallbacks (`native_render_fallback_enabled`/`native_render_consent`, `firecrawl_enabled`/`firecrawl_consent`) are **off by default** and must not be turned on speculatively. They only ever apply to a `dynamic` JavaScript shell on a public page; a challenge/interstitial/paywall page is terminal. Firecrawl goes through the supported native `ctx.call_mcp` contract — the host owns the OAuth connection and the operator's MCP allowlist; name an already-configured MCP server/tool (`firecrawl_mcp_server`/`firecrawl_mcp_tool`), never an endpoint or a key, and never sign up, copy a credential, or make a paid call on the user's behalf. Every call is a locally capped, persisted attempt (per cycle and per UTC day, with a 429 cooldown); local attempts are not provider credits, and budget exhaustion defers rather than switching to another metered service. `hermes secretary status`/`doctor` reports these capabilities candidly (unavailable with the honest reason rather than a fake success).
+
 Do not ask for passwords, tokens or chat authentication secrets in conversation. Use the platform's supported secure login/connection flow if the user authorises one. Missing credentials are a capability limit, not permission to create new access.
 
 ## 3. Install and enable

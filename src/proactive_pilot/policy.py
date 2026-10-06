@@ -76,6 +76,35 @@ DEFAULT_POLICY: dict[str, Any] = {
     "feed_max_sources_per_run": 2,
     "generic_websites_opt_in": False,
     "public_findings_retention_days": 30,
+    # -- V0.4.0 routed retrieval fallbacks (STAGE-ONLY; both OFF by default) ----
+    # The direct DNS-pinned HTTPS transport remains the only default route. These
+    # two opt-in fallbacks exist ONLY for a 200 JavaScript shell on a PUBLIC page;
+    # a challenge/interstitial/paywall/login page is terminal and is never
+    # rendered or bypassed. Both require an explicit owner consent flag and a
+    # verified host interface (an injected approved renderer / a native secret),
+    # otherwise the capability is reported unavailable rather than faked.
+    "native_render_fallback_enabled": False,
+    "native_render_consent": False,
+    "firecrawl_enabled": False,
+    "firecrawl_consent": False,
+    "retrieval_fallback_max_bytes": 2097152,
+    # Native MCP Firecrawl adapter (server/tool are NAMED by configuration, never
+    # guessed; no endpoint/key/OAuth code is embedded here). Attempts are locally
+    # capped per cycle and per UTC day, concurrency-bounded, and a provider 429
+    # triggers a cooldown. These are local-attempt proposals, NOT paid credits.
+    "firecrawl_mcp_server": "",
+    "firecrawl_mcp_tool": "",
+    "firecrawl_mcp_url_arg": "url",
+    "firecrawl_mcp_formats_arg": "formats",
+    # Verified-schema freshness: null omits the field; 0 requests a live fetch.
+    "firecrawl_mcp_max_age": None,
+    "firecrawl_schema_verified": False,
+    "firecrawl_max_attempts_per_cycle": 1,
+    "firecrawl_max_attempts_per_day": 10,
+    "firecrawl_concurrency": 1,
+    "firecrawl_timeout_seconds": 30,
+    "firecrawl_cooldown_minutes": 60,
+    "firecrawl_cache_ttl_minutes": 60,
     # -- adaptive watch acquisition (STAGE-ONLY; DISABLED by default) ---------
     # Feature mode is the single honest switch:
     #   disabled -> no adaptive planning/acquisition anywhere (default);

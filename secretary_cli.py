@@ -263,6 +263,17 @@ def detect_capabilities() -> dict[str, Any]:
     secretary_src = Path(_secretary_src())
     secretary = bool(str(secretary_src)) and secretary_src.is_dir()
     monitoring = "full" if (secretary or himalaya) else "public-only"
+    # Candid routed-retrieval capability (direct pinned HTTPS + the two opt-in
+    # fallbacks). No secret value is read or returned; an absent host interface is
+    # reported with the honest reason rather than a fake success.
+    routed: dict[str, Any] = {}
+    try:
+        from proactive_pilot import policy as policy_mod
+        from proactive_pilot import routed_retrieval
+        loaded_policy = policy_mod.load_policy(paths.policy_path())
+        routed = routed_retrieval.capabilities(loaded_policy, ctx=get_native_context())
+    except Exception as exc:  # noqa: BLE001 - detection must never fail setup
+        routed = {"error": f"unavailable ({type(exc).__name__})"}
     return {
         "himalaya_mail": himalaya,
         "productivity_secretary": secretary,
@@ -272,6 +283,7 @@ def detect_capabilities() -> dict[str, Any]:
         "calendar_tasks": secretary,
         "public_sources": True,
         "monitoring": monitoring,
+        "routed_retrieval": routed,
     }
 
 
@@ -742,6 +754,13 @@ def doctor_command(args: argparse.Namespace) -> int:
     add("public_sources", True, "public-source monitoring works without mail/calendar/tasks",
         critical=False)
     add("monitoring_mode", True, caps.get("monitoring", "public-only"), critical=False)
+    routed = caps.get("routed_retrieval") or {}
+    fc = routed.get("firecrawl") or {}
+    render_cap = routed.get("native_render_fallback") or {}
+    add("routed_firecrawl", bool(fc.get("available")),
+        str(fc.get("reason") or "unavailable"), critical=False)
+    add("native_render_fallback", bool(render_cap.get("available")),
+        str(render_cap.get("reason") or "unavailable"), critical=False)
     # Validated user configuration + optional adapters (never credential reads).
     # The AUTHORITATIVE native-first configuration is loaded with the host ctx;
     # a present-but-invalid setting is a CRITICAL failure and can never be

@@ -45,3 +45,7 @@ plugin-events.jsonl
 references/
 PLUGIN_BUILD_SCOPE.md
 PLUGIN_CHECKPOINT.md
+
+# Parent-run finalization harness and its generated artifacts (never shipped)
+finalization/
+

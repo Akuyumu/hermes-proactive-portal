@@ -161,6 +161,7 @@ def collect_public_and_adaptive(
     interest_proposer=None,
     privacy_verifier=None,
     native_ctx=None,
+    native_renderer=None,
 ) -> list:
     """Collect the public category: ordinary feeds + (when enabled) adaptive.
 
@@ -237,6 +238,18 @@ def collect_public_and_adaptive(
     # evidence, so the combined cycle never issues two Reddit requests.
     reddit_ledger = RedditLedger(1)
 
+    # V0.4.0 native MCP Firecrawl fallback: built from the ACTUAL host context
+    # (``ctx.call_mcp``) that the registered CLI handler / scheduled runner
+    # already threads through, not an injection-only helper. Neutral default is
+    # ``None`` (both opt-in flags off), so the ordinary byte path is unchanged.
+    firecrawl = None
+    if feeds_enabled:
+        try:
+            from .routed_retrieval import build_firecrawl_adapter
+            firecrawl = build_firecrawl_adapter(policy, ctx=native_ctx, store=store)
+        except Exception:  # noqa: BLE001 - a fallback build failure never breaks the run
+            firecrawl = None
+
     def _run_adaptive() -> list:
         summary = collect_adaptive(policy, clock, store=store, planner=planner,
                                    fetcher=fetcher, budget=public_budget,
@@ -250,7 +263,8 @@ def collect_public_and_adaptive(
     def _run_ordinary() -> list:
         return collect_public_feeds(policy, clock, store=store, context=context,
                                     budget=public_budget, fetcher=public_fetcher,
-                                    attempt_ledger=ledger, reddit_ledger=reddit_ledger)
+                                    attempt_ledger=ledger, reddit_ledger=reddit_ledger,
+                                    renderer=native_renderer, firecrawl=firecrawl)
 
     if adaptive_on and adaptive_first:
         results.extend(_run_adaptive())
@@ -365,6 +379,19 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             return 1
 
         results = []
+        # Plain native plugin CLI commands do not run agent-worker MCP discovery.
+        # Bootstrap after validated configuration, pause and lock gates, before
+        # collection. Fixtures and no-model offline runs never start a transport.
+        if (not getattr(args, "fixture", None) and not getattr(args, "no_model", False)
+                and policy.get("firecrawl_enabled") and policy.get("firecrawl_consent")
+                and policy.get("firecrawl_mcp_server")):
+            from .native_bootstrap import NativeBootstrapError, require_native
+            try:
+                require_native(getattr(args, "native_ctx", None), policy["firecrawl_mcp_server"])
+            except NativeBootstrapError as exc:
+                _diag({"diagnostic": "native-bootstrap-blocked", "reason": str(exc)})
+                _emit("")
+                return 1
         # Budget handle for the opt-in local phone-context pass. In a real run it
         # is the reserved CORE allocation, so location work can never steal the
         # public/obligation reserved slots; in fixture mode it is a fresh ceiling.
@@ -467,6 +494,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                         interest_proposer=getattr(args, "interest_proposer", None),
                         privacy_verifier=getattr(args, "privacy_verifier", None),
                         native_ctx=getattr(args, "native_ctx", None),
+                        native_renderer=getattr(args, "native_renderer", None),
                     ))
                 except Exception as exc:  # noqa: BLE001
                     results.append(SourceResult("feed:error", "error",

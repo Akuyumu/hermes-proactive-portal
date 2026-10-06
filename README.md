@@ -345,6 +345,12 @@ Notable keys:
 | `feed_seed_sources` | `[]` | **Empty by default** — add your own public sources |
 | `adaptive_mode` | `"disabled"` | Keep disabled unless you want adaptive discovery |
 | `location_context_enabled` | `false` | Local phone context is opt-in and off by default |
+| `native_render_fallback_enabled` / `native_render_consent` | `false` | Opt-in bounded JS-shell rendering (needs a host renderer) |
+| `firecrawl_enabled` / `firecrawl_consent` | `false` | Opt-in Firecrawl extract via native `ctx.call_mcp` (host OAuth) |
+| `firecrawl_mcp_server` / `firecrawl_mcp_tool` | `""` | Named MCP server/tool (never an endpoint or a key) |
+| `firecrawl_max_attempts_per_cycle` / `firecrawl_max_attempts_per_day` | `1` / `10` | Local metered-attempt ceilings (not paid credits) |
+| `firecrawl_concurrency` / `firecrawl_timeout_seconds` | `1` / `30` | Bounded concurrent calls / call timeout |
+| `firecrawl_cooldown_minutes` / `firecrawl_cache_ttl_minutes` | `60` / `60` | 429 cooldown / repeat-scrape freshness |
 | `evaluator.toolset` | `"context_engine"` | Must resolve to zero tools |
 | `evaluator.hermes_bin` / `evaluator.profile` | unset | Override the native binary/profile |
 
@@ -366,6 +372,55 @@ The `kind` must be one the bundled parsers support (for example
 `github_releases`, `reddit_rss`, `rss_atom`, `web_page`, `nea_forecast`,
 `ntu_json`, `ntu_opportunity`, `smrt_notice`, `cna_rss`). Only add public,
 keyless endpoints you trust.
+
+### Routed retrieval fallbacks (v0.4.0, opt-in, off by default)
+
+The direct DNS-pinned public HTTPS transport is always the default. A 200
+JavaScript shell on a public page may *optionally* be rendered by a
+host-supplied, constrained renderer, and Firecrawl may *optionally* be used as a
+metered extraction backend — but **only** when you set the enable **and** consent
+flag for that route and a verified host interface exists. Both are reported
+candidly by `hermes secretary status` / `doctor`: when unavailable, the honest
+reason is shown and nothing is faked.
+
+```json
+{
+  "native_render_fallback_enabled": false,
+  "native_render_consent": false,
+  "firecrawl_enabled": false,
+  "firecrawl_consent": false,
+  "firecrawl_mcp_server": "",
+  "firecrawl_mcp_tool": "",
+  "firecrawl_max_attempts_per_cycle": 1,
+  "firecrawl_max_attempts_per_day": 10,
+  "firecrawl_concurrency": 1,
+  "firecrawl_timeout_seconds": 30,
+  "firecrawl_cooldown_minutes": 60,
+  "firecrawl_cache_ttl_minutes": 60,
+  "retrieval_fallback_max_bytes": 2097152
+}
+```
+
+- A `blocked` challenge/interstitial/paywall/login page is **terminal**: it is
+  never rendered, bypassed, or treated as evidence. Fallback applies only to a
+  `dynamic` JS shell. A private/SSRF-rejected URL is denied *before* any metered
+  attempt is reserved.
+- The generic shared Hermes browser is deliberately **not** reused (owner
+  session/cookies, SSRF/subresource surface). Without a host-injected
+  constrained renderer the native-render capability is reported unavailable.
+- Firecrawl goes through the **supported native plugin contract**
+  `ctx.call_mcp(server, tool, arguments, timeout)`: the host owns the OAuth
+  connection and the MCP allowlist. This plugin embeds no endpoint, key or OAuth
+  client, and sends only one narrow request
+  (`{"url": <public-https-url>, "formats": ["markdown"]}`) to the one configured
+  server/tool. The remote tool schema is host-owned; until a verified reference
+  is supplied it is reported as unverified rather than guessed.
+- Every Firecrawl call is a **reserved, persisted local attempt**: ceilings are
+  enforced per cycle and per UTC day, shared across collectors and restarts, with
+  a provider 429 cooldown. A failed attempt still consumes the reserved attempt.
+  Local attempt counts are **not** provider billing credits, and the plugin never
+  switches to another metered service when a budget is exhausted — it defers.
+
 
 ### Paths and overrides
 
