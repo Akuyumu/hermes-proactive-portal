@@ -48,6 +48,16 @@ def register(ctx) -> None:
     from . import secretary_cli as _cli
     _cli.set_native_context(ctx)
 
+    # Own auxiliary slot so the operator can route secretary model calls
+    # (auxiliary.proactive_secretary) independently of the main chat model.
+    register_aux = getattr(ctx, "register_auxiliary_task", None)
+    if callable(register_aux):
+        try:
+            register_aux("proactive_secretary", display_name="Proactive secretary",
+                         description="Secretary evaluator/planner/intake structured calls.")
+        except Exception:  # noqa: BLE001 - older hosts: fall back to the main model
+            pass
+
     skill = root / "skills" / "proactive-secretary" / "SKILL.md"
     if skill.is_file():
         ctx.register_skill("proactive-secretary", skill,

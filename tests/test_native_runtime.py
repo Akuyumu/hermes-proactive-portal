@@ -98,6 +98,17 @@ class TrustShapeTests(unittest.TestCase):
         self.assertEqual(call["purpose"], "secretary.evaluate")
         self.assertEqual(call["max_tokens"], 64)
 
+    def test_registered_aux_slot_routes_by_task_never_model(self):
+        llm = FakeLlm()
+        route = nr.evaluator_route(FakeCtx(llm))
+        from unittest import mock
+        with mock.patch.object(nr, "_aux_task_registered", return_value=True):
+            route.complete_structured(instructions="i", input=[{"type": "text", "text": "t"}])
+        call = llm.calls[0]
+        self.assertEqual(call["task"], nr.AUX_TASK_KEY)
+        for forbidden in ("provider", "model", "agent_id", "profile"):
+            self.assertNotIn(forbidden, call)
+
     def test_route_failure_is_sanitized(self):
         route = nr.evaluator_route(FakeCtx(FakeLlm(raise_exc=RuntimeError("token=SECRET"))))
         with self.assertRaises(nr.LlmUnavailable) as ctx:

@@ -26,6 +26,19 @@ from typing import Any
 NATIVE_PLUGIN_ID = "hermes-proactive-secretary"
 # Paths that must never spend a model call, ever.
 MODEL_FREE_PATHS = frozenset({"reminder", "disabled", "paused", "public-only"})
+# Plugin-owned auxiliary slot (registered in __init__.register). Routing it is
+# the operator's native config (auxiliary.proactive_secretary); the plugin
+# itself still never names a provider or model.
+AUX_TASK_KEY = "proactive_secretary"
+
+
+def _aux_task_registered() -> bool:
+    """True when the host registry holds this plugin's auxiliary slot."""
+    try:
+        from hermes_cli.plugins import get_plugin_auxiliary_tasks
+        return any(e.get("key") == AUX_TASK_KEY for e in get_plugin_auxiliary_tasks())
+    except Exception:  # noqa: BLE001 - no host registry: main-model path
+        return False
 
 
 class LlmUnavailable(RuntimeError):
@@ -131,6 +144,8 @@ class LlmRoute:
         }
         kwargs = {k: v for k, v in kwargs.items() if v is not None or k in {
             "instructions", "input", "json_schema", "json_mode", "purpose"}}
+        if _aux_task_registered():
+            kwargs["task"] = AUX_TASK_KEY
         self._calls += 1
         try:
             return self.ctx.llm.complete_structured(**kwargs)
