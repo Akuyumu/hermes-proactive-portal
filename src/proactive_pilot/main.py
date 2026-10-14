@@ -172,6 +172,7 @@ def collect_public_and_adaptive(
     privacy_verifier=None,
     native_ctx=None,
     native_renderer=None,
+    transport_gate=None,
 ) -> list:
     """Collect the public category: ordinary feeds + (when enabled) adaptive.
 
@@ -274,7 +275,8 @@ def collect_public_and_adaptive(
         return collect_public_feeds(policy, clock, store=store, context=context,
                                     budget=public_budget, fetcher=public_fetcher,
                                     attempt_ledger=ledger, reddit_ledger=reddit_ledger,
-                                    renderer=native_renderer, firecrawl=firecrawl)
+                                    renderer=native_renderer, firecrawl=firecrawl,
+                                    transport_gate=transport_gate)
 
     if adaptive_on and adaptive_first:
         results.extend(_run_adaptive())
@@ -515,6 +517,30 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                 # budget (see collect_public_and_adaptive / prepare_adaptive_plan).
                 public_budget = Budget(float(policy.get("public_budget_seconds", 10)),
                                        parent=overall, label="public")
+                # Agentic LTA transport gate: the credentialed train-alert API is
+                # never polled unconditionally. Candidate facts are built from the
+                # already-collected calendar/location/registry context; the
+                # verdict comes from the plugin auxiliary model lane (never a
+                # named provider/model) and the hard floors persist in the plugin
+                # private state directory. Any failure here leaves the gate
+                # unconfigured, so the credentialed source is skipped (fail closed).
+                transport_gate = None
+                try:
+                    from .native_runtime import build_model_lane
+                    from .publicfeeds import load_registry
+                    from .transport import (LTA_GATE_STATE_NAME, LTA_MODEL_PATH,
+                                            LTA_MODEL_PURPOSE, TransportGate,
+                                            build_transport_facts)
+                    facts = build_transport_facts(
+                        now=clock.now(), results=results, location_state=state,
+                        registry=load_registry(store))
+                    lane = build_model_lane(getattr(args, "native_ctx", None), policy,
+                                            path=LTA_MODEL_PATH, purpose=LTA_MODEL_PURPOSE)
+                    transport_gate = TransportGate(
+                        facts=facts, model_lane=lane,
+                        state_path=Path(args.state_dir) / LTA_GATE_STATE_NAME)
+                except Exception:  # noqa: BLE001 - gate stays None: source skipped
+                    transport_gate = None
                 try:
                     results.extend(collect_public_and_adaptive(
                         policy, clock, store=store, context=proposer_context,
@@ -529,6 +555,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                         privacy_verifier=getattr(args, "privacy_verifier", None),
                         native_ctx=getattr(args, "native_ctx", None),
                         native_renderer=getattr(args, "native_renderer", None),
+                        transport_gate=transport_gate,
                     ))
                 except Exception as exc:  # noqa: BLE001
                     results.append(SourceResult("feed:error", "error",

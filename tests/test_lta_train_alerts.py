@@ -66,6 +66,26 @@ STATUS2 = json.dumps({
     },
 }).encode("utf-8")
 
+# Documented disruption shape: ``value`` is a LIST of per-line clusters.
+STATUS2_CLUSTERS = json.dumps({
+    "odata.metadata": "https://datamall2.mytransport.sg/ltaodataservice/$metadata#TrainServicesAlerts",
+    "value": [
+        {
+            "Status": 2,
+            "Line": "NSL",
+            "Direction": "Both",
+            "Stations": ["NS1", "NS2", "NS3"],
+            "FreePublicBus": "Yes",
+            "FreeMRTShuttle": "No",
+            "MRTShuttleDirection": "",
+            "Message": [
+                {"Content": "NSL disruption due to a track fault.",
+                 "CreatedDate": "2026-10-15T11:30:00+08:00"},
+            ],
+        },
+    ],
+}).encode("utf-8")
+
 
 class _FakeResponse:
     def __init__(self, body, status=200, headers=None, url=LTA_TRAIN_ALERTS_URL):
@@ -103,6 +123,27 @@ class _FakeOpener:
 
 def _env(key=FAKE_KEY):
     return {LTA_ACCOUNT_KEY_ENV: key}
+
+
+class _AllowDecision:
+    allow = True
+
+    def to_source_failure(self):
+        return ""
+
+
+class _AllowGate:
+    """Minimal gate stub that permits one fetch (tests only)."""
+
+    def __init__(self):
+        self.decisions = 0
+
+    def decide(self, *, rec=None, now=None):
+        self.decisions += 1
+        return _AllowDecision()
+
+    def record_outcome(self, *, decision=None, now=None, disruption_found=False):
+        self.last_outcome = bool(disruption_found)
 
 
 def _lta_policy():
@@ -175,10 +216,11 @@ class LtaTrainAlertsTests(unittest.TestCase):
     def test_malformed_and_unexpected_shapes_fail_closed(self):
         for body in (
             b"not json",
-            b"[]",
+            b"[]",                                                   # payload not object
             b"{}",                                                   # no value
-            b'{"value": 5}',                                         # value not object
-            b'{"value": {"Status": 1}}',                             # arrays missing
+            b'{"value": 5}',                                         # value neither object nor list
+            b'{"value": []}',                                        # empty list
+            b'{"value": [5]}',                                       # list entry not a cluster
             b'{"value": {"Status": true, "AffectedSegments": [], "Message": []}}',
             b'{"value": {"Status": "1", "AffectedSegments": [], "Message": []}}',
             b'{"value": {"Status": 7, "AffectedSegments": [], "Message": []}}',
@@ -188,6 +230,82 @@ class LtaTrainAlertsTests(unittest.TestCase):
             with self.subTest(body=body):
                 with self.assertRaises(FeedFailed):
                     parse_lta_train_alerts(body, now=NOW)
+
+    # -- parser: documented LIST-of-clusters disruption shape ---------------
+
+    def test_status_2_single_affected_line_cluster(self):
+        items = parse_lta_train_alerts(STATUS2_CLUSTERS, now=NOW)
+        self.assertEqual(len(items), 2)  # one line cluster + one message
+        blob = json.dumps(items)
+        self.assertIn("NSL", blob)
+        self.assertIn("NS1", blob)
+        self.assertIn("track fault", blob)
+        for row in items:
+            self.assertFalse(row["all_clear"])
+            self.assertEqual(row["service_status"], "disruption")
+
+    def test_status_2_multi_line_clusters(self):
+        body = json.dumps({"value": [
+            {"Status": 2, "Line": "NSL", "Direction": "Both",
+             "Stations": ["NS1", "NS2"], "Message": []},
+            {"Status": 2, "Line": "EWL", "Direction": "Towards Pasir Ris",
+             "Stations": "EW1", "Message": []},
+        ]}).encode("utf-8")
+        items = parse_lta_train_alerts(body, now=NOW)
+        blob = json.dumps(items)
+        self.assertIn("NSL", blob)
+        self.assertIn("EWL", blob)
+        self.assertIn("EW1", blob)
+        self.assertTrue(all(i["service_status"] == "disruption" for i in items))
+
+    def test_status_1_list_cluster_with_recover_message(self):
+        body = json.dumps({"value": [
+            {"Status": 1, "Line": "NSL",
+             "Message": [{"Content": "NSL service has resumed.",
+                          "CreatedDate": "2026-10-15T12:00:00+08:00"}]},
+        ]}).encode("utf-8")
+        items = parse_lta_train_alerts(body, now=NOW)
+        markers = [i for i in items if i["all_clear"]]
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(markers[0]["id"], LTA_ALL_CLEAR_ID)
+        self.assertTrue(any("resumed" in i["summary"] for i in items))
+        self.assertFalse(any(i["all_clear"] for i in items if i is not markers[0]))
+
+    def test_message_as_plain_string_and_dict_list(self):
+        dict_list = json.dumps({"value": [
+            {"Status": 2, "Line": "NSL",
+             "Message": [{"Content": "dict message", "CreatedDate": "2026-10-15T09:00:00+08:00"}]},
+        ]}).encode("utf-8")
+        plain = json.dumps({"value": [
+            {"Status": 2, "Line": "EWL", "Message": "plain string message"},
+        ]}).encode("utf-8")
+        self.assertTrue(any("dict message" in i["summary"]
+                            for i in parse_lta_train_alerts(dict_list, now=NOW)))
+        self.assertTrue(any("plain string message" in i["summary"]
+                            for i in parse_lta_train_alerts(plain, now=NOW)))
+
+    def test_cluster_without_stations_still_extracts_detail(self):
+        body = json.dumps({"value": [
+            {"Status": 2, "Line": "Circle Line", "Direction": "Both"},
+        ]}).encode("utf-8")
+        items = parse_lta_train_alerts(body, now=NOW)
+        self.assertTrue(items)
+        self.assertTrue(any("Circle Line" in i["summary"] for i in items))
+
+    def test_list_cluster_garbage_or_1m_status_fails_closed(self):
+        for status in (1000000, "2", True, 3, None):
+            body = json.dumps({"value": [
+                {"Status": 2, "Line": "NSL"},
+                {"Status": status, "Line": "EWL"},
+            ]}).encode("utf-8")
+            with self.subTest(status=status):
+                if status is None:
+                    # A cluster with no Status reports nothing; the other valid
+                    # cluster still makes this a status-2 disruption.
+                    self.assertTrue(parse_lta_train_alerts(body, now=NOW))
+                else:
+                    with self.assertRaises(FeedFailed):
+                        parse_lta_train_alerts(body, now=NOW)
 
     # -- credentialed fetch: key handling -----------------------------------
 
@@ -293,7 +411,8 @@ class LtaTrainAlertsTests(unittest.TestCase):
 
             results = collect_public_feeds(
                 policy, SeededClock(NOW.isoformat()), store=store,
-                fetcher=unused_fetcher, credentialed_fetcher=fake_cred)
+                fetcher=unused_fetcher, credentialed_fetcher=fake_cred,
+                transport_gate=_AllowGate())
             lta = [r for r in results if r.name.startswith("feed:lta_train_alerts")]
             self.assertTrue(lta, results)
             self.assertTrue(lta[0].healthy, lta[0].error)
@@ -312,7 +431,8 @@ class LtaTrainAlertsTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {LTA_ACCOUNT_KEY_ENV: ""}):
                 results = collect_public_feeds(
                     policy, SeededClock(NOW.isoformat()), store=store,
-                    fetcher=unused_fetcher)  # no credentialed_fetcher -> real path
+                    fetcher=unused_fetcher,
+                    transport_gate=_AllowGate())  # no credentialed_fetcher -> real path
             lta = [r for r in results if r.name.startswith("feed:lta_train_alerts")]
             self.assertTrue(lta, results)
             self.assertFalse(lta[0].healthy)

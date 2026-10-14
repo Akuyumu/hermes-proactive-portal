@@ -79,7 +79,7 @@ ACQUISITION_COVERAGE: dict[str, dict[str, Any]] = {
         "route": ["lta_train_alerts", "fetch_lta_train_alerts (credentialed, header-only key)", "PinnedHTTPSTransport (ordinary feeds unchanged)"],
         "wired_kinds": ["lta_train_alerts"],
         "integration_point": "publicfeeds.default_seed_sources -> collect_public_feeds -> fetch_lta_train_alerts -> parse_lta_train_alerts -> packet/evaluator",
-        "note": "requires env var LTA_DATAMALL_ACCOUNT_KEY; fails closed without a network call when absent; not a forecast or planned notice",
+        "note": "requires env var LTA_DATAMALL_ACCOUNT_KEY; fails closed without a network call when absent; accepts both the object and the documented list-of-clusters value shapes; not polled on a fixed cadence (agentic candidate pre-filter + auxiliary model verdict + persisted interval/daily-cap floors, fail closed); not a forecast or planned notice",
     },
 }
 

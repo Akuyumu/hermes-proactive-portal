@@ -927,11 +927,47 @@ def parse_nea_forecast(
 # downstream when the official status returns to normal.
 LTA_ALL_CLEAR_ID = "lta-train-all-clear"
 
+# Documented per-cluster attributes (LTA API User Guide v6.10 section 2.11).
+_LTA_CLUSTER_FIELD_KEYS = (
+    "Line", "Direction", "Stations", "FreePublicBus", "FreeMRTShuttle",
+    "MRTShuttleDirection",
+)
+
 
 def _lta_scalar_text(value: Any, *, max_chars: int = 200) -> str:
     if isinstance(value, (dict, list)):
         return ""
     return strip_html(value, max_chars=max_chars)
+
+
+def _lta_list_text(value: Any, *, item_chars: int = 60, max_chars: int = 120) -> str:
+    """Render a field that may be a scalar or a list (bounded, sanitized)."""
+    if isinstance(value, list):
+        return strip_html(
+            ", ".join(_lta_scalar_text(v, max_chars=item_chars) for v in value[:10]),
+            max_chars=max_chars,
+        )
+    return strip_html(value, max_chars=max_chars)
+
+
+def _lta_cluster_text(cluster: dict[str, Any]) -> str:
+    """Bounded detail from the documented per-cluster attributes.
+
+    ``Stations`` is accepted as either a string or a list (per the guide) and the
+    cluster keys are projected verbatim so no context is invented.
+    """
+    parts: list[str] = []
+    for key in _LTA_CLUSTER_FIELD_KEYS:
+        if key not in cluster:
+            continue
+        text = _lta_list_text(cluster.get(key))
+        if not text:
+            continue
+        if key in ("Line", "Direction", "Stations"):
+            parts.append(f"{key}: {text}")
+        else:
+            parts.append(text)
+    return " — ".join(parts)[:280]
 
 
 def _lta_segment_text(segment: Any) -> str:
@@ -970,6 +1006,41 @@ def _lta_message_text(message: Any) -> tuple[str, str]:
     return strip_html(message, max_chars=400), ""
 
 
+def _lta_message_entries(cluster: dict[str, Any]) -> list[Any]:
+    """Message entries from a cluster/object: a list, a single dict or a string."""
+    raw = cluster.get("Message")
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    return [raw]
+
+
+def _lta_segment_entries(cluster: dict[str, Any]) -> list[Any]:
+    raw = cluster.get("AffectedSegments")
+    return raw if isinstance(raw, list) else []
+
+
+def _lta_message_item(content: str, created: str, *, normal: bool) -> dict[str, Any]:
+    label = "LTA train service notice" if normal else "LTA train disruption notice"
+    prefix = "lta-recover-" if normal else "lta-message-"
+    return {
+        "title": f"{label}: {content[:120]}",
+        "summary": content,
+        "link": LTA_TRAIN_ALERTS_URL,
+        "id": prefix + hashlib.sha256(
+            (content + "|" + created).encode("utf-8")).hexdigest()[:16],
+        "published": created,
+        "date_precision": "timestamp" if created else "unknown",
+        "category": "live_transport",
+        "publisher": "Singapore Land Transport Authority (LTA)",
+        "service_status": "normal" if normal else "disruption",
+        "live_service_alert": True,
+        "all_clear": False,
+        "recover_message": bool(normal),
+    }
+
+
 def parse_lta_train_alerts(
     body: bytes,
     *,
@@ -978,11 +1049,27 @@ def parse_lta_train_alerts(
 ) -> list[dict[str, Any]]:
     """Parse the official LTA DataMall ``TrainServiceAlerts`` envelope.
 
-    Bounded evidence only; every field is untrusted text and is sanitized and
-    length-bounded. Status 1 yields exactly ONE explicit all-clear marker item
-    (never a fabricated incident). Status 2 yields one item per affected segment
-    and per message. A missing/garbage shape, an unexpected Status value, or a
-    non-JSON body fails closed with ``FeedFailed`` -- never "no news".
+    Accepts BOTH documented shapes for ``value`` and fails closed on anything
+    else:
+
+    - an OBJECT (single cluster; the live all-clear body), read directly; or
+    - a LIST of per-line cluster objects (the shape the LTA API User Guide
+      documents for a disruption: "each affected line ... published as separate
+      clusters within the single API response").
+
+    Detail is read from the per-cluster documented fields (``Line``,
+    ``Direction``, ``Stations`` -- string or list, ``FreePublicBus``,
+    ``FreeMRTShuttle``, ``MRTShuttleDirection``, ``Message``) AND from any
+    ``AffectedSegments`` entries. ``Message`` entries accept a dict (``Content``
+    / ``CreatedDate``) or a plain string. Every field is untrusted: sanitized and
+    length-bounded, with deterministic content-derived ids.
+
+    Overall status: for the object shape, ``value["Status"]``; for the list
+    shape, ``2`` if ANY cluster reports 2, else ``1`` if at least one reports 1,
+    else fail closed. Status 1 yields EXACTLY ONE all-clear marker (plus bounded
+    recover-message items when the body carries them). Status 2 with no
+    extractable detail fails closed -- never "no news". A malformed/garbage
+    Status (bool, non-int, or outside {1,2}) fails closed.
     """
     try:
         payload = json.loads(body.decode("utf-8", "replace"))
@@ -991,18 +1078,40 @@ def parse_lta_train_alerts(
     if not isinstance(payload, dict):
         raise FeedFailed("LTA train alerts payload is not an object")
     value = payload.get("value")
-    if not isinstance(value, dict):
+    if isinstance(value, dict):
+        clusters: list[dict[str, Any]] = [value]
+    elif isinstance(value, list):
+        if not value:
+            raise FeedFailed("LTA train alerts value list is empty")
+        if not all(isinstance(entry, dict) for entry in value):
+            raise FeedFailed("LTA train alerts cluster is not an object")
+        clusters = list(value)
+    else:
         raise FeedFailed("LTA train alerts value missing")
-    status = value.get("Status")
-    if isinstance(status, bool) or not isinstance(status, int):
-        raise FeedFailed("LTA train alerts status malformed")
-    segments = value.get("AffectedSegments")
-    messages = value.get("Message")
-    if not isinstance(segments, list) or not isinstance(messages, list):
-        raise FeedFailed("LTA train alerts arrays malformed")
+
+    statuses: list[int] = []
+    for cluster in clusters:
+        status = cluster.get("Status")
+        if status is None:
+            continue
+        if isinstance(status, bool) or not isinstance(status, int) or status not in (1, 2):
+            raise FeedFailed(f"LTA train alerts status malformed: {status!r}")
+        statuses.append(status)
+    if not statuses:
+        raise FeedFailed("LTA train alerts status missing")
+    if 2 in statuses:
+        overall = 2
+    elif 1 in statuses:
+        overall = 1
+    else:  # pragma: no cover - statuses only ever contains 1/2
+        raise FeedFailed("LTA train alerts unexpected status")
+
     observed = (now or datetime.now(timezone.utc)).isoformat()
-    if status == 1:
-        return [{
+    limit = max(1, int(max_items))
+
+    if overall == 1:
+        # Exactly ONE all-clear marker, always first, regardless of max_items.
+        out: list[dict[str, Any]] = [{
             "title": "LTA train service status: normal service (all-clear)",
             "summary": (
                 "Official LTA DataMall TrainServiceAlerts reports Status 1: no "
@@ -1018,55 +1127,79 @@ def parse_lta_train_alerts(
             "service_status": "normal",
             "live_service_alert": True,
             "all_clear": True,
+            "recover_message": False,
         }]
-    if status != 2:
-        raise FeedFailed(f"LTA train alerts unexpected status: {status!r}")
-    if not segments and not messages:
+        # A recover message may still ride a Status-1 body: append it bounded
+        # rather than silently dropping it, keeping the one all-clear marker.
+        for cluster in clusters:
+            for message in _lta_message_entries(cluster):
+                content, created = _lta_message_text(message)
+                if not content:
+                    continue
+                out.append(_lta_message_item(content, created, normal=True))
+                if len(out) >= limit:
+                    return out
+        return out
+
+    # overall == 2: a real disruption; detail is mandatory.
+    out = []
+    seen: set[str] = set()
+
+    def _append(item: dict[str, Any]) -> bool:
+        """Add a deduped disruption item; True when the cap is now reached."""
+        if item["id"] in seen:
+            return False
+        seen.add(item["id"])
+        out.append(item)
+        return len(out) >= limit
+
+    for cluster in clusters:
+        for segment in _lta_segment_entries(cluster):
+            text = _lta_segment_text(segment)
+            if not text:
+                continue
+            if _append({
+                "title": f"LTA train disruption — affected segment: {text[:120]}",
+                "summary": f"Affected segment: {text}",
+                "link": LTA_TRAIN_ALERTS_URL,
+                "id": "lta-segment-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+                "published": "",
+                "date_precision": "unknown",
+                "category": "live_transport",
+                "publisher": "Singapore Land Transport Authority (LTA)",
+                "service_status": "disruption",
+                "live_service_alert": True,
+                "all_clear": False,
+                "recover_message": False,
+            }):
+                return out
+        text = _lta_cluster_text(cluster)
+        if text:
+            if _append({
+                "title": f"LTA train disruption — affected line: {text[:120]}",
+                "summary": text,
+                "link": LTA_TRAIN_ALERTS_URL,
+                "id": "lta-line-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+                "published": "",
+                "date_precision": "unknown",
+                "category": "live_transport",
+                "publisher": "Singapore Land Transport Authority (LTA)",
+                "service_status": "disruption",
+                "live_service_alert": True,
+                "all_clear": False,
+                "recover_message": False,
+            }):
+                return out
+        for message in _lta_message_entries(cluster):
+            content, created = _lta_message_text(message)
+            if not content:
+                continue
+            if _append(_lta_message_item(content, created, normal=False)):
+                return out
+
+    if not out:
         # Status 2 with no described detail must never degrade to "no news".
         raise FeedFailed("LTA train alerts status 2 with no detail")
-    limit = max(1, int(max_items))
-    out: list[dict[str, Any]] = []
-    for segment in segments:
-        text = _lta_segment_text(segment)
-        if not text:
-            continue
-        out.append({
-            "title": f"LTA train disruption — affected segment: {text[:120]}",
-            "summary": f"Affected segment: {text}",
-            "link": LTA_TRAIN_ALERTS_URL,
-            "id": "lta-segment-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
-            "published": "",
-            "date_precision": "unknown",
-            "category": "live_transport",
-            "publisher": "Singapore Land Transport Authority (LTA)",
-            "service_status": "disruption",
-            "live_service_alert": True,
-            "all_clear": False,
-        })
-        if len(out) >= limit:
-            return out
-    for message in messages:
-        content, created = _lta_message_text(message)
-        if not content:
-            continue
-        out.append({
-            "title": f"LTA train disruption notice: {content[:120]}",
-            "summary": content,
-            "link": LTA_TRAIN_ALERTS_URL,
-            "id": "lta-message-" + hashlib.sha256(
-                (content + "|" + created).encode("utf-8")).hexdigest()[:16],
-            "published": created,
-            "date_precision": "timestamp" if created else "unknown",
-            "category": "live_transport",
-            "publisher": "Singapore Land Transport Authority (LTA)",
-            "service_status": "disruption",
-            "live_service_alert": True,
-            "all_clear": False,
-        })
-        if len(out) >= limit:
-            return out
-    if not out:
-        raise FeedFailed("LTA train alerts status 2 detail unusable")
     return out
 
 
@@ -2271,6 +2404,7 @@ def _collect_one(
     renderer: Callable[[str], Any] | None = None,
     firecrawl: Any = None,
     credentialed_fetcher: Callable[..., FetchResponse] | None = None,
+    transport_gate: Any = None,
 ) -> tuple[SourceResult, int]:
     sid = str(rec.get("id") or "")
     kind = str(rec.get("kind") or "rss")
@@ -2323,11 +2457,27 @@ def _collect_one(
             reddit_ledger.take(1)
         rec["last_fetch_at"] = now.isoformat()
 
+    lta_decision = None
     try:
         if kind == LTA_TRAIN_ALERTS_KIND:
-            # The ONE credentialed source uses its own isolated, explicitly named
-            # path (never ``fetch_bytes``, never the generic fetcher). Tests
-            # inject ``credentialed_fetcher``; production uses the real one.
+            # The credentialed API must NOT be polled on a fixed cadence (owner
+            # directive). An agentic gate (candidate pre-filter + auxiliary model
+            # lane verdict + persisted hard floors) must permit each fetch. With
+            # no gate configured the source is skipped, never polled
+            # unconditionally. The ONE credentialed source still uses its own
+            # isolated, explicitly named path (never ``fetch_bytes``, never the
+            # generic fetcher); tests inject ``credentialed_fetcher``.
+            if transport_gate is None:
+                return SourceResult(name, "deferred",
+                                    failure="transport gate not configured",
+                                    attempted=False), used
+            lta_decision = transport_gate.decide(rec=rec, now=now)
+            if not getattr(lta_decision, "allow", False):
+                label = (lta_decision.to_source_failure()
+                         if hasattr(lta_decision, "to_source_failure")
+                         else "transport gate skipped")
+                return SourceResult(name, "deferred", failure=label[:200],
+                                    attempted=False), used
             cred_fetch = credentialed_fetcher or fetch_lta_train_alerts
             response = cred_fetch(
                 timeout=int(policy.get("feed_timeout_seconds", DEFAULT_TIMEOUT)),
@@ -2594,6 +2744,7 @@ def _collect_one(
             "service_status": str(row.get("service_status") or ""),
             "live_service_alert": bool(row.get("live_service_alert", False)),
             "all_clear": bool(row.get("all_clear", False)),
+            "recover_message": bool(row.get("recover_message", False)),
         })
     # Refresh cache.
     rec["cache_items"] = items
@@ -2602,6 +2753,14 @@ def _collect_one(
     rec["last_modified"] = str(response.headers.get("Last-Modified") or response.headers.get("last-modified") or "")
     rec["failures"] = 0
     rec.pop("stale_reason", None)
+    if kind == LTA_TRAIN_ALERTS_KIND and transport_gate is not None and lta_decision is not None:
+        # Bounded telemetry: whether an actual disruption was found. Never fatal.
+        try:
+            transport_gate.record_outcome(
+                decision=lta_decision, now=now,
+                disruption_found=any(not bool(i.get("all_clear")) for i in items))
+        except Exception:  # noqa: BLE001 - telemetry must never break a run
+            pass
     return SourceResult(name, "ok", count=len(items), items=items, checked_at=now.isoformat(),
                         truncated=bool(len(parsed) >= int(policy.get("feed_max_items", DEFAULT_MAX_ITEMS)))), used
 
@@ -2620,6 +2779,7 @@ def collect_public_feeds(
     renderer: Callable[[str], Any] | None = None,
     firecrawl: Any = None,
     credentialed_fetcher: Callable[..., FetchResponse] | None = None,
+    transport_gate: Any = None,
 ) -> list[SourceResult]:
     """Collect bounded public feeds. Never raises; failures are labelled.
 
@@ -2698,7 +2858,8 @@ def collect_public_feeds(
                                      fetcher=fetcher, reddit_budget=reddit_budget,
                                      reddit_ledger=reddit_ledger, renderer=renderer,
                                      firecrawl=firecrawl,
-                                     credentialed_fetcher=credentialed_fetcher)
+                                     credentialed_fetcher=credentialed_fetcher,
+                                     transport_gate=transport_gate)
         except Exception as exc:  # noqa: BLE001 - one bad source never breaks the run
             res = SourceResult(f"feed:{rec.get('id','unknown')}", "error",
                                error=safe_source_error(exc, kind="feed"), checked_at=now.isoformat())
