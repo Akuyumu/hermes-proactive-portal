@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 
 from .candidates import build_packet
@@ -366,6 +367,42 @@ def run_self_test() -> int:
     outcomes.append(_Result("trusted_intake_explicit_fallback",
                             action.get("action") == "add"
                             and "mycorrhizal" in action.get("public_topic", "")))
+
+    # -- per-source health gate (durable incidents, bounded recovery) ---------
+    from . import source_health as _sh
+    from .collectors import SourceResult as _SR
+    hp = json.loads(json.dumps(policy))
+    hp["health_critical_sources"] = ["mail:formal"]
+    hstate: dict = {}
+    t0 = day.now()
+    _sh.record_observations(hstate, [_SR("mail:formal", "error", error="HTTP 503")], t0, hp)
+    outcomes.append(_Result("health_retryable_silent_initially",
+                            _sh.health_alert(hstate, t0, hp, commit=False) is None))
+    for _ in range(3):
+        _sh.record_observations(hstate, [_SR("mail:formal", "error", error="401 unauthorized")], t0, hp)
+    hstate["source_health"]["sources"]["mail:formal"]["first_failure_at"] = (
+        t0 - timedelta(hours=3)).isoformat()
+    later = t0 + timedelta(minutes=61)
+    _sh.dispatch_gate(hstate, "mail:formal", later, hp)
+    _sh.record_observations(hstate, [_SR("mail:formal", "error", error="401 unauthorized")], later, hp)
+    later2 = later + timedelta(minutes=61)
+    _sh.dispatch_gate(hstate, "mail:formal", later2, hp)
+    _sh.record_observations(hstate, [_SR("mail:formal", "error", error="401 unauthorized")], later2, hp)
+    first = _sh.health_alert(hstate, later2, hp, commit=True)
+    outcomes.append(_Result("health_critical_persistent_alerts_once",
+                            first is not None
+                            and _sh.health_alert(hstate, later2, hp, commit=False) is None))
+    dstate: dict = {}
+    for _ in range(3):
+        _sh.record_observations(dstate, [_SR("mail:formal", "error", error="429 Retry-After: 3600")], t0, hp)
+    blocked = _sh.dispatch_gate(dstate, "mail:formal", t0 + timedelta(minutes=5), hp)
+    outcomes.append(_Result("health_429_blocks_until_due", not blocked["dispatch"]))
+    outcomes.append(_Result("health_cached_ok_not_recovery",
+                            _sh.classify_observation(
+                                _SR("mail:formal", "ok", cached=True)) == _sh.OBSERVATION_NON_EVIDENTIAL))
+    outcomes.append(_Result("health_routine_message_guarded",
+                            _sh.routine_health_reason("Coverage note: mail could not be read") is not None
+                            and _sh.routine_health_reason("Your payment is due tomorrow") is None))
 
     # report
     passed = sum(1 for o in outcomes if o.passed)

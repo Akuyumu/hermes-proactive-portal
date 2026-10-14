@@ -43,6 +43,15 @@ from .gates import (
     notice_allowed,
     record_delivery,
 )
+from .source_health import (
+    alerting_sources,
+    commit_alert,
+    dispatch_gate,
+    load_source_health,
+    health_alert,
+    record_observations,
+    routine_health_reason,
+)
 from .policy import in_quiet_hours, load_policy, load_preferences
 from .state import CorruptStateError, StateStore
 from .watchdog import RunDeadlineExceeded, run_deadline
@@ -62,6 +71,7 @@ def _emit(text: str) -> None:
     """
     if text:
         sys.stdout.write(text.strip() + "\n")
+        sys.stdout.flush()
 
 
 def _diag(payload: dict) -> None:
@@ -378,7 +388,31 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             _emit("")
             return 1
 
+        health_state = load_source_health(state)
+        for record in health_state["sources"].values():
+            if record["delivery_state"] == "emitting":
+                record["delivery_state"] = "uncertain"
+                _diag({"diagnostic": "health-delivery-uncertain", "incident_id": record["delivery_incident"]})
+        state["source_health"] = health_state
         results = []
+        observed_obligations = []
+
+        def _dispatch_source(name):
+            from copy import deepcopy
+            before = deepcopy(state["source_health"])
+            gate = dispatch_gate(state, name, clock.now(), policy)
+            if gate["dispatch"] and gate["mode"] != "closed" and not (args.check or args.collect_only or args.dry_run):
+                # Reserve the probe durably BEFORE entering the approved client.
+                try:
+                    store.save("notify_state.json", state)
+                except OSError as exc:
+                    state["source_health"] = before
+                    _diag({"diagnostic": "health-probe-save-failed", "error": type(exc).__name__})
+                    return False
+            return gate["dispatch"]
+
+        policy["_source_dispatch"] = _dispatch_source
+        policy["_source_observe"] = observed_obligations.append
         # Plain native plugin CLI commands do not run agent-worker MCP discovery.
         # Bootstrap after validated configuration, pause and lock gates, before
         # collection. Fixtures and no-model offline runs never start a transport.
@@ -512,10 +546,18 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                                                 error=safe_source_error(exc, kind="obligation"),
                                                 checked_at=clock.now().isoformat()))
 
+        policy.pop("_source_dispatch", None)
+        policy.pop("_source_observe", None)
         packet = build_packet(results, clock=clock, policy=policy, baseline=state,
                               context=context, private_context=private_context,
                               assistant_context=assistant_entries)
         state["health"] = dict(packet["coverage"])
+        # Per-source incidents from ACTUAL attempted observations only. This is
+        # the durable repair that replaces the ordinary scheduled coverage spam:
+        # cached/partial/truncated/deferred/busy reads never count.
+        observed_names = {r.name for r in observed_obligations}
+        record_observations(state, [r for r in results if r.name not in observed_names]
+                            + observed_obligations, clock.now(), policy)
         if snapshot_view is not None:
             # Bounded, text-free health for the delivery cache: available /
             # expired / invalid / unconfigured is visible without exposing text.
@@ -576,7 +618,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             _emit("")
             return 0
 
-        if should_skip_inference(state, digest, clock.now(), policy,
+        if not health_alert(state, clock.now(), policy, commit=False) and should_skip_inference(state, digest, clock.now(), policy,
                                  context_fingerprint=context_digest,
                                  context_present=context_present):
             # Upgrade a LEGACY record that predates the context fingerprint and
@@ -616,35 +658,72 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             }, indent=2))
             return 0
 
-        # Health notices are not an escape hatch: they obey the shared quiet /
-        # pause / snooze / cooldown / cap guards, and the failure-signature is
-        # only consumed once a notice is actually emitted.
+        # Health alerts are not an escape hatch: they obey the shared quiet /
+        # pause / snooze / cooldown / cap guards, and the incident is only
+        # consumed once a notice is actually emitted. Ordinary per-source
+        # failures (including retryable timeouts/503) are silent here; only a
+        # critical, persistent, recovery-exhausted loss surfaces, once/incident.
         allowed, _guard_reason = notice_allowed(state, policy, prefs, clock.now())
-        notice = deferred_coverage_notice(results, state, policy, clock.now(), commit=False)
-        business_message = bool(proposal.message)
+        health_notice = health_alert(state, clock.now(), policy, commit=False)
+        # A model cannot smuggle a routine health/coverage message as a business
+        # alert: the runtime guard rejects it, without blocking a real warning
+        # that names a concrete obligation/deadline/consequence.
+        guard_reason = routine_health_reason(proposal.message, proposal=proposal, packet=packet) if proposal.action == "notify" else None
+        business_message = bool(proposal.message) and guard_reason is None
 
-        # A higher-priority coverage notice is emitted first; the evaluator
-        # failure notice is NOT consumed when coverage is emitted, so it stays
-        # armed for the next run (only one health message per run).
-        if notice and not business_message and allowed:
-            rich_evaluator = note_evaluator_outcome(proposal, state, policy, prefs, clock.now())
-            commit_coverage_notice(results, state, now=clock.now())
+        # A critical source-health alert is emitted first; the evaluator failure
+        # notice is NOT consumed when it is emitted, so it stays armed for the
+        # next run (only one health message per run).
+        if health_notice and not business_message and allowed:
+            note_evaluator_outcome(proposal, state, policy, prefs, clock.now())
+            incidents = alerting_sources(state, clock.now(), policy)
+            signature = "source-health:" + hashlib.sha256(json.dumps(
+                [(i["source"], i["incident_id"]) for i in incidents],
+                separators=(",", ":")).encode()).hexdigest()[:32]
+            for item in incidents:
+                record = state["source_health"]["sources"][item["source"]]
+                record["delivery_state"] = "emitting"
+                record["delivery_incident"] = item["incident_id"]
+            # An interrupted emission is UNCERTAIN, never a blind retry. A save
+            # failure here occurs before stdout and leaves the incident eligible.
+            try:
+                store.save("notify_state.json", state)
+            except OSError as exc:
+                _diag({"diagnostic": "health-outbox-save-failed", "error": type(exc).__name__})
+                return 1
+            try:
+                _emit(health_notice)
+            except (OSError, RuntimeError) as exc:
+                _diag({"diagnostic": "health-emission-uncertain", "error": type(exc).__name__})
+                return 1
+            commit_alert(state, clock.now(), policy, incidents=incidents)
             state["last_delivery_at"] = clock.now().isoformat()
-            state.setdefault("delivered", []).append({"at": clock.now().isoformat(), "signature": "coverage", "urgent": False})
-            store.save("notify_state.json", state)
-            _emit(notice)
+            state.setdefault("delivered", []).append(
+                {"at": clock.now().isoformat(), "signature": signature, "urgent": False})
+            store.prune_notify_state(state, int(policy.get("state_retention_days", 30)))
+            try:
+                store.save("notify_state.json", state)
+            except OSError as exc:
+                _diag({"diagnostic": "health-commit-uncertain", "error": type(exc).__name__})
+                return 1
             return 0
 
         evaluator_notice = note_evaluator_outcome(proposal, state, policy, prefs, clock.now())
-        if evaluator_notice and allowed:
+        if evaluator_notice and allowed and routine_health_reason(evaluator_notice) is None:
             state["last_delivery_at"] = clock.now().isoformat()
             state.setdefault("delivered", []).append({"at": clock.now().isoformat(), "signature": "evaluator-failure", "urgent": False})
             store.save("notify_state.json", state)
             _emit(evaluator_notice)
             return 0
 
-        decision = decide(proposal, packet, clock=clock, policy=policy, prefs=prefs, state=state,
-                          requested_reminder=bool(args.requested_reminder))
+        if guard_reason:
+            # Runtime guard: reject a routine health/coverage message from the
+            # model; the evaluator outcome is still recorded above. Nothing is
+            # emitted and the packet digest still advances.
+            decision = {"send": False, "message": "", "reason": "runtime-guard", "urgent": False}
+        else:
+            decision = decide(proposal, packet, clock=clock, policy=policy, prefs=prefs, state=state,
+                              requested_reminder=bool(args.requested_reminder))
         if decision.get("send"):
             decision.setdefault("kind", proposal.kind)
             decision.setdefault("key", proposal.key)

@@ -671,6 +671,16 @@ def collect_obligations(
         # Never re-preview an id whose body was already read; this keeps the
         # dedicated preview budget for genuinely new actionable mail.
         skip_ids = set(str(x) for x in (cursor.get("previewed_ids") or []))
+        dispatch = policy.get("_source_dispatch")
+        if dispatch is not None and not dispatch(f"obligation:{account}"):
+            # Preserve known obligations even while the provider circuit waits.
+            active = [_item_from_record(account, rec, now) for rec in data["records"].values()
+                      if str(rec.get("account") or "") == account
+                      and rec.get("status") in {"pending", "uncertain"}]
+            results.append(SourceResult(f"obligation:{account}", "stale", count=len(active),
+                                        items=active, attempted=False,
+                                        failure="source-health cooldown", truncated=True))
+            continue
         try:
             meta = collect_himalaya_native(
                 account, limit, clock=clock, cutoff_date=account_cutoff,
@@ -684,6 +694,10 @@ def collect_obligations(
             )
         except Exception as exc:  # noqa: BLE001 - surface as coverage failure
             cursor["last_error"] = safe_source_error(exc, kind="obligation")
+            observe = policy.get("_source_observe")
+            if observe is not None:
+                observe(SourceResult(f"obligation:{account}", "error", error=cursor["last_error"],
+                                     checked_at=now.isoformat(), attempted=True))
             results.append(SourceResult(f"obligation:{account}", "error",
                                         error=cursor["last_error"],
                                         checked_at="", truncated=True,
@@ -691,6 +705,10 @@ def collect_obligations(
                                         pending_ids=list(start_pending)))
             continue
         attempted += 1
+        observe = policy.get("_source_observe")
+        if observe is not None:
+            from dataclasses import replace
+            observe(replace(meta, name=f"obligation:{account}"))
         meta_scanned = int(getattr(meta, "scanned", 0) or 0)
         meta_listed = int(getattr(meta, "ids_listed", 0) or 0)
         cursor["scanned_total"] = int(cursor.get("scanned_total", 0)) + meta_scanned

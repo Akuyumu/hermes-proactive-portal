@@ -65,6 +65,8 @@ PUBLIC_HOST_PATHS: dict[str, tuple[str, ...]] = {
         # Exact reviewed official opportunity page (parent-fetched public
         # fixture). One fixed page only: this is NOT a prefix or subtree opt-in.
         "/admissions/undergraduate/fees-and-funding/financial-aid/overseas-student-programme-loan-travel-award",
+        # Owner-approved exact replacement for the redirected Travel Award page.
+        "/admissions/undergraduate/fees-and-funding/financial-aid/travel-award-overseas-student-programme-exchange",
     ),
     "www.channelnewsasia.com": ("/api/v1/rss-outbound-feed",),
     # Exact official keyless NEA forecast API and one reviewed SMRT planned
@@ -101,7 +103,7 @@ NTU_SCHOLARSHIP_PROCESS_URL = (
 )
 NTU_TRAVEL_AWARD_URL = (
     "https://www.ntu.edu.sg/admissions/undergraduate/fees-and-funding/"
-    "financial-aid/overseas-student-programme-loan-travel-award"
+    "financial-aid/travel-award-overseas-student-programme-exchange"
 )
 
 # Query keys that would smuggle a credential/token into a URL.
@@ -2044,7 +2046,11 @@ def _collect_one(
             generic_opt_in=vetted_opt_in,
         ).geturl()
     except URLRejected as exc:
-        return SourceResult(name, "error", error=f"url rejected: {exc}", checked_at=now.isoformat()), used
+        return SourceResult(name, "error", error=f"url rejected: {exc}", checked_at=now.isoformat(), attempted=False), used
+
+    dispatch = policy.get("_source_dispatch")
+    if dispatch is not None and not dispatch(name):
+        return SourceResult(name, "deferred", failure="source-health cooldown", attempted=False), used
 
     # Consume the single per-cycle Reddit slot BEFORE any attempt, so a Reddit
     # failure (timeout/429/parse) can never allow a second Reddit request.
@@ -2066,7 +2072,11 @@ def _collect_one(
         )
     except URLRejected:
         return SourceResult(name, "error", error="feed url rejected", checked_at=now.isoformat()), used
-    except FeedError:
+    except FeedError as exc:
+        observe = policy.get("_source_observe")
+        if observe is not None:
+            observe(SourceResult(name, "error", error=safe_source_error(exc, kind="feed"),
+                                 checked_at=now.isoformat(), attempted=True))
         rec["last_fetch_at"] = now.isoformat()
         rec["failures"] = int(rec.get("failures", 0)) + 1
         rec["stale_reason"] = "feed fetch failed"
@@ -2092,6 +2102,23 @@ def _collect_one(
         res.checked_at = now.isoformat()
         return res, used
     if response.status == 429:
+        # Record the real attempted failure separately from any served cache.
+        # The health circuit owns the deadline even when cadence is shorter.
+        retry = str(next((v for k, v in response.headers.items()
+                          if str(k).lower() == "retry-after"), ""))
+        seconds = 0
+        try:
+            seconds = max(0, min(int(retry), 86400))
+        except ValueError:
+            try:
+                from email.utils import parsedate_to_datetime
+                seconds = max(0, min(int((parsedate_to_datetime(retry) - now).total_seconds()), 86400))
+            except (ValueError, TypeError, OverflowError):
+                pass
+        observe = policy.get("_source_observe")
+        if observe is not None:
+            observe(SourceResult(name, "error", checked_at=now.isoformat(), attempted=True,
+                                 error="429 rate limited" + (f"; Retry-After: {seconds}" if seconds else "")))
         # Never retry or bypass; keep cache; enforce cadence via last_fetch_at.
         rec["failures"] = int(rec.get("failures", 0)) + 1
         rec["stale_reason"] = "rate limited (429)"
@@ -2099,6 +2126,10 @@ def _collect_one(
         res.status = "stale"
         return res, used
     if response.status < 200 or response.status >= 300:
+        observe = policy.get("_source_observe")
+        if observe is not None:
+            observe(SourceResult(name, "error", error=f"http {response.status}",
+                                 checked_at=now.isoformat(), attempted=True))
         rec["failures"] = int(rec.get("failures", 0)) + 1
         rec["stale_reason"] = f"http {response.status}"
         if rec.get("cache_items"):

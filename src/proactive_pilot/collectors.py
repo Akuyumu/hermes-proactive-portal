@@ -241,6 +241,9 @@ class SourceResult:
     # arrivals at the head cannot shift numeric offsets and skip unvisited
     # historical ids. ``offset`` is the first unvisited index into this queue.
     pending_ids: list[str] = field(default_factory=list)
+    # False only for an explicitly skipped dispatch. None preserves legacy
+    # attempted-result contracts; wrappers must not fabricate fresh evidence.
+    attempted: bool | None = None
 
     @property
     def healthy(self) -> bool:
@@ -307,6 +310,15 @@ def safe_source_error(exc: Any, *, kind: str = "source") -> str:
         return f"{kind} timeout"
     if isinstance(exc, FileNotFoundError) or "not found" in lowered:
         return f"{kind} unavailable"
+    if any(marker in lowered for marker in ("401", "invalid_grant", "token revoked", "authorization revoked",
+                                           "authorisation revoked", "missing configured grant")):
+        return "configured authorization requires renewal"
+    if "429" in lowered or "rate limit" in lowered:
+        from .source_health import retry_after_seconds
+        seconds = retry_after_seconds(text)
+        return "rate limited 429" + (f"; Retry-After: {seconds}" if seconds else "")
+    if any(code in lowered for code in ("503", "502", "504")):
+        return f"{kind} provider overload 503"
     if "auth" in lowered or "permission" in lowered or "credential" in lowered or "401" in lowered or "403" in lowered:
         return "authentication unavailable"
     if "parse" in lowered or "json" in lowered or "decode" in lowered:
@@ -766,7 +778,7 @@ def collect_himalaya_native(
             combined = f"{err} {stdout_error}".strip()
             lowered = combined.lower()
             if any(tok in lowered for tok in ("auth", "credential", "permission", "401", "403")):
-                return SourceResult(name, "error", error="authentication unavailable",
+                return SourceResult(name, "error", error=safe_source_error(combined, kind="mail"),
                                     checked_at=checked, pending_ids=list(queue_in))
             if _gmail_unsupported_error(stdout_error) or _native_search_unsupported(stdout_error) \
                     or any(tok in lowered for tok in
@@ -817,7 +829,7 @@ def collect_himalaya_native(
                 # Auth failure on a metadata get is a real error with
                 # uncertainty: fail closed, preserve the unvisited id, and never
                 # present a fresh/healthy partial or a stale actionable alert.
-                return SourceResult(name, "error", error="authentication unavailable",
+                return SourceResult(name, "error", error=safe_source_error(combined, kind="mail"),
                                     checked_at=checked, items=items,
                                     truncated=True, next_token=carry_token, offset=i,
                                     pending_ids=list(ids), scanned=metadata_scanned,
@@ -1523,6 +1535,7 @@ def default_sources(policy: dict[str, Any], clock: Any,
                     f"calendar:gws:{calendar_id}", budget,
                     lambda: adapter.collect(clock, {**policy, "calendar_ids": [calendar_id]},
                                             budget=budget),
+                    dispatch=policy.get("_source_dispatch"),
                 )
             )
 
@@ -1537,6 +1550,7 @@ def default_sources(policy: dict[str, Any], clock: Any,
                         page_size=page_size, timeout=_clamp_timeout(budget, 25),
                         calendar_ids=policy.get("calendar_ids"),
                     ),
+                    dispatch=policy.get("_source_dispatch"),
                 )
             )
     if tasks_on and compatibility_on:
@@ -1550,6 +1564,7 @@ def default_sources(policy: dict[str, Any], clock: Any,
                         task_lists=policy.get("task_lists"),
                         task_adapter=policy.get("task_adapter", ""),
                     ),
+                    dispatch=policy.get("_source_dispatch"),
                 )
             )
     if mail_on:
@@ -1568,16 +1583,20 @@ def default_sources(policy: dict[str, Any], clock: Any,
                         server_window=False,
                         allowed_accounts=mail_accounts,
                     ),
+                    dispatch=policy.get("_source_dispatch"),
                 )
             )
     return factories
 
 
-def _budgeted(name: str, budget: "Budget | None", fn: Callable[[], SourceResult]) -> SourceResult:
+def _budgeted(name: str, budget: "Budget | None", fn: Callable[[], SourceResult],
+              *, dispatch=None) -> SourceResult:
     """Run a source only while budget remains; otherwise declare it partial."""
     if budget is not None and budget.expired():
         return SourceResult(name, "ok", count=0, items=[], checked_at="", truncated=True,
                             failure="collector budget exhausted before this source")
+    if dispatch is not None and not dispatch(name):
+        return SourceResult(name, "deferred", failure="source-health cooldown", attempted=False)
     return fn()
 
 

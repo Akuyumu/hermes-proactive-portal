@@ -305,6 +305,20 @@ requirement. Delivery is best-effort; do not promise hard punctuality.
 - Undated tasks are not covered.
 - Blocked, failed, deferred and truncated sources are recorded separately; do
   not promise complete coverage.
+- **Source health is limited repair, not self-healing.** Ordinary scans do not
+  spam a coverage notice. The plugin keeps a per-source incident (attempted
+  checks, failure streak, timestamps), retries boundedly, and honours a `429`
+  `Retry-After` with a real per-source dispatch gate. It alerts **once per
+  unresolved incident** only for a source the user explicitly named critical
+  (`health.critical_sources`; mail/calendar are not critical by default) that
+   failed repeatedly for the persistent window (>= 2h) after safe recovery was
+   exhausted AND a narrowly classified authorization/grant problem requires
+   owner action. Provider overload and unexplained connectivity loss stay
+   internal. Two next-scheduled probes are bounded by existing quotas; later
+   cooldown-spaced reads are ordinary checks. It cannot refresh revoked grants
+   or edit authorization/configuration. Incident-specific emission is persisted
+   as pending before stdout; interrupted emission is uncertain across restart
+   and is never blindly resent.
 - Public feed items are tentative public evidence, not obligations. A forecast
   is a forecast, not an active warning.
 - A 200 JavaScript shell is not content; the optional v0.4.0 render fallback and

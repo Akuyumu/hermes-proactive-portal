@@ -148,6 +148,38 @@ can then explain the coverage on your machine.
   the native scheduler owns actual delivery.
 - It does not fabricate urgency, personal fit, location, or a deadline.
 
+## Source health and bounded recovery (limited, not self-healing)
+
+Ordinary scheduled scans no longer emit a coverage notice every time a source
+fails. Instead the plugin keeps a schema-validated per-source incident (actual
+attempted checks, first/last failure, success and streak) in durable state:
+
+- Only an **attempted** read counts. A missing, cached, partial, truncated,
+  deferred or busy observation is neither a success nor a failure and can never
+  be recorded as a recovery.
+- A retryable timeout/503 stays **silent without an identifiable owner fix**. A `429` honours its
+  `Retry-After`/backoff: the per-source dispatch gate blocks the next real call
+  until that deadline, then permits exactly one **half-open** probe.
+- A single critical-source alert is emitted **at most once per unresolved
+  incident**, even across restarts, and only when the source was explicitly
+  named critical in configuration, has failed repeatedly, has stayed failed for
+  the persistent window (>= 2h by default), safe recovery is exhausted, and
+  an explicitly classified revoked/missing grant requires owner action. A
+  new incident can only qualify after an authoritative attempted success.
+  Scoped clients are gated before requests; unrelated accounts continue under
+  their existing budgets. Two bounded next-scheduled probes are the default;
+  later cooldown-spaced checks are ordinary reads, not claimed auth repair.
+  Health emission uses a durable incident-specific outbox: interruption after
+  emission starts is marked uncertain across restart and is not blindly resent.
+
+This is deliberately **limited repair**, not universal self-healing: the plugin
+cannot fix a revoked credential, an outage at a provider, or a network fault. It
+only stops ordinary scan spam, retries boundedly, and tells you once when an
+actionable source you marked critical is persistently lost. Mail and calendar are NOT
+critical by default; name them under `health.critical_sources` if you want an
+alert. A provider overload or timeout alone is never presented as something you
+can fix yourself.
+
 ## Permissions and privacy
 
 - Collectors, searches and fetches can contact external authorised services and

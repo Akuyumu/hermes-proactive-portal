@@ -49,8 +49,21 @@ DEFAULT_POLICY: dict[str, Any] = {
     "evaluator_failure_notice_threshold": 3,
     # Per-source coverage notice cooldown: stops a fail/recover/fail flap from
     # re-notifying the same source, while still allowing a genuine later loss
-    # to surface once the window lapses.
+    # to surface once the window lapses. Retained for the legacy helper; the
+    # ordinary scheduled path now uses the per-source health gate below.
     "coverage_notice_cooldown_minutes": 60,
+    # -- per-source health gate (durable, bounded recovery) -------------------
+    # A retryable timeout/503 is silent at first. A chronic loss only alerts when
+    # a source is explicitly critical AND it has failed at least this many
+    # attempted reads AND been failing for at least the persistent window AND
+    # safe recovery is exhausted. Mail/calendar are NOT critical by default.
+    "source_health_failure_threshold": 3,
+    "source_health_persistent_minutes": 120,
+    "source_health_cooldown_minutes": 60,
+    "source_health_max_recovery_attempts": 2,
+    # Neutral default: no source is critical until the user's validated
+    # configuration names it. This is the ONLY way a source becomes critical.
+    "health_critical_sources": [],
     # -- public awareness expansion -------------------------------------------
     "feeds_enabled": True,
     "obligations_enabled": True,

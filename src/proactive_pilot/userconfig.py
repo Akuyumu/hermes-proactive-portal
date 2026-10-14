@@ -75,8 +75,12 @@ _SAFE_MCP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SECTIONS = (
     "schema", "version", "timezone", "notification", "sources", "mail",
     "calendar", "tasks", "public_interests", "public_sources", "adaptive",
-    "bounds", "adapters", "retrieval", "advanced",
+    "bounds", "adapters", "retrieval", "health", "advanced",
 )
+
+# Health critical sources are named source ids like ``mail:formal`` or
+# ``calendar:primary``. They are names only, never a credential.
+_SAFE_SOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 def default_config() -> dict[str, Any]:
@@ -111,6 +115,9 @@ def default_config() -> dict[str, Any]:
             "privacy_review": False,
             "inferred_goals": False,
         },
+        # Per-source health: NEUTRAL by default. No source is critical until the
+        # user explicitly names it here; mail/calendar are never implicit.
+        "health": {"critical_sources": []},
         "bounds": {
             "collector_budget_seconds": 60,
             "max_candidates_per_kind": 60,
@@ -350,6 +357,10 @@ def validate_config(raw: Any) -> dict[str, Any]:
             "the structural privacy boundary still runs but the optional semantic "
             "review stays off")
 
+    health = _require_mapping(raw.get("health") or {}, "health")
+    config["health"]["critical_sources"] = _validate_str_list(
+        health.get("critical_sources"), "health.critical_sources", _SAFE_SOURCE_NAME)
+
     bounds = _require_mapping(raw.get("bounds") or {}, "bounds")
     config["bounds"]["collector_budget_seconds"] = _bounded_int(
         bounds.get("collector_budget_seconds"), "bounds.collector_budget_seconds",
@@ -486,6 +497,7 @@ def policy_overrides(config: dict[str, Any]) -> dict[str, Any]:
         "adaptive_mode": config["adaptive"]["mode"],
         "adaptive_privacy_review_enabled": config["adaptive"]["privacy_review"],
         "adaptive_inferred_goals_enabled": config["adaptive"]["inferred_goals"],
+        "health_critical_sources": list(config["health"]["critical_sources"]),
         "collector_budget_seconds": config["bounds"]["collector_budget_seconds"],
         "max_candidates_per_kind": config["bounds"]["max_candidates_per_kind"],
         "feed_max_sources_per_run": config["bounds"]["feed_max_sources_per_run"],
@@ -609,6 +621,7 @@ class LoadedConfig:
             "mail_accounts": list(self.config["mail"]["accounts"]),
             "calendars": list(self.config["calendar"]["calendars"]),
             "adaptive_mode": self.config["adaptive"]["mode"],
+            "critical_sources": list(self.config.get("health", {}).get("critical_sources", [])),
             "adapters": dict(self.config["adapters"]),
             "retrieval": dict(self.config.get("retrieval", {})),
             "warnings": list(self.warnings),
@@ -800,6 +813,12 @@ def migrate_legacy(
     config["adaptive"]["inferred_goals"] = bool(policy.get("adaptive_inferred_goals_enabled", False))
     report["mapped"].append("adaptive")
 
+    # Explicit per-source health critical list; neutral when absent.
+    critical = policy.get("health_critical_sources")
+    if isinstance(critical, list):
+        config["health"]["critical_sources"] = _validate_str_list(
+            critical, "health.critical_sources", _SAFE_SOURCE_NAME)
+
     config["bounds"]["collector_budget_seconds"] = _bounded_int(
         policy.get("collector_budget_seconds"), "collector_budget_seconds", 5, 600, 60)
     config["bounds"]["max_candidates_per_kind"] = _bounded_int(
@@ -843,6 +862,7 @@ def migrate_legacy(
         "feed_seed_sources", "adaptive_mode", "adaptive_privacy_review_enabled",
         "adaptive_inferred_goals_enabled", "collector_budget_seconds",
         "max_candidates_per_kind", "feed_max_sources_per_run",
+        "health_critical_sources",
         "firecrawl_enabled", "firecrawl_consent", "firecrawl_mcp_server",
         "firecrawl_mcp_tool", "firecrawl_max_attempts_per_cycle",
         "firecrawl_max_attempts_per_day", "firecrawl_concurrency",

@@ -432,7 +432,7 @@ class SafeErrorTests(unittest.TestCase):
         self.assertEqual(safe_source_error(SourceTimeout("slow"), kind="obligation"),
                          "obligation budget-deferred")
         self.assertEqual(safe_source_error("HTTP 401 unauthorized", kind="calendar"),
-                         "authentication unavailable")
+                         "configured authorization requires renewal")
 
     def test_wallclock_alarm_restores_previous_handler_and_timer(self):
         import signal
