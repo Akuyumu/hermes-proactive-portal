@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
@@ -41,6 +42,16 @@ DEFAULT_REGISTRY_LIMIT = 12
 REDDIT_CADENCE_MINUTES = 60
 
 USER_AGENT = "proactive-pilot/0.2 (public feeds; read-only)"
+
+# Exact official LTA DataMall live train-service-alert endpoint. This is a
+# CREDENTIALED source: the AccountKey is read ONLY from the environment variable
+# below and sent ONLY as a request header. The host/path are declared as a fixed
+# EXACT endpoint (never authority to crawl datamall2.mytransport.sg).
+LTA_DATAMALL_HOST = "datamall2.mytransport.sg"
+LTA_TRAIN_ALERTS_PATH = "/ltaodataservice/TrainServiceAlerts"
+LTA_TRAIN_ALERTS_URL = f"https://{LTA_DATAMALL_HOST}{LTA_TRAIN_ALERTS_PATH}"
+LTA_ACCOUNT_KEY_ENV = "LTA_DATAMALL_ACCOUNT_KEY"
+LTA_TRAIN_ALERTS_KIND = "lta_train_alerts"
 
 # Canonical host -> permitted path prefixes (strict). Extend only via policy
 # opt-in for generic websites, never at runtime from feed content.
@@ -75,6 +86,10 @@ PUBLIC_HOST_PATHS: dict[str, tuple[str, ...]] = {
     "www.smrt.com.sg": (
         "/news-publications/newsroom/service-announcements/last-bus-train-timing-extension-for-2026-f1-singapore-grand-prix/",
     ),
+    # Exact official credentialed LTA DataMall live train-service-alert endpoint.
+    # A single fixed EXACT path (enforced in ``validate_public_url`` below), NOT
+    # authority to crawl the domain.
+    LTA_DATAMALL_HOST: (LTA_TRAIN_ALERTS_PATH,),
 }
 
 REDDIT_HOSTS = {"www.reddit.com", "reddit.com", "old.reddit.com"}
@@ -82,7 +97,7 @@ GITHUB_HOSTS = {"api.github.com", "github.com"}
 
 # Vetted fixed public news sources permitted in the registry (seed sources).
 VETTED_NEWS_HOSTS = {"www.ntu.edu.sg", "www.channelnewsasia.com"}
-VETTED_FIXED_PUBLIC_HOSTS = {"api-open.data.gov.sg", "www.smrt.com.sg"}
+VETTED_FIXED_PUBLIC_HOSTS = {"api-open.data.gov.sg", "www.smrt.com.sg", LTA_DATAMALL_HOST}
 # Hosts permitted for DISPLAY-ONLY article links. They are normalized/validated
 # but NEVER fetched and article bodies are NEVER followed.
 ARTICLE_HOSTS = {"www.ntu.edu.sg", "www.channelnewsasia.com"}
@@ -212,6 +227,10 @@ def validate_public_url(
             # Scholarship entries are reviewed individual pages, not prefixes.
             if path not in prefixes:
                 raise URLRejected(f"path not exactly allowlisted for {host}: {path}")
+        if host == LTA_DATAMALL_HOST and path != LTA_TRAIN_ALERTS_PATH:
+            # One EXACT credentialed endpoint: any other path on this host (even
+            # one that shares the prefix) is refused.
+            raise URLRejected(f"path not exactly allowlisted for {host}: {path}")
         if prefixes and not any(path.startswith(prefix) for prefix in prefixes):
             raise URLRejected(f"path not allowlisted for {host}: {path}")
     elif not generic_opt_in:
@@ -369,6 +388,98 @@ def fetch_bytes(
         final_url, allowed_hosts=allowed_hosts,
         generic_opt_in=generic_opt_in, generic_hosts=generic_hosts,
     )
+    if len(raw) > int(max_bytes):
+        raw = raw[: int(max_bytes)]
+    return FetchResponse(status, resp_headers, raw, final_url)
+
+
+# --------------------------------------------------------------------------- #
+# Credentialed fetch path (SEPARATE from fetch_bytes; exactly one source)
+# --------------------------------------------------------------------------- #
+#
+# ``fetch_bytes`` above is a documented NO-CREDENTIAL bounded GET and is kept
+# exactly that way. The one credentialed source (LTA DataMall train alerts) gets
+# its OWN explicitly named path below. It never weakens ``fetch_bytes`` and is
+# usable ONLY for a single fixed host + exact path; every vetting failure raises
+# (fail closed) rather than degrading, and the key is never placed in a URL.
+
+
+class CredentialMissing(FeedError):
+    """A credentialed source's key env var is absent/empty. Fails closed."""
+
+
+def _redact_credential(text: Any, secret: str) -> str:
+    """Remove the secret value (and the account header name) from any text."""
+    out = str(text or "")
+    if secret:
+        out = out.replace(secret, "[redacted]")
+    return re.sub(r"(?i)accountkey", "[redacted-header]", out)
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect for the credentialed source (never follow)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        raise FeedFailed("redirect refused for credentialed source")
+
+
+def fetch_lta_train_alerts(
+    *,
+    environ: Any = None,
+    opener: Any = None,
+    url: str = LTA_TRAIN_ALERTS_URL,
+    timeout: int = DEFAULT_TIMEOUT,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+) -> FetchResponse:
+    """Bounded credentialed GET for the ONE reviewed LTA DataMall endpoint.
+
+    Security contract (all violations raise, none degrade):
+
+    - the AccountKey is read ONLY from ``os.environ[LTA_ACCOUNT_KEY_ENV]`` (or an
+      injected mapping for tests) and sent ONLY as a request header;
+    - exactly one host and one EXACT path (no query string) is permitted; any
+      other host/port/scheme/path is refused before any socket is opened;
+    - redirects are refused outright;
+    - the existing byte cap and timeout are enforced;
+    - a missing/empty key raises ``CredentialMissing`` with a non-secret
+      diagnostic (the env var NAME only) and NO network call is attempted.
+    """
+    env = os.environ if environ is None else environ
+    key = str(env.get(LTA_ACCOUNT_KEY_ENV) or "").strip()
+    if not key:
+        # Diagnostic carries the variable NAME only, never a value or length.
+        raise CredentialMissing(
+            f"credentialed feed unavailable: {LTA_ACCOUNT_KEY_ENV} is not set")
+    allowed = {LTA_DATAMALL_HOST: (LTA_TRAIN_ALERTS_PATH,)}
+    parsed = validate_public_url(url, allowed_hosts=allowed)
+    if canonical_host(parsed.hostname or "") != LTA_DATAMALL_HOST:
+        raise URLRejected("credentialed source host mismatch")
+    if (parsed.path or "/") != LTA_TRAIN_ALERTS_PATH or parsed.query:
+        raise URLRejected("credentialed source path must be exact and query-free")
+    opener_obj = opener if opener is not None else urllib.request.build_opener(_RefuseRedirects())
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "AccountKey": key,
+    }
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with opener_obj.open(request, timeout=max(1, int(timeout))) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            raw = response.read(int(max_bytes) + 1)
+            final_url = str(getattr(response, "url", url) or url)
+            resp_headers = {str(k): str(v) for k, v in dict(response.headers).items()}
+    except urllib.error.HTTPError as exc:
+        raise FeedFailed(
+            _redact_credential(f"http {int(getattr(exc, 'code', 0) or 0)}", key)) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise FeedFailed(_redact_credential(f"network error: {exc}", key)) from exc
+    # A redirect is refused, so the final URL must still be the one vetted target.
+    final = validate_public_url(final_url, allowed_hosts=allowed)
+    if canonical_host(final.hostname or "") != LTA_DATAMALL_HOST:
+        raise URLRejected("credentialed source final host mismatch")
+    if (final.path or "/") != LTA_TRAIN_ALERTS_PATH:
+        raise URLRejected("credentialed source final path mismatch")
     if len(raw) > int(max_bytes):
         raw = raw[: int(max_bytes)]
     return FetchResponse(status, resp_headers, raw, final_url)
@@ -649,6 +760,8 @@ _NORMALIZED_CONTENT_TYPES: dict[str, tuple[str, ...]] = {
     "nea_forecast": ("json",),
     "smrt_notice": ("html",),
     "ntu_opportunity": ("html", "xml", "xhtml"),
+    # Official credentialed LTA DataMall live train alerts: JSON only.
+    "lta_train_alerts": ("json",),
 }
 
 
@@ -808,6 +921,153 @@ def parse_nea_forecast(
         "valid_until": ends.isoformat(),
         "forecast_only": True,
     }]
+
+
+# All-clear marker item id (stable) so a standing disruption can be resolved
+# downstream when the official status returns to normal.
+LTA_ALL_CLEAR_ID = "lta-train-all-clear"
+
+
+def _lta_scalar_text(value: Any, *, max_chars: int = 200) -> str:
+    if isinstance(value, (dict, list)):
+        return ""
+    return strip_html(value, max_chars=max_chars)
+
+
+def _lta_segment_text(segment: Any) -> str:
+    """Bounded, sanitized description of one untrusted AffectedSegments entry."""
+    if isinstance(segment, dict):
+        parts: list[str] = []
+        for key in ("Line", "Direction", "Station", "StationCode", "Stations", "Message"):
+            raw = segment.get(key)
+            if isinstance(raw, list):
+                text = strip_html(
+                    ", ".join(_lta_scalar_text(v, max_chars=60) for v in raw[:10]),
+                    max_chars=120,
+                )
+            else:
+                text = strip_html(raw, max_chars=120)
+            if text:
+                parts.append(text)
+        return " — ".join(parts)[:280]
+    if isinstance(segment, list):
+        return strip_html(
+            ", ".join(_lta_scalar_text(v, max_chars=60) for v in segment[:10]),
+            max_chars=280,
+        )
+    return strip_html(segment, max_chars=280)
+
+
+def _lta_message_text(message: Any) -> tuple[str, str]:
+    if isinstance(message, dict):
+        content = strip_html(
+            message.get("Content") or message.get("Message") or message.get("Text") or "",
+            max_chars=400,
+        )
+        created = strip_html(
+            message.get("CreatedDate") or message.get("Date") or "", max_chars=60)
+        return content, created
+    return strip_html(message, max_chars=400), ""
+
+
+def parse_lta_train_alerts(
+    body: bytes,
+    *,
+    now: datetime | None = None,
+    max_items: int = DEFAULT_MAX_ITEMS,
+) -> list[dict[str, Any]]:
+    """Parse the official LTA DataMall ``TrainServiceAlerts`` envelope.
+
+    Bounded evidence only; every field is untrusted text and is sanitized and
+    length-bounded. Status 1 yields exactly ONE explicit all-clear marker item
+    (never a fabricated incident). Status 2 yields one item per affected segment
+    and per message. A missing/garbage shape, an unexpected Status value, or a
+    non-JSON body fails closed with ``FeedFailed`` -- never "no news".
+    """
+    try:
+        payload = json.loads(body.decode("utf-8", "replace"))
+    except (ValueError, TypeError) as exc:
+        raise FeedFailed("LTA train alerts JSON parse error") from exc
+    if not isinstance(payload, dict):
+        raise FeedFailed("LTA train alerts payload is not an object")
+    value = payload.get("value")
+    if not isinstance(value, dict):
+        raise FeedFailed("LTA train alerts value missing")
+    status = value.get("Status")
+    if isinstance(status, bool) or not isinstance(status, int):
+        raise FeedFailed("LTA train alerts status malformed")
+    segments = value.get("AffectedSegments")
+    messages = value.get("Message")
+    if not isinstance(segments, list) or not isinstance(messages, list):
+        raise FeedFailed("LTA train alerts arrays malformed")
+    observed = (now or datetime.now(timezone.utc)).isoformat()
+    if status == 1:
+        return [{
+            "title": "LTA train service status: normal service (all-clear)",
+            "summary": (
+                "Official LTA DataMall TrainServiceAlerts reports Status 1: no "
+                "train service disruption is currently reported (all-clear "
+                "marker). This is a status marker, not a fabricated incident."
+            ),
+            "link": LTA_TRAIN_ALERTS_URL,
+            "id": LTA_ALL_CLEAR_ID,
+            "published": observed,
+            "date_precision": "timestamp",
+            "category": "live_transport",
+            "publisher": "Singapore Land Transport Authority (LTA)",
+            "service_status": "normal",
+            "live_service_alert": True,
+            "all_clear": True,
+        }]
+    if status != 2:
+        raise FeedFailed(f"LTA train alerts unexpected status: {status!r}")
+    if not segments and not messages:
+        # Status 2 with no described detail must never degrade to "no news".
+        raise FeedFailed("LTA train alerts status 2 with no detail")
+    limit = max(1, int(max_items))
+    out: list[dict[str, Any]] = []
+    for segment in segments:
+        text = _lta_segment_text(segment)
+        if not text:
+            continue
+        out.append({
+            "title": f"LTA train disruption — affected segment: {text[:120]}",
+            "summary": f"Affected segment: {text}",
+            "link": LTA_TRAIN_ALERTS_URL,
+            "id": "lta-segment-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+            "published": "",
+            "date_precision": "unknown",
+            "category": "live_transport",
+            "publisher": "Singapore Land Transport Authority (LTA)",
+            "service_status": "disruption",
+            "live_service_alert": True,
+            "all_clear": False,
+        })
+        if len(out) >= limit:
+            return out
+    for message in messages:
+        content, created = _lta_message_text(message)
+        if not content:
+            continue
+        out.append({
+            "title": f"LTA train disruption notice: {content[:120]}",
+            "summary": content,
+            "link": LTA_TRAIN_ALERTS_URL,
+            "id": "lta-message-" + hashlib.sha256(
+                (content + "|" + created).encode("utf-8")).hexdigest()[:16],
+            "published": created,
+            "date_precision": "timestamp" if created else "unknown",
+            "category": "live_transport",
+            "publisher": "Singapore Land Transport Authority (LTA)",
+            "service_status": "disruption",
+            "live_service_alert": True,
+            "all_clear": False,
+        })
+        if len(out) >= limit:
+            return out
+    if not out:
+        raise FeedFailed("LTA train alerts status 2 detail unusable")
+    return out
 
 
 _NOTICE_PUB_DATE_RE = re.compile(r"\b(\d{1,2})\s+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{4})\b", re.I)
@@ -1463,6 +1723,8 @@ def parse_source(
         return parse_smrt_planned_notice(body, now=now or datetime.now(timezone.utc))
     if kind == "ntu_opportunity":
         return parse_ntu_opportunity(body, now=now or datetime.now(timezone.utc))
+    if kind == LTA_TRAIN_ALERTS_KIND:
+        return parse_lta_train_alerts(body, now=now, max_items=max_items)
     if kind == "web_json":
         return parse_web_json(body, max_items=max_items)
     if kind == "web_page":
@@ -2008,6 +2270,7 @@ def _collect_one(
     reddit_ledger: Any = None,
     renderer: Callable[[str], Any] | None = None,
     firecrawl: Any = None,
+    credentialed_fetcher: Callable[..., FetchResponse] | None = None,
 ) -> tuple[SourceResult, int]:
     sid = str(rec.get("id") or "")
     kind = str(rec.get("kind") or "rss")
@@ -2061,17 +2324,44 @@ def _collect_one(
         rec["last_fetch_at"] = now.isoformat()
 
     try:
-        response = fetcher(
-            url,
-            allowed_hosts=None,
-            generic_opt_in=vetted_opt_in,
-            timeout=int(policy.get("feed_timeout_seconds", DEFAULT_TIMEOUT)),
-            max_bytes=int(policy.get("feed_max_bytes", DEFAULT_MAX_BYTES)),
-            etag=str(rec.get("etag") or ""),
-            last_modified=str(rec.get("last_modified") or ""),
-        )
+        if kind == LTA_TRAIN_ALERTS_KIND:
+            # The ONE credentialed source uses its own isolated, explicitly named
+            # path (never ``fetch_bytes``, never the generic fetcher). Tests
+            # inject ``credentialed_fetcher``; production uses the real one.
+            cred_fetch = credentialed_fetcher or fetch_lta_train_alerts
+            response = cred_fetch(
+                timeout=int(policy.get("feed_timeout_seconds", DEFAULT_TIMEOUT)),
+                max_bytes=int(policy.get("feed_max_bytes", DEFAULT_MAX_BYTES)),
+            )
+        else:
+            response = fetcher(
+                url,
+                allowed_hosts=None,
+                generic_opt_in=vetted_opt_in,
+                timeout=int(policy.get("feed_timeout_seconds", DEFAULT_TIMEOUT)),
+                max_bytes=int(policy.get("feed_max_bytes", DEFAULT_MAX_BYTES)),
+                etag=str(rec.get("etag") or ""),
+                last_modified=str(rec.get("last_modified") or ""),
+            )
     except URLRejected:
         return SourceResult(name, "error", error="feed url rejected", checked_at=now.isoformat()), used
+    except CredentialMissing as exc:
+        # Fail closed with the non-secret env-var diagnostic. No key value, no
+        # key length and no raw exception text are surfaced.
+        label = str(exc)
+        observe = policy.get("_source_observe")
+        if observe is not None:
+            observe(SourceResult(name, "error", error=label,
+                                 checked_at=now.isoformat(), attempted=False))
+        rec["last_fetch_at"] = now.isoformat()
+        rec["failures"] = int(rec.get("failures", 0)) + 1
+        rec["stale_reason"] = label
+        if rec.get("cache_items"):
+            res = _cached_result(rec, now, name, reason=label)
+            res.status = "stale"
+            return res, used
+        return SourceResult(name, "error", error=label, checked_at=now.isoformat(),
+                            failure=label, attempted=False), used
     except FeedError as exc:
         observe = policy.get("_source_observe")
         if observe is not None:
@@ -2139,10 +2429,11 @@ def _collect_one(
         return SourceResult(name, "error", error=f"http {response.status}", checked_at=now.isoformat(),
                             failure=f"http {response.status}"), used
 
-    if rec.get("discovered"):
-        # M1: a discovered body must match its declared route before parse. A
-        # clearly mismatched type (binary body, or HTML served for a JSON route)
-        # fails closed and is never recorded as healthy.
+    if rec.get("discovered") or kind == LTA_TRAIN_ALERTS_KIND:
+        # A body must match its declared route before parse. A clearly mismatched
+        # type (binary body, or HTML served for a JSON route) fails closed and is
+        # never recorded as healthy. The credentialed JSON source is always
+        # checked (it is a seed, not a discovered source).
         ctype = normalized_content_type(response.headers)
         if not content_type_allowed(kind, ctype):
             rec["failures"] = int(rec.get("failures", 0)) + 1
@@ -2297,6 +2588,12 @@ def _collect_one(
             "audience": str(row.get("audience") or "")[:300],
             "audience_declared": bool(row.get("audience_declared", False)),
             "personal_qualification": False,
+            # Live transport service status (LTA train alerts): the all-clear
+            # marker and disruption items both carry these bounded flags so a
+            # standing disruption can be resolved downstream.
+            "service_status": str(row.get("service_status") or ""),
+            "live_service_alert": bool(row.get("live_service_alert", False)),
+            "all_clear": bool(row.get("all_clear", False)),
         })
     # Refresh cache.
     rec["cache_items"] = items
@@ -2322,6 +2619,7 @@ def collect_public_feeds(
     reddit_ledger: Any | None = None,
     renderer: Callable[[str], Any] | None = None,
     firecrawl: Any = None,
+    credentialed_fetcher: Callable[..., FetchResponse] | None = None,
 ) -> list[SourceResult]:
     """Collect bounded public feeds. Never raises; failures are labelled.
 
@@ -2399,7 +2697,8 @@ def collect_public_feeds(
             res, used = _collect_one(rec, policy=policy, clock=clock, now=now,
                                      fetcher=fetcher, reddit_budget=reddit_budget,
                                      reddit_ledger=reddit_ledger, renderer=renderer,
-                                     firecrawl=firecrawl)
+                                     firecrawl=firecrawl,
+                                     credentialed_fetcher=credentialed_fetcher)
         except Exception as exc:  # noqa: BLE001 - one bad source never breaks the run
             res = SourceResult(f"feed:{rec.get('id','unknown')}", "error",
                                error=safe_source_error(exc, kind="feed"), checked_at=now.isoformat())
@@ -2526,6 +2825,18 @@ def default_seed_sources() -> list[dict[str, Any]]:
             "url": SMRT_F1_NOTICE_URL,
             "provenance": "public vetted seed (reviewed official SMRT planned notice; not live incident coverage)",
             "interest": "planned transport advisory",
+            "cadence_minutes": 360,
+        },
+        {
+            # Official credentialed LTA DataMall live train-service alerts.
+            # The AccountKey is env-only (LTA_DATAMALL_ACCOUNT_KEY) and header-only;
+            # if absent the source fails closed without any network call. Status 1
+            # is an explicit all-clear marker, Status 2 describes each affected
+            # segment/message -- never a fabricated incident.
+            "kind": LTA_TRAIN_ALERTS_KIND,
+            "url": LTA_TRAIN_ALERTS_URL,
+            "provenance": "public vetted seed (official LTA DataMall TrainServiceAlerts; credentialed via env-only header; live status, not a plan or forecast)",
+            "interest": "singapore train service alerts",
             "cadence_minutes": 360,
         },
     ]

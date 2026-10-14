@@ -30,11 +30,11 @@ class CoverageExtensionTests(unittest.TestCase):
         self.assertEqual(entry["status"], "supported_generic")
         self.assertTrue(set(entry["route"]).issubset(set(C.GENERIC_ROUTES)))
 
-    def test_forecast_and_planned_notice_are_supported_but_live_transport_is_not(self):
+    def test_forecast_planned_notice_and_live_transport_are_supported(self):
         self.assertEqual(C.coverage_status("weather")["status"], "supported_fixed_official")
         self.assertEqual(C.coverage_status("planned_transport")["status"], "supported_planned_only")
-        self.assertEqual(C.coverage_status("live_transport")["status"], "unsupported")
-        self.assertEqual(C.unsupported_categories(), ["live_transport"])
+        self.assertEqual(C.coverage_status("live_transport")["status"], "supported_fixed_official")
+        self.assertEqual(C.unsupported_categories(), [])
 
     def test_unknown_category_is_unsupported(self):
         self.assertEqual(C.coverage_status("teleportation")["status"], "unsupported")
@@ -45,6 +45,7 @@ class CoverageExtensionTests(unittest.TestCase):
         self.assertTrue(C.is_supported_kind("rss_atom"))
         self.assertTrue(C.is_supported_kind("nea_forecast"))
         self.assertTrue(C.is_supported_kind("smrt_notice"))
+        self.assertTrue(C.is_supported_kind("lta_train_alerts"))
         self.assertFalse(C.is_supported_kind("weather_api"))
         self.assertFalse(C.is_supported_kind("live_transport"))
 

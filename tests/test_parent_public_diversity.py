@@ -285,18 +285,22 @@ def test_vetted_hosts_and_ssrf_unchanged():
     raise AssertionError("unsafe redirect was not rejected")
 
 
-def test_only_reviewed_weather_and_planned_transport_sources_claimed():
+def test_only_reviewed_weather_planned_and_live_transport_sources_claimed():
     seeds = default_seed_sources()
     kinds = {s["kind"] for s in seeds}
     assert kinds == {"github_releases", "reddit_rss", "ntu_json", "cna_rss",
-                     "nea_forecast", "smrt_notice"}, kinds
+                     "nea_forecast", "smrt_notice", "lta_train_alerts"}, kinds
     blob = " ".join(f"{s['kind']} {s['url']} {s['interest']}" for s in seeds).lower()
-    for forbidden in ("pm25", "psi", "lta", "opportunity feed", "internship feed"):
+    for forbidden in ("pm25", "psi", "opportunity feed", "internship feed"):
         assert forbidden not in blob, forbidden
     by_kind = {s["kind"]: s for s in seeds}
     assert by_kind["nea_forecast"]["url"] == "https://api-open.data.gov.sg/v2/real-time/api/twenty-four-hr-forecast"
     assert "not an active warning" in by_kind["nea_forecast"]["provenance"]
     assert "not live incident coverage" in by_kind["smrt_notice"]["provenance"]
+    # The one live transport source is the official credentialed LTA endpoint
+    # (env-only header key), never a keyless SMRT page.
+    assert by_kind["lta_train_alerts"]["url"] == "https://datamall2.mytransport.sg/ltaodataservice/TrainServiceAlerts"
+    assert "LTA_DATAMALL_ACCOUNT_KEY" in by_kind["lta_train_alerts"]["provenance"] or "credentialed" in by_kind["lta_train_alerts"]["provenance"]
     assert "scholarship" not in blob
 
 

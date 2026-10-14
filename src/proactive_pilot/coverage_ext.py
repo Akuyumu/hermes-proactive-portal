@@ -29,6 +29,7 @@ GENERIC_ROUTES: tuple[str, ...] = ("rss", "web_json", "web_page")
 WIRED_KINDS: tuple[str, ...] = (
     "github_releases", "github_search", "ntu_json", "web_json", "web_page",
     "rss_atom", "nea_forecast", "smrt_notice", "ntu_opportunity",
+    "lta_train_alerts",
 )
 
 ACQUISITION_COVERAGE: dict[str, dict[str, Any]] = {
@@ -67,10 +68,18 @@ ACQUISITION_COVERAGE: dict[str, dict[str, Any]] = {
         "note": "dated planned notice only; not live incident status, an all-clear, or route-specific advice",
     },
     "live_transport": {
-        "status": "unsupported",
-        "route": [],
-        "integration_point": "requires a vetted official live transit/advisory endpoint; none wired",
-        "note": "SMRT planned notices do not prove live incidents or all-clear; no validated keyless live feed",
+        # Official credentialed LTA DataMall TrainServiceAlerts, wired over a
+        # fixed EXACT host+path with an env-only request-header key. Status 1 is
+        # an explicit all-clear marker; Status 2 describes each affected segment/
+        # message. It is bounded and fails closed on a missing key, redirects,
+        # host/path/scheme/port mismatch, non-JSON bodies or malformed shapes.
+        "status": "supported_fixed_official",
+        "acquisition": "wired_credentialed",
+        "verified_active": False,
+        "route": ["lta_train_alerts", "fetch_lta_train_alerts (credentialed, header-only key)", "PinnedHTTPSTransport (ordinary feeds unchanged)"],
+        "wired_kinds": ["lta_train_alerts"],
+        "integration_point": "publicfeeds.default_seed_sources -> collect_public_feeds -> fetch_lta_train_alerts -> parse_lta_train_alerts -> packet/evaluator",
+        "note": "requires env var LTA_DATAMALL_ACCOUNT_KEY; fails closed without a network call when absent; not a forecast or planned notice",
     },
 }
 
