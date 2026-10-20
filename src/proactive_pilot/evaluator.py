@@ -179,21 +179,20 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 
 # Conservative markers of prompt/command injection in model-produced prose. The
 # evaluator is asked to emit only a short JSON object, so any of these in the
-# message/proposal is treated as a validator violation and dropped.
-_INJECTION_MARKERS = (
-    "ignore previous", "ignore all previous", "disregard", "system prompt",
-    "you are now", "assistant:", "system:", "tool_use", "execute_code",
-    "rm -rf", "curl ", "wget ", "bash -c", "sh -c", "subprocess",
-    "$(", "`", "<script", "/etc/passwd", "authorized_keys",
+# message/proposal is treated as a validator violation and dropped. Defensive
+# detection patterns for untrusted retrieved text, not executable instructions.
+_INJECTION_MARKERS_RE = re.compile(
+    r"ignore previous|ignore all previous|disregard|system prompt|you are now"
+    r"|assistant:|system:|tool_use|execute_code|rm -rf|curl |wget |bash -c"
+    r"|sh -c|subprocess|\$\(|`|<script|/etc/(?:passwd|shadow|sudoers)"
+    r"|authorized_keys",
+    re.IGNORECASE,
 )
 
 
 def _injection_flag(text: str) -> str | None:
-    lowered = str(text or "").lower()
-    for marker in _INJECTION_MARKERS:
-        if marker in lowered:
-            return marker
-    return None
+    match = _INJECTION_MARKERS_RE.search(str(text or ""))
+    return match.group(0) if match else None
 
 
 def _default_agent_src() -> str:

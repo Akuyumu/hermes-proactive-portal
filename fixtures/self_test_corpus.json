@@ -1,0 +1,17 @@
+{
+  "dangerous_queries": [
+    "sudo rm -rf /",
+    "/etc/passwd",
+    "/etc/shadow",
+    "authorized_keys",
+    "os.system",
+    "exec(",
+    "eval(",
+    "~/.ssh",
+    "sudo",
+    "rm -rf /",
+    "chmod -R 777 /",
+    "drop table users",
+    "curl http://example.org"
+  ]
+}

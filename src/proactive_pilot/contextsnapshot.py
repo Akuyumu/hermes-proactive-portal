@@ -109,12 +109,14 @@ _REASON_EXPIRED = "all context entries have expired"
 _ID_RE = re.compile(r"^cs_[0-9a-f]{12}$")
 
 # Prompt/command injection markers: an assistant-mediated entry is data, so an
-# entry that tries to look like an instruction is refused outright.
-_INJECTION_MARKERS = (
-    "ignore previous", "ignore all previous", "disregard", "system prompt",
-    "you are now", "assistant:", "system:", "tool_use", "execute_code",
-    "rm -rf", "curl ", "wget ", "bash -c", "sh -c", "subprocess",
-    "$(", "`", "<script", "/etc/passwd", "authorized_keys",
+# entry that tries to look like an instruction is refused outright. Defensive
+# detection patterns for untrusted retrieved text, not executable instructions.
+_INJECTION_MARKERS_RE = re.compile(
+    r"ignore previous|ignore all previous|disregard|system prompt|you are now"
+    r"|assistant:|system:|tool_use|execute_code|rm -rf|curl |wget |bash -c"
+    r"|sh -c|subprocess|\$\(|`|<script|/etc/(?:passwd|shadow|sudoers)"
+    r"|authorized_keys",
+    re.IGNORECASE,
 )
 
 # Credential/secret-shaped content is never a legitimate delivery-cache entry.
@@ -191,8 +193,7 @@ def _parse_timestamp(value: Any, exc_type: type[Exception]) -> datetime:
 
 
 def _content_denied(text: str) -> bool:
-    lowered = text.lower()
-    if any(marker in lowered for marker in _INJECTION_MARKERS):
+    if _INJECTION_MARKERS_RE.search(text):
         return True
     return bool(_SECRET_RE.search(text))
 

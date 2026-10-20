@@ -43,12 +43,12 @@ DEFAULT_QUERY_MAX_CHARS = 120
 _ACCEPTABLE_SCOPES = {"reddit", "github", "public"}
 
 # Code/command/credential markers that must never appear in a public query.
-_UNSAFE_CODE = (
-    "sudo", "chmod", "chown", "curl", "wget", "ssh ", "scp ", "rm -rf",
-    "subprocess", "exec(", "eval(", "os.system", "api_key", "apikey",
-    "private key", "authorized_keys", "/etc/", "~/.ssh", "drop table",
-    "powershell", "/bin/", "#!/",
-)
+_UNSAFE_CODE_RE = re.compile(
+    r"\bsudo\b|chmod|chown|curl|wget|\bssh\b|scp|\brm\s+-rf\b"
+    r"|subprocess|\b(?:exec|eval)\s*\(|os\.system|api_key|apikey"
+    r"|private key|authorized_keys|/etc/|(?:~|\$HOME)[/\\]\.ssh|drop table"
+    r"|powershell|/bin/|#!",
+    re.IGNORECASE)
 _SHELL_META_RE = re.compile(r"[`;&|$(){}<>\\\n\r]")
 _LONGNUM_RE = re.compile(r"\d{5,}")
 
@@ -112,7 +112,7 @@ def validate_query(query: Any, *, max_chars: int = DEFAULT_QUERY_MAX_CHARS) -> s
     lowered = text.lower()
     if any(marker in lowered for marker in _SENSITIVE_MARKERS):
         raise PlannerError("query contains sensitive-looking data")
-    if any(marker in lowered for marker in _UNSAFE_CODE):
+    if _UNSAFE_CODE_RE.search(text):
         raise PlannerError("query contains a code/command marker")
     if _EMAIL_RE.search(text) or _URL_RE.search(text) or _HOST_RE.search(text):
         raise PlannerError("query contains an email/url/host")

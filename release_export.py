@@ -33,7 +33,7 @@ from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parent
 VERSION = "0.5.0"
-SHIPPED_DIRS = ("src", "policy", "skills", "runners", "public_samples")
+SHIPPED_DIRS = ("src", "policy", "skills", "runners", "public_samples", "fixtures")
 ROOT_SUFFIXES = (".py", ".md", ".json", ".yaml", ".yml", ".html", ".txt")
 # Extensionless root files that are part of the redistribution contract. The
 # README links LICENSE, so omitting it would ship a broken/incomplete package.

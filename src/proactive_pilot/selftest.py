@@ -31,6 +31,23 @@ def _packet(name: str, clock, policy):
     return results, build_packet(results, clock=clock, policy=policy, baseline={})
 
 
+def _adversarial_corpus_path() -> Path:
+    """Locate the shipped adversarial-query corpus from the plugin root."""
+    return Path(__file__).resolve().parents[2] / "fixtures" / "self_test_corpus.json"
+
+
+def _load_adversarial_corpus() -> list[str] | None:
+    """Load the fixture data; ``None`` means the corpus is missing/malformed."""
+    try:
+        payload = json.loads(_adversarial_corpus_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    queries = payload.get("dangerous_queries") if isinstance(payload, dict) else None
+    if not isinstance(queries, list) or not all(isinstance(q, str) for q in queries):
+        return None
+    return queries
+
+
 def run_self_test() -> int:
     outcomes: list[_Result] = []
     policy = json.loads(json.dumps(DEFAULT_POLICY))
@@ -274,8 +291,18 @@ def run_self_test() -> int:
         rejected = True
     outcomes.append(_Result("watch_validation_rejects_pii", rejected))
 
-    for bad in ({"queries": ["a@b.com"]}, {"queries": ["x"] * 3},
-                {"queries": ["sudo rm -rf /"]}):
+    corpus = _load_adversarial_corpus()
+    if corpus is None:
+        outcomes.append(_Result(
+            "adversarial_corpus_present", False,
+            f"missing or invalid {_adversarial_corpus_path()}"))
+        bad_plans = [{"queries": ["a@b.com"]}, {"queries": ["x"] * 3}]
+    else:
+        outcomes.append(_Result("adversarial_corpus_present", True,
+                                f"{len(corpus)} queries"))
+        bad_plans = ([{"queries": ["a@b.com"]}, {"queries": ["x"] * 3}]
+                     + [{"queries": [query]} for query in corpus])
+    for bad in bad_plans:
         try:
             _validate_plan(bad, policy)
         except _planner.PlannerError:
