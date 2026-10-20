@@ -26,6 +26,36 @@ It is **read-only over the user's sources** and makes no calendar/mail/task
 writes, no purchases, and no bookings. The evaluator runs with a resolved
 zero-tool toolset, so it can only judge the supplied evidence packet.
 
+## Onboarding and model routes (0.5.0 seam)
+
+- Start or resume with `/secretary setup`; `/secretary status` inspects and
+  `/secretary cancel` cancels while retaining progress.
+- Use the `secretary_onboarding` tool for every state change and exact readback.
+  Foreground memory may be *proposed*; it is never source consent. Ask only
+  missing/conflicting/stale facts and genuine permissions. Never ask for
+  credentials in chat.
+- The native plugin form also has primary/fallback provider+model fields. Pairs
+  are both-or-none; assigned primary -> assigned fallback -> stop. A native
+  `auxiliary.proactive_secretary` pin is owner configuration and always wins; the
+  plugin never rewrites it.
+- If `secretary_onboarding inspect` reports
+  `configured_model_calls_allowed: false`, model-dependent secretary work is
+  unsupported on this host. Do not claim a working fallback ladder; deterministic
+  controls and requested reminders still work.
+- A destination is recorded as `user_confirmed` at most, never live-verified.
+  Confirmation leaves setup at `pending_verification`; do not claim jobs are
+  armed or delivery works. A canary needs the user's explicit go and normal host
+  tools.
+- Private preparation is opt-in and off by default. `preparation_scopes` uses
+  exactly conversation/public/mail/calendar/tasks/documents/memory; public
+  consent never grants a private scope. Enabling it arms no job. On a host
+  without the explicit configured-only contract, `hermes secretary prepare`
+  fails closed before any model call; report that limit and do not claim an
+  artifact was prepared.
+- Never describe the model-outage notice as verified on this host: the generic
+  pipeline has no truthful primary/fallback attempt metadata, so no outage
+  outcome is fabricated. Requested reminders remain deterministic.
+
 ## When to use this skill
 
 Load it when the user wants to:
@@ -211,7 +241,7 @@ hermes secretary feedback pause --provenance "user asked"
 hermes secretary feedback resume --provenance "user asked"
 hermes secretary feedback list
 hermes secretary feedback show --id <exact existing id>     # typed read-back
-hermes secretary feedback forget --id <exact existing id>  # revoke
+hermes secretary feedback forget --id <exact existing id>  # erase record (no tombstone)
 hermes secretary feedback noop                             # thanks/silence: writes nothing
 ```
 
@@ -224,8 +254,12 @@ Rules:
 - A plain "thanks", acknowledgement or silence is a **no-op** (`noop`, or simply
   say nothing): it is never recorded as a preference.
 - Read back the exact affected preference after a write before claiming saved.
-- Bad input and corrupt artifacts fail closed (non-zero, nothing written); an
-  explicit `forget` records a durable revocation so it cannot be revived.
+- Bad input and corrupt artifacts fail closed (non-zero, nothing written). An
+  explicit `forget` erases that stored preference record (after typed read-back);
+  it does NOT create a topic tombstone. To prevent an inferred topic from being
+  rediscovered, use `inferred-revoke`, `watch-forget`, or `context-revoke`, which
+  are the durable revocation paths. A user may explicitly re-add a forgotten
+  preference later; that is not a revival of hidden state.
 
 ## Assistant-mediated context snapshot
 

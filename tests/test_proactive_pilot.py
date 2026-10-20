@@ -32,6 +32,7 @@ from proactive_pilot.state import StateStore  # noqa: E402
 
 def _policy():
     p = json.loads(json.dumps(DEFAULT_POLICY))
+    p["timezone"] = "Asia/Singapore"
     p["_preferences"] = {"explicit": [], "inferred": [], "snoozes": []}
     return p
 
@@ -92,7 +93,7 @@ def test_hard_cap():
     results = fixture_results("changed_event", clock)
     packet = build_packet(results, clock=clock, policy=policy, baseline={})
     prop = fixture_evaluator("changed_event").evaluate(packet, policy)
-    state = {"delivered": [{"at": "2026-10-02T09:00:00+08:00", "signature": s, "urgent": False} for s in ("a", "b", "c")]}
+    state = {"delivered": [{"at": "2026-10-02T09:00:00+08:00", "signature": s, "urgent": False} for s in ("a", "b", "c", "d", "e")]}
     dec = decide(prop, packet, clock=clock, policy=policy, prefs=policy["_preferences"], state=state)
     assert not dec["send"] and dec["reason"] == "daily cap"
 

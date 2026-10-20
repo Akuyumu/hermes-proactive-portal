@@ -1,21 +1,17 @@
 """hermes-proactive-secretary plugin entry point.
 
-``register(ctx)`` does the minimum needed to expose the plugin surface and
-nothing else:
-
-- adds ``<plugin_root>/src`` to ``sys.path`` so the bundled ``proactive_pilot``
-  package imports;
-- registers the bundled ``proactive-secretary`` skill;
-- registers the ``hermes secretary`` CLI command.
-
-The heavy ``proactive_pilot`` package is imported lazily by the CLI handlers, so
-loading this plugin never slows down unrelated ``hermes`` startup, and no
-sources, scheduler jobs, or network calls are touched at registration time.
+``register(ctx)`` exposes the plugin surface only. It never reads private
+sources, sends messages, arms jobs or mutates access at registration time.
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+
+
+# Sanitized diagnostics only; never a credential or raw provider output.
+_MODEL_REGISTRATION: dict = {}
+_CONVERSATION_REGISTRATION: dict = {}
 
 
 def _plugin_root() -> Path:
@@ -32,6 +28,15 @@ def _handle_secretary_cli(args):
     return secretary_command(args)
 
 
+def _register_conversation(ctx) -> dict:
+    from .secretary_conversation import register_conversation_surfaces, register_onboarding_tool
+    from .secretary_responsibilities import register_tool as register_responsibility_tool
+    result = register_onboarding_tool(ctx)
+    result.update(register_responsibility_tool(ctx))
+    result.update(register_conversation_surfaces(ctx))
+    return result
+
+
 def register(ctx) -> None:
     """Wire the plugin into Hermes. Called exactly once at load time."""
     root = _plugin_root()
@@ -41,27 +46,43 @@ def register(ctx) -> None:
         if src_str not in sys.path:
             sys.path.insert(0, src_str)
 
-    # Keep the host-built context for the registered handler closure so the
-    # ordinary pipeline can use the supported ctx.llm lane when invoked from
-    # the plugin CLI. This is the context Hermes created and passed in; the
-    # plugin never constructs one.
     from . import secretary_cli as _cli
     _cli.set_native_context(ctx)
 
-    # Own auxiliary slot so the operator can route secretary model calls
-    # (auxiliary.proactive_secretary) independently of the main chat model.
-    register_aux = getattr(ctx, "register_auxiliary_task", None)
-    if callable(register_aux):
+    # Model routing is optional, but it is never silently replaced by an
+    # unguarded/native lane when registration or import fails. The runtime guard
+    # is bound to THIS host context and denies model dispatch until a real
+    # configured-only contract is registered. Deterministic controls and
+    # reminders do not depend on this block.
+    try:
+        from .secretary_models import register_configured_models
+        _MODEL_REGISTRATION.update(register_configured_models(ctx))
+    except Exception as exc:  # noqa: BLE001 - guard, never a permissive fallback
+        _MODEL_REGISTRATION.update({
+            "registered": False, "strict_active": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        })
         try:
-            register_aux("proactive_secretary", display_name="Proactive secretary",
-                         description="Secretary evaluator/planner/intake structured calls.")
-        except Exception:  # noqa: BLE001 - older hosts: fall back to the main model
+            from proactive_pilot.native_runtime import bind_model_lane
+            bind_model_lane(
+                ctx, allowed=False, status=dict(_MODEL_REGISTRATION),
+                reason=f"secretary model registration failed: {type(exc).__name__}")
+        except Exception:  # noqa: BLE001 - runtime import failure also stays closed
             pass
 
     skill = root / "skills" / "proactive-secretary" / "SKILL.md"
     if skill.is_file():
-        ctx.register_skill("proactive-secretary", skill,
-                           description="Proactive secretary setup, operation and limits.")
+        try:
+            ctx.register_skill("proactive-secretary", skill,
+                               description="Proactive secretary setup, operation and limits.")
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        _CONVERSATION_REGISTRATION.update(_register_conversation(ctx))
+    except Exception as exc:  # noqa: BLE001 - deterministic CLI must still load
+        _CONVERSATION_REGISTRATION.update({
+            "error": f"{type(exc).__name__}: {exc}"})
 
     ctx.register_cli_command(
         name="secretary",

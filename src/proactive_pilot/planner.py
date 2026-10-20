@@ -299,7 +299,9 @@ class NativePlanner:
 
         lane = build_model_lane(self.ctx, policy, path="planner",
                                 purpose="secretary.plan")
-        return lane if lane.available else None
+        if lane.available:
+            return lane
+        raise PlannerError(f"configured model lane unavailable: {lane.route.reason}")
 
     def plan(self, watch: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
         cfg = policy.get("evaluator", {}) or {}

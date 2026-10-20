@@ -398,7 +398,9 @@ class NativeIntakeModel:
 
         lane = build_model_lane(self.ctx, policy, path="intake",
                                 purpose="secretary.intake")
-        return lane if lane.available else None
+        if lane.available:
+            return lane
+        raise IntakeError(f"configured model lane unavailable: {lane.route.reason}")
 
     def build_prompt(self, text: str) -> str:
         return INTAKE_SYSTEM + "\n\nREQUEST:\n" + text + "\n\nReturn only the JSON object."

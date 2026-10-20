@@ -1,5 +1,5 @@
 name: hermes-proactive-secretary
-version: 0.4.3
+version: 0.5.0
 kind: standalone
 platforms:
   - linux
@@ -8,8 +8,9 @@ description: >-
   Proactive secretary for your own authorised mail, calendar and tasks plus
   public sources: read-only collectors, a zero-tool evaluator, bounded
   notification gates, an explicit requested-reminder registry, and one-command
-  native-cron setup. One command installs and verifies the two native jobs; one
-  command truthfully disables them.
+  native-cron setup. One command installs and verifies the two default native jobs; an
+  explicit opt-in adds one preparation script job; one command truthfully
+  disables only owned jobs.
 author: Hermes Plugin Community
 license: MIT
 tags:
@@ -22,3 +23,171 @@ provides_skills:
   - proactive-secretary
 provides_cli_commands:
   - secretary
+
+# Ordinary native Desktop controls (Settings -> Plugins). Hermes reads this as a
+# mapping of setting key -> field spec and writes edits under
+# plugins.entries.hermes-proactive-secretary.settings.<key>, exactly where
+# ctx.get_config reads them. These controls are projected from / merged into the
+# same validated per-user configuration owner as configure/CLI and the scheduled
+# runners. Complex source consent/account setup stays in the conversational/CLI
+# flow rather than an opaque JSON editor.
+config_schema:
+  timezone:
+    type: str
+    title: Timezone
+    description: IANA timezone used for quiet hours and the local-day allowance.
+    default: UTC
+  destination:
+    type: str
+    title: Delivery target
+    description: Local or a configured chat target. Leave empty for local recording.
+    default: ""
+  daily_normal_cap:
+    type: int
+    title: Daily discretionary message ceiling
+    description: Any nonnegative integer. Zero suppresses ordinary discretionary messages only.
+    default: 5
+    minimum: 0
+  quiet_start_hour:
+    type: int
+    title: Quiet hours start (local hour)
+    description: Inclusive local hour when ordinary messages are deferred (0-23).
+    default: 0
+    minimum: 0
+    maximum: 23
+  quiet_end_hour:
+    type: int
+    title: Quiet hours end (local hour)
+    description: Exclusive local hour when ordinary messages may resume (0-23).
+    default: 8
+    minimum: 0
+    maximum: 23
+  cooldown_minutes:
+    type: int
+    title: Minimum spacing between messages (minutes)
+    default: 30
+    minimum: 0
+    maximum: 1440
+  public_feeds:
+    type: bool
+    title: Enable public feeds
+    description: >-
+      Enables explicitly configured public feeds. Requires at least one entry in
+      "Public source definitions"; enabling this alone yields no coverage.
+    default: false
+  obligations:
+    type: bool
+    title: Mail obligations
+    description: Read configured mail accounts for due payments/orders.
+    default: false
+  mail_enabled:
+    type: bool
+    title: Mail monitoring
+    default: false
+  calendar_enabled:
+    type: bool
+    title: Calendar monitoring
+    default: false
+  tasks_enabled:
+    type: bool
+    title: Task monitoring
+    default: false
+  public_interests:
+    type: array
+    title: Public interests
+    description: Explicit interests for public discovery; empty means none.
+    default: []
+  public_sources:
+    type: array
+    title: Public source definitions
+    description: >-
+      Explicit source objects. An empty list clears inherited seeds. Pair with
+      "Enable public feeds"; both are required for any public coverage.
+    default: []
+  discovery_mode:
+    type: str
+    title: Discovery mode
+    description: Adaptive discovery remains disabled unless explicitly selected.
+    choices:
+      - disabled
+      - shadow
+      - active
+    default: disabled
+  discovery_privacy_review:
+    type: bool
+    title: Semantic privacy review for discovery
+    default: false
+  discovery_inferred_goals:
+    type: bool
+    title: Allow inferred public goals
+    default: false
+  collector_budget_seconds:
+    type: int
+    title: Collection time budget (seconds)
+    description: Bounded per-run wall-clock allowance for source collection.
+    default: 60
+    minimum: 5
+    maximum: 600
+  max_candidates_per_kind:
+    type: int
+    title: Maximum candidates per kind
+    description: Bounded packet size per source kind.
+    default: 60
+    minimum: 1
+    maximum: 500
+  feed_max_sources_per_run:
+    type: int
+    title: Public feeds per run
+    description: Bounded public-feed reads per scheduled run.
+    default: 2
+    minimum: 0
+    maximum: 20
+  preparation_enabled:
+    type: bool
+    title: Private preparation
+    description: >-
+      Opt-in bounded private drafts for explicitly accepted responsibilities.
+      Off by default. Enabling never creates a scheduled job or grants a source
+      scope; model work also requires a host with explicit configured-only routing.
+    default: false
+  preparation_scopes:
+    type: array
+    title: Approved preparation scopes
+    description: >-
+      Explicit standing scopes for private preparation: conversation, public,
+      mail, calendar, tasks, documents, memory. Broad public consent does not
+      imply private scopes.
+    default: []
+  preparation_source_consent:
+    type: bool
+    title: Allow reading already-authorised cached source facts
+    description: >-
+      Off by default. When enabled together with preparation scopes, preparation
+      may read only fresh bounded facts already cached from sources you enabled.
+      It never opens a new connector/account or performs a fresh fetch.
+    default: false
+  primary_provider:
+    type: str
+    title: Secretary primary provider
+    description: >-
+      Provider id for the secretary's own auxiliary task (set provider AND model,
+      or leave both empty). Leave both empty to inherit the active chat model
+      initially. Explicit native auxiliary pins win and are never modified.
+    default: ""
+  primary_model:
+    type: str
+    title: Secretary primary model
+    description: Model id paired with the primary provider (both or neither).
+    default: ""
+  fallback_provider:
+    type: str
+    title: Secretary fallback provider
+    description: >-
+      Optional single configured fallback (set provider AND model, or neither).
+      No main/global/discovery escalation is allowed after this route fails.
+    default: ""
+  fallback_model:
+    type: str
+    title: Secretary fallback model
+    description: Model id paired with the fallback provider (both or neither).
+    default: ""

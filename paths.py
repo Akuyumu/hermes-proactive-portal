@@ -1,21 +1,32 @@
 """Profile-safe path resolution for the hermes-proactive-secretary plugin.
 
 Nothing here hardcodes a personal absolute path. Every location is derived from
-an environment override or the active Hermes home:
+the active profile resolved by :mod:`proactive_pilot.ownerpaths`:
 
-- ``HERMES_HOME`` selects the active profile home (falling back to
-  ``~/.hermes``).
+- The native host's active profile scope selects the home, so a routed context
+  uses its own profile.
+- ``HERMES_HOME`` is the standalone fallback only when the host profile module
+  is genuinely not installed (then falling back to ``~/.hermes``).
 - ``HERMES_PROACTIVE_SECRETARY_DATA`` overrides the owner-only runtime data
-  root (state, policy copy, preferences) so tests and the parent installer can
-  keep everything inside a scratch directory.
+  root (state, policy copy, preferences) for the process's own launch profile
+  and standalone use. A routed foreign profile never inherits the launch
+  profile's data override.
 """
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
-PLUGIN_NAME = "hermes-proactive-secretary"
-DATA_ENV = "HERMES_PROACTIVE_SECRETARY_DATA"
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+if _SRC_DIR.is_dir() and str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from proactive_pilot import ownerpaths as _owner  # noqa: E402
+
+PLUGIN_NAME = _owner.PLUGIN_NAME
+DATA_ENV = _owner.DATA_ENV
+ProfileResolutionError = _owner.ProfileResolutionError
 
 
 def plugin_root() -> Path:
@@ -24,19 +35,13 @@ def plugin_root() -> Path:
 
 
 def hermes_home() -> Path:
-    """Active Hermes home: ``$HERMES_HOME`` or ``~/.hermes``."""
-    override = os.environ.get("HERMES_HOME")
-    if override:
-        return Path(override)
-    return Path.home() / ".hermes"
+    """Active Hermes home from the host's context-local profile scope."""
+    return _owner.hermes_home()
 
 
 def data_root() -> Path:
     """Owner-only runtime data root (survives plugin update/remove)."""
-    override = os.environ.get(DATA_ENV)
-    if override:
-        return Path(override)
-    return hermes_home() / "plugin-data" / PLUGIN_NAME
+    return _owner.data_root()
 
 
 def state_dir() -> Path:
@@ -71,7 +76,7 @@ def user_config_path() -> Path:
 
 
 def scripts_dir() -> Path:
-    """The native scheduler's script directory: ``$HERMES_HOME/scripts``."""
+    """The native scheduler's script directory in the active profile home."""
     return hermes_home() / "scripts"
 
 

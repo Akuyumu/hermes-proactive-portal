@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from proactive_pilot import main as M  # noqa: E402
+from proactive_pilot import native_runtime as nr  # noqa: E402
 from proactive_pilot import contextsnapshot as CS  # noqa: E402
 from proactive_pilot.clock import SeededClock  # noqa: E402
 from proactive_pilot.collectors import Budget, SourceResult  # noqa: E402
@@ -112,6 +113,7 @@ class _RoutingLlm:
 class _HostCtx:
     def __init__(self, llm):
         self.llm = llm
+        nr.bind_model_lane(self, allowed=True, reason="test host lane")
 
     def get_config(self, key, default=None):
         return default

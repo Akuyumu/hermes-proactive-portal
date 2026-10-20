@@ -20,18 +20,21 @@ exists. This module never imports the pipeline and never reads runtime state.
 from __future__ import annotations
 
 import json
-import os
+import sys
 from pathlib import Path
 from typing import Any
+
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+if _SRC_DIR.is_dir() and str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from proactive_pilot import ownerpaths as _ownerpaths  # noqa: E402
 
 PLUGIN_ID = "hermes-proactive-secretary"
 
 
 def _hermes_home() -> Path:
-    override = os.environ.get("HERMES_HOME")
-    if override:
-        return Path(override)
-    return Path.home() / ".hermes"
+    return _ownerpaths.hermes_home()
 
 
 def _read_yaml(path: Path) -> Any:
@@ -112,7 +115,10 @@ def plugin_enabled(
     if not root.is_dir():
         return False
     if config is None:
-        config = load_plugin_config(hermes_home)
+        try:
+            config = load_plugin_config(hermes_home)
+        except _ownerpaths.ProfileResolutionError:
+            return False
     if not isinstance(config, dict):
         return False
     plugins = config.get("plugins")

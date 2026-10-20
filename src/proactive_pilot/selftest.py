@@ -34,6 +34,10 @@ def _packet(name: str, clock, policy):
 def run_self_test() -> int:
     outcomes: list[_Result] = []
     policy = json.loads(json.dumps(DEFAULT_POLICY))
+    # Deterministic self-test fixtures use +08 wall-clock strings. Pin their
+    # interpretation explicitly so the neutral UTC runtime default never shifts
+    # these offline assertions.
+    policy["timezone"] = "Asia/Singapore"
     policy["_preferences"] = {"explicit": [], "inferred": []}
 
     # 1. healthy empty -> evaluator silence -> no send
@@ -86,15 +90,14 @@ def run_self_test() -> int:
     from .gates import _expired
     outcomes.append(_Result("expiry_helper", _expired({"expiry": "2026-10-01T00:00:00+08:00"}, day) is True, ""))
 
-    # 8. hard cap: 3 normal deliveries then 4th suppressed
-    state = {"delivered": [{"at": "2026-10-02T09:00:00+08:00", "signature": "a", "urgent": False},
-                           {"at": "2026-10-02T10:00:00+08:00", "signature": "b", "urgent": False},
-                           {"at": "2026-10-02T11:00:00+08:00", "signature": "c", "urgent": False}]}
+    # 8. hard cap: five (default ceiling) normal deliveries then sixth suppressed
+    state = {"delivered": [{"at": f"2026-10-02T{9 + i:02d}:00:00+08:00", "signature": s, "urgent": False}
+                           for i, s in enumerate(("a", "b", "c", "d", "e"))]}
     prop = fixture_evaluator("changed_event").evaluate(packet, policy)
     # avoid cooldown interference
     state.pop("last_delivery_at", None)
     dec_cap = decide(prop, packet, clock=day, policy=policy, prefs=policy["_preferences"], state=state)
-    outcomes.append(_Result("hard_cap_suppresses_4th", not dec_cap["send"] and dec_cap["reason"] == "daily cap", dec_cap["reason"]))
+    outcomes.append(_Result("hard_cap_suppresses_6th", not dec_cap["send"] and dec_cap["reason"] == "daily cap", dec_cap["reason"]))
 
     # 9. changed event passes validation and would send
     _, packet = _packet("changed_event", day, policy)

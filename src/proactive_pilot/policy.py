@@ -7,10 +7,12 @@ lock, and explicit preference suppression the user asked for.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .clock import DEFAULT_TIMEZONE, SG
 from .state import parse_iso
 
 try:  # preferences schema lives with the feedback module
@@ -20,10 +22,12 @@ except Exception:  # pragma: no cover - defensive; only used with strict load
     load_preferences_file = None  # type: ignore
 
 DEFAULT_POLICY: dict[str, Any] = {
-    "timezone": "Asia/Singapore",
+    "timezone": "UTC",
     "quiet_start_hour": 0,
     "quiet_end_hour": 8,
-    "daily_normal_cap": 3,
+    # A ceiling, never a target. Zero suppresses ordinary discretionary
+    # interruptions only; requested reminders and urgent evidence remain.
+    "daily_normal_cap": 5,
     "cooldown_minutes": 30,
     "urgent_max_minutes": 60,
     "calendar_horizon_hours": 48,
@@ -182,6 +186,12 @@ DEFAULT_POLICY: dict[str, Any] = {
     # -- trusted conversational intake (explicit requests only) ----------------
     "intake_max_turns": 2,
     "intake_timeout_seconds": 60,
+    # -- bounded private preparation (opt-in; neutral default OFF) ------------
+    # Disabled until the user explicitly enables it and approves the small
+    # per-responsibility scope vocabulary. Enabling never creates a cron job.
+    "preparation_enabled": False,
+    "preparation_scopes": [],
+    "preparation_source_consent": False,
     # -- local-only phone context (STAGE-ONLY, opt-in) ------------------------
     # Disabled by default. When enabled, the phone is consulted ONLY around an
     # upcoming meaningful in-person calendar event, on the fixed local origin,
@@ -286,10 +296,51 @@ def load_preferences(path: Path | None, *, strict: bool = False) -> dict[str, An
     return prefs
 
 
+def policy_zone(policy: dict[str, Any]) -> ZoneInfo:
+    """Return the configured zone; invalid values use neutral UTC.
+
+    The generic plugin never assumes a regional location. A malformed legacy
+    value therefore falls back to UTC (not Asia/Singapore) while the validated
+    user configuration path still rejects invalid IANA names explicitly.
+    """
+    name = policy.get("timezone") or DEFAULT_TIMEZONE
+    try:
+        return ZoneInfo(str(name))
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
+
+
+def localize(now: datetime, policy: dict[str, Any]) -> datetime:
+    """Convert an aware instant to the configured local timezone.
+
+    A naive instant is treated as already-local (fixtures and legacy state).
+    This is the single conversion used by quiet hours, local-day caps and the
+    runtime clock contract.
+    """
+    if now.tzinfo is None:
+        return now.replace(tzinfo=policy_zone(policy))
+    return now.astimezone(policy_zone(policy))
+
+
+def local_day(now: datetime, policy: dict[str, Any]) -> str:
+    return localize(now, policy).date().isoformat()
+
+
+def stored_local_day(value: Any, policy: dict[str, Any], now: datetime) -> str:
+    """Local day of a stored ISO timestamp, normalising naive legacy values."""
+    try:
+        parsed = parse_iso(str(value), now)
+    except (ValueError, TypeError):
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=now.tzinfo or timezone.utc)
+    return local_day(parsed, policy)
+
+
 def in_quiet_hours(policy: dict[str, Any], now: datetime) -> bool:
     start = int(policy.get("quiet_start_hour", 0))
     end = int(policy.get("quiet_end_hour", 8))
-    hour = now.hour
+    hour = localize(now, policy).hour
     if start == end:
         return False
     if start < end:

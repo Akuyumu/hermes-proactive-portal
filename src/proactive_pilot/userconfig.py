@@ -33,10 +33,12 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CONFIG_SCHEMA = 1
 CONFIG_VERSION = 1
 DEFAULT_TIMEZONE = "UTC"
+DEFAULT_DAILY_NORMAL_CAP = 5
 NATIVE_PLUGIN_ID = "hermes-proactive-secretary"
 NATIVE_SETTINGS_KEY = "user_config"
 
@@ -75,8 +77,14 @@ _SAFE_MCP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SECTIONS = (
     "schema", "version", "timezone", "notification", "sources", "mail",
     "calendar", "tasks", "public_interests", "public_sources", "adaptive",
-    "bounds", "adapters", "retrieval", "health", "advanced",
+    "bounds", "adapters", "retrieval", "health", "preparation", "advanced",
 )
+
+# Small documented standing-approval vocabulary for private preparation. Broad
+# "public" consent never implies mail/calendar/tasks/documents/memory.
+PREPARATION_SCOPES = frozenset({
+    "conversation", "public", "mail", "calendar", "tasks", "documents", "memory",
+})
 
 # Health critical sources are named source ids like ``mail:formal`` or
 # ``calendar:primary``. They are names only, never a credential.
@@ -95,7 +103,7 @@ def default_config() -> dict[str, Any]:
             "destination": "",
             "quiet_start_hour": 0,
             "quiet_end_hour": 8,
-            "daily_normal_cap": 3,
+            "daily_normal_cap": DEFAULT_DAILY_NORMAL_CAP,
             "cooldown_minutes": 30,
         },
         "sources": {
@@ -110,6 +118,9 @@ def default_config() -> dict[str, Any]:
         "tasks": {"accounts": [], "lists": [], "adapter": ""},
         "public_interests": [],
         "public_sources": [],
+        # Internal marker: neutral generic defaults deliberately suppress any
+        # inherited seed feeds. Never persisted (leading underscore).
+        "_explicit_public_sources": True,
         "adaptive": {
             "mode": "disabled",
             "privacy_review": False,
@@ -118,6 +129,9 @@ def default_config() -> dict[str, Any]:
         # Per-source health: NEUTRAL by default. No source is critical until the
         # user explicitly names it here; mail/calendar are never implicit.
         "health": {"critical_sources": []},
+        # Private preparation is opt-in and OFF by default. Enabling it does
+        # not arm a job or grant any source scope.
+        "preparation": {"enabled": False, "scopes": [], "source_consent": False},
         "bounds": {
             "collector_budget_seconds": 60,
             "max_candidates_per_kind": 60,
@@ -201,6 +215,15 @@ def _bounded_int(raw: Any, name: str, low: int, high: int, default: int) -> int:
     return raw
 
 
+def _nonnegative_int(raw: Any, name: str, default: int) -> int:
+    """Any nonnegative integer. There is no product ceiling/target of five."""
+    if raw is None:
+        return default
+    if not _is_int(raw) or raw < 0:
+        raise ConfigError(f"{name} must be a nonnegative integer")
+    return raw
+
+
 def _bounded_bool(raw: Any, name: str, default: bool) -> bool:
     if raw is None:
         return default
@@ -250,7 +273,7 @@ def validate_config(raw: Any) -> dict[str, Any]:
     config = default_config()
     warnings: list[str] = []
     for key in raw:
-        if key not in _SECTIONS:
+        if key not in _SECTIONS and not str(key).startswith("_"):
             warnings.append(f"ignoring unknown config key {key!r}")
 
     timezone = raw.get("timezone")
@@ -260,6 +283,13 @@ def validate_config(raw: Any) -> dict[str, Any]:
                 f"timezone {timezone!r} is not a valid IANA timezone name",
                 remedy="use e.g. \"UTC\" or \"Europe/London\", or omit it for the neutral default",
             )
+        try:
+            ZoneInfo(timezone.strip())
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ConfigError(
+                f"timezone {timezone!r} is not a known IANA timezone",
+                remedy="use e.g. \"UTC\" or \"Europe/London\"",
+            ) from exc
         config["timezone"] = timezone.strip()
 
     notif = _require_mapping(raw.get("notification") or {}, "notification")
@@ -290,8 +320,8 @@ def validate_config(raw: Any) -> dict[str, Any]:
     base_notif["quiet_end_hour"] = _bounded_int(
         notif.get("quiet_end_hour"), "notification.quiet_end_hour", 0, 23,
         base_notif["quiet_end_hour"])
-    base_notif["daily_normal_cap"] = _bounded_int(
-        notif.get("daily_normal_cap"), "notification.daily_normal_cap", 0, 50,
+    base_notif["daily_normal_cap"] = _nonnegative_int(
+        notif.get("daily_normal_cap"), "notification.daily_normal_cap",
         base_notif["daily_normal_cap"])
     base_notif["cooldown_minutes"] = _bounded_int(
         notif.get("cooldown_minutes"), "notification.cooldown_minutes", 0, 1440,
@@ -341,6 +371,13 @@ def validate_config(raw: Any) -> dict[str, Any]:
     config["public_interests"] = _validate_str_list(
         raw.get("public_interests"), "public_interests", _SAFE_LABEL)
     config["public_sources"] = _validate_public_sources(raw.get("public_sources"))
+    # An explicit empty list is authoritative and must clear inherited seed
+    # feeds. An omitted list is also neutral for the typed configuration layer
+    # unless a reported legacy passthrough explicitly retained seeds.
+    legacy = (raw.get("advanced") or {}).get("legacy_policy") if isinstance(raw.get("advanced"), dict) else None
+    config["_explicit_public_sources"] = bool(
+        "public_sources" in raw
+        or not (isinstance(legacy, dict) and "feed_seed_sources" in legacy))
 
     adaptive = _require_mapping(raw.get("adaptive") or {}, "adaptive")
     mode = adaptive.get("mode", "disabled")
@@ -410,6 +447,23 @@ def validate_config(raw: Any) -> dict[str, Any]:
             "retrieval.firecrawl_enabled is on without retrieval.firecrawl_consent; "
             "the route stays unavailable until explicit consent is set")
 
+    preparation = _require_mapping(raw.get("preparation") or {}, "preparation")
+    config["preparation"]["enabled"] = _bounded_bool(
+        preparation.get("enabled"), "preparation.enabled", False)
+    scopes = preparation.get("scopes", [])
+    if scopes is None:
+        scopes = []
+    if not isinstance(scopes, list) or any(
+            not isinstance(item, str) or item.strip().lower() not in PREPARATION_SCOPES
+            for item in scopes):
+        raise ConfigError(
+            "preparation.scopes must list supported scope kinds",
+            remedy="use conversation/public/mail/calendar/tasks/documents/memory")
+    config["preparation"]["source_consent"] = _bounded_bool(
+        preparation.get("source_consent"), "preparation.source_consent", False)
+    config["preparation"]["scopes"] = list(dict.fromkeys(
+        item.strip().lower() for item in scopes))
+
     # Explicit, reported compatibility passthrough of the remaining effective
     # legacy policy fields (migration parity). This is the ONLY place arbitrary
     # legacy policy scalars are retained; unknown keys are never silently dropped
@@ -420,6 +474,21 @@ def validate_config(raw: Any) -> dict[str, Any]:
         legacy_policy = {}
     legacy_policy = _require_mapping(legacy_policy, "advanced.legacy_policy")
     config["advanced"] = {"legacy_policy": copy.deepcopy(dict(legacy_policy))}
+    provenance_marker = advanced.get("onboarding_provenance")
+    if isinstance(provenance_marker, dict):
+        marker: dict[str, Any] = {"schema": 1}
+        marker["neutral_init"] = bool(provenance_marker.get("neutral_init"))
+        marker["known_fields"] = [
+            str(item) for item in (provenance_marker.get("known_fields") or [])
+            if isinstance(item, str) and item in SEEDED_PATHS
+        ]
+        baseline = provenance_marker.get("baseline")
+        if isinstance(baseline, dict):
+            marker["baseline"] = {
+                path: copy.deepcopy(baseline[path]) for path in SEEDED_PATHS
+                if path in baseline
+            }
+        config["advanced"]["onboarding_provenance"] = marker
     discovery = advanced.get("legacy_account_discovery", [])
     if not isinstance(discovery, list) or any(
             kind not in {"calendar", "tasks"} for kind in discovery):
@@ -431,6 +500,123 @@ def validate_config(raw: Any) -> dict[str, Any]:
     config["_warnings"] = warnings
     config["_explicit_version"] = version
     return config
+
+
+# Canonical dotted paths that onboarding may treat as user-decided. Presence is
+# evaluated on the RAW payload before validation fills neutral factory values.
+SEEDED_PATHS = (
+    "timezone",
+    "notification.destination",
+    "notification.daily_normal_cap",
+    "notification.quiet_start_hour",
+    "notification.quiet_end_hour",
+    "sources.public_feeds",
+    "sources.obligations",
+    "sources.mail",
+    "sources.calendar",
+    "sources.tasks",
+    "mail.accounts",
+    "calendar.accounts",
+    "calendar.calendars",
+    "tasks.lists",
+    "public_interests",
+)
+
+# Values used by the shipped neutral example. A full payload equal to these is
+# generated/neutral, not evidence that a user chose UTC/5/0/8.
+_NEUTRAL_EXAMPLE_VALUES = {
+    "timezone": "UTC",
+    "notification.destination": "local",
+    "notification.daily_normal_cap": 5,
+    "notification.quiet_start_hour": 0,
+    "notification.quiet_end_hour": 8,
+    "sources.public_feeds": False,
+    "sources.obligations": False,
+    "sources.mail": False,
+    "sources.calendar": False,
+    "sources.tasks": False,
+    "mail.accounts": [],
+    "calendar.accounts": [],
+    "calendar.calendars": [],
+    "tasks.lists": [],
+    "public_interests": [],
+}
+
+_FULL_NEUTRAL_KEYS = frozenset({
+    "schema", "version", "timezone", "notification", "sources", "mail",
+    "calendar", "tasks", "public_interests", "public_sources", "adaptive",
+    "bounds", "adapters",
+})
+
+
+def raw_value(raw: Any, path: str) -> Any:
+    node = raw
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _field_present(raw: Any, path: str) -> bool:
+    node = raw
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def onboarding_provenance(raw: Any) -> dict[str, Any]:
+    """Describe which raw settings were explicitly present/known.
+
+    The marker written by neutral ``setup``/``configure init`` records a
+    baseline, so factory defaults are never mistaken for user decisions. User
+    edits made after that baseline (different value) are recognised, and an
+    onboarding write records only its actually-chosen fields in
+    ``known_fields``.
+    """
+    if not isinstance(raw, dict):
+        return {"mode": "defaults", "fields": [], "present": []}
+    present = [path for path in SEEDED_PATHS if _field_present(raw, path)]
+    advanced = raw.get("advanced")
+    marker = advanced.get("onboarding_provenance") if isinstance(advanced, dict) else None
+    marker = marker if isinstance(marker, dict) else {}
+    known = {str(item) for item in (marker.get("known_fields") or [])
+             if isinstance(item, str) and item in SEEDED_PATHS}
+    neutral_init = bool(marker.get("neutral_init"))
+    baseline = marker.get("baseline") if isinstance(marker.get("baseline"), dict) else {}
+    neutral_defaults = default_config()
+    fits_factory = (
+        set(_FULL_NEUTRAL_KEYS) <= set(raw)
+        and all(raw_value(raw, path) in (
+            value, raw_value(neutral_defaults, path))
+            for path, value in _NEUTRAL_EXAMPLE_VALUES.items()))
+    if neutral_init:
+        fields = set(known)
+        for path in present:
+            reference = baseline.get(path, _NEUTRAL_EXAMPLE_VALUES.get(path))
+            if path in known or raw_value(raw, path) != reference:
+                fields.add(path)
+        mode = "neutral_init"
+    elif fits_factory and not known:
+        fields = set()
+        mode = "factory_neutral"
+    else:
+        fields = set(present) | known
+        mode = "explicit"
+    return {"mode": mode, "fields": sorted(fields), "present": present}
+
+
+def neutral_init_marker(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the persisted provenance marker for a generated neutral config."""
+    return {
+        "schema": 1,
+        "neutral_init": True,
+        "known_fields": [],
+        "baseline": {path: copy.deepcopy(raw_value(config, path))
+                     for path in SEEDED_PATHS},
+    }
 
 
 def _validate_public_sources(raw: Any) -> list[dict[str, Any]]:
@@ -498,6 +684,9 @@ def policy_overrides(config: dict[str, Any]) -> dict[str, Any]:
         "adaptive_privacy_review_enabled": config["adaptive"]["privacy_review"],
         "adaptive_inferred_goals_enabled": config["adaptive"]["inferred_goals"],
         "health_critical_sources": list(config["health"]["critical_sources"]),
+        "preparation_enabled": config["preparation"]["enabled"],
+        "preparation_scopes": list(config["preparation"]["scopes"]),
+        "preparation_source_consent": config["preparation"]["source_consent"],
         "collector_budget_seconds": config["bounds"]["collector_budget_seconds"],
         "max_candidates_per_kind": config["bounds"]["max_candidates_per_kind"],
         "feed_max_sources_per_run": config["bounds"]["feed_max_sources_per_run"],
@@ -523,7 +712,9 @@ def policy_overrides(config: dict[str, Any]) -> dict[str, Any]:
             overrides.pop(f"{kind if kind == 'calendar' else 'task'}_accounts", None)
     if notif["destination"]:
         overrides["deliver_target"] = notif["destination"]
-    if config["public_sources"]:
+    if config.get("_explicit_public_sources", True):
+        # Empty means empty: an explicit (or neutral) typed configuration must
+        # never inherit regional/personal seed feeds from the legacy policy.
         overrides["feed_seed_sources"] = copy.deepcopy(config["public_sources"])
     return overrides
 
@@ -596,6 +787,198 @@ def _read_native_setting(native: Any) -> tuple[str, Any]:
     return _classify_native(value)
 
 
+# Ordinary native settings controls. These are the SAME validated fields the
+# CLI/file owner uses; the native form is not a second preference store.
+NATIVE_FLAT_FIELDS = {
+    "timezone": ("timezone",),
+    "destination": ("notification", "destination"),
+    "daily_normal_cap": ("notification", "daily_normal_cap"),
+    "quiet_start_hour": ("notification", "quiet_start_hour"),
+    "quiet_end_hour": ("notification", "quiet_end_hour"),
+    "cooldown_minutes": ("notification", "cooldown_minutes"),
+    "public_feeds": ("sources", "public_feeds"),
+    "obligations": ("sources", "obligations"),
+    "mail_enabled": ("sources", "mail"),
+    "calendar_enabled": ("sources", "calendar"),
+    "tasks_enabled": ("sources", "tasks"),
+    "public_interests": ("public_interests",),
+    "public_sources": ("public_sources",),
+    "discovery_mode": ("adaptive", "mode"),
+    "discovery_privacy_review": ("adaptive", "privacy_review"),
+    "discovery_inferred_goals": ("adaptive", "inferred_goals"),
+    "collector_budget_seconds": ("bounds", "collector_budget_seconds"),
+    "max_candidates_per_kind": ("bounds", "max_candidates_per_kind"),
+    "feed_max_sources_per_run": ("bounds", "feed_max_sources_per_run"),
+    "preparation_enabled": ("preparation", "enabled"),
+    "preparation_scopes": ("preparation", "scopes"),
+    "preparation_source_consent": ("preparation", "source_consent"),
+}
+
+
+def _native_getter(native: Any):
+    if isinstance(native, Mapping):
+        def _get(key, default=None):
+            return native.get(key, default)
+        return _get
+    getter = getattr(native, "get_config", None)
+    if callable(getter):
+        return getter
+    return native if callable(native) else None
+
+
+def _read_native_flat_setting(native: Any) -> tuple[str, Any]:
+    """Build one typed config payload from ordinary flat native controls.
+
+    Only keys the plugin manifest actually declares are read. Delegating their
+    validation to :func:`validate_config` keeps the native form, CLI, file and
+    runner on one owner; no duplicate range/cross-field logic exists here.
+    """
+    getter = _native_getter(native)
+    if getter is None:
+        return "unset", None
+    raw: dict[str, Any] = {"schema": CONFIG_SCHEMA, "version": CONFIG_VERSION}
+    seen = False
+    try:
+        for key, (section, *rest) in NATIVE_FLAT_FIELDS.items():
+            value = getter(key, _UNSET)
+            if value is _UNSET:
+                continue
+            if key in {"public_interests", "public_sources"} and isinstance(value, str):
+                try:
+                    value = json.loads(value) if value.strip() else []
+                except ValueError:
+                    return "invalid", f"native {key} setting is not valid JSON"
+            seen = True
+            if not rest:
+                raw[section] = value
+                continue
+            target = raw.setdefault(section, {})
+            if not isinstance(target, dict):
+                target = raw[section] = {}
+            target[rest[0]] = value
+    except Exception as exc:  # noqa: BLE001 - failed read is fail-closed
+        return "invalid", f"native settings read failed ({type(exc).__name__})"
+    return ("ok", raw) if seen else ("unset", None)
+
+
+def _overlay_mapping(base: Any, overlay: Mapping[str, Any]) -> dict[str, Any]:
+    """Deep-overlay a partial form payload onto a base config mapping.
+
+    Lists and scalars replace; mappings merge one level at a time. This preserves
+    every unrelated scope/preference/bound the base already authorised while an
+    ordinary form edit changes only its own field.
+    """
+    out = copy.deepcopy(base) if isinstance(base, dict) else {}
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _overlay_mapping(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def _merge_flat_payload(base_raw: Any, flat_raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Overlay explicitly-present flat controls without changing base version."""
+    if base_raw is None:
+        merged = {"schema": CONFIG_SCHEMA, "version": CONFIG_VERSION}
+    elif isinstance(base_raw, dict):
+        merged = copy.deepcopy(base_raw)
+    else:
+        # A malformed base (e.g. a JSON array file) must stay malformed so the
+        # one validator fails closed; flat controls never mask it.
+        return copy.deepcopy(base_raw)
+    # The flat payload always carries the current schema/version for a
+    # standalone form-only config. It must never silently upgrade a stale file
+    # or opaque native payload: migration stays explicit.
+    for key, value in flat_raw.items():
+        if key in {"schema", "version"}:
+            continue
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _overlay_mapping(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def native_flat_values(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the ordinary native-form values for a validated config.
+
+    This is a projection of the same validated owner, not a second store: the
+    manifest keys map onto the already-normalised typed fields. Validation runs
+    first so a caller can never write an unvalidated form value.
+    """
+    validated = validate_config(dict(config))
+    notif = validated["notification"]
+    adaptive = validated["adaptive"]
+    bounds = validated["bounds"]
+    sources = validated["sources"]
+    return {
+        "timezone": validated["timezone"],
+        "destination": notif["destination"],
+        "daily_normal_cap": notif["daily_normal_cap"],
+        "quiet_start_hour": notif["quiet_start_hour"],
+        "quiet_end_hour": notif["quiet_end_hour"],
+        "cooldown_minutes": notif["cooldown_minutes"],
+        "public_feeds": sources["public_feeds"],
+        "obligations": sources["obligations"],
+        "mail_enabled": sources["mail"],
+        "calendar_enabled": sources["calendar"],
+        "tasks_enabled": sources["tasks"],
+        "public_interests": copy.deepcopy(validated["public_interests"]),
+        "public_sources": copy.deepcopy(validated["public_sources"]),
+        "discovery_mode": adaptive["mode"],
+        "discovery_privacy_review": adaptive["privacy_review"],
+        "discovery_inferred_goals": adaptive["inferred_goals"],
+        "collector_budget_seconds": bounds["collector_budget_seconds"],
+        "max_candidates_per_kind": bounds["max_candidates_per_kind"],
+        "feed_max_sources_per_run": bounds["feed_max_sources_per_run"],
+        "preparation_enabled": validated["preparation"]["enabled"],
+        "preparation_scopes": copy.deepcopy(validated["preparation"]["scopes"]),
+        "preparation_source_consent": validated["preparation"]["source_consent"],
+    }
+
+
+def _same_form_value(left: Any, right: Any) -> bool:
+    """Type-sensitive equality (``False`` must not equal ``0`` for a switch)."""
+    return type(left) is type(right) and left == right
+
+
+def project_native_settings(native: Any, config: Mapping[str, Any]) -> list[str]:
+    """Mirror validated ordinary controls into the native settings form.
+
+    This is the migration/projection seam used after ``configure init`` or
+    ``configure migrate``. It writes through the host's documented
+    ``ctx.set_config`` writer (or a mutable settings mapping in tests), skipping
+    values that already match, so the Desktop form shows the effective values
+    without creating a divergent second preference store. Complex account scope
+    remains in the versioned config file and is not widened here.
+    """
+    values = native_flat_values(config)
+    writer = getattr(native, "set_config", None)
+    if not callable(writer):
+        from collections.abc import MutableMapping
+        if isinstance(native, MutableMapping):
+            def writer(key: str, value: Any) -> None:  # noqa: ANN001 - local shim
+                native[key] = value
+            getter = _native_getter(native)
+        else:
+            raise ConfigError(
+                "native settings writer unavailable",
+                remedy="run configure through the native plugin context",
+            )
+    else:
+        getter = _native_getter(native)
+    written: list[str] = []
+    for key, value in values.items():
+        if getter is not None:
+            current = getter(key, _UNSET)
+            if current is not _UNSET and _same_form_value(current, value):
+                continue
+        writer(key, copy.deepcopy(value))
+        written.append(key)
+    return written
+
+
 @dataclass
 class LoadedConfig:
     """Result of loading + validating a user configuration."""
@@ -606,6 +989,9 @@ class LoadedConfig:
     warnings: list[str] = field(default_factory=list)
     migrated: bool = False
     migration_report: dict[str, Any] = field(default_factory=dict)
+    # ``None`` means a legacy caller constructed LoadedConfig directly; a real
+    # load always supplies the raw-presence provenance described above.
+    provenance: dict[str, Any] | None = None
 
     @property
     def version(self) -> int:
@@ -637,13 +1023,13 @@ def load_user_config(
 ) -> LoadedConfig:
     """Load, validate and (when asked) migrate a user configuration.
 
-    Preference order: a native plugin ``user_config`` setting, then the explicit
-    file at ``path``. A present-but-stale version is only accepted when
-    ``migrate`` is true; an unknown/corrupt version always fails closed.
+    Preference order: a native plugin ``user_config`` setting (or ordinary flat
+    native form controls layered over it), then the explicit file at ``path``.
+    Flat controls are authoritative per field but preserve every unrelated
+    scope/bound they do not mention. A present-but-stale version is only
+    accepted when ``migrate`` is true; an unknown/corrupt version fails closed.
     """
     native_state, native_raw = _read_native_setting(native)
-    source = "defaults"
-    raw: Any = None
     if native_state == "invalid":
         raise ConfigError(
             f"invalid native user_config setting: {native_raw}",
@@ -651,7 +1037,20 @@ def load_user_config(
                     f"{NATIVE_PLUGIN_ID}.settings.{NATIVE_SETTINGS_KEY} to a JSON "
                     "object or remove it (a malformed setting never falls back)"),
         )
+    # Ordinary flat controls (the real Desktop/TUI form) are read even when the
+    # opaque user_config key exists: a form edit must never be silently ignored
+    # behind an older native blob.
+    flat_state, flat_raw = _read_native_flat_setting(native)
+    if flat_state == "invalid":
+        raise ConfigError(
+            f"invalid native settings: {flat_raw}",
+            remedy="correct or remove the offending native plugin setting",
+        )
+
+    source = "defaults"
+    raw: Any = None
     if native_state == "ok":
+        # An opaque native configuration is authoritative over a local file.
         raw, source = native_raw, "native"
     elif path is not None and Path(path).exists():
         try:
@@ -663,10 +1062,21 @@ def load_user_config(
             ) from exc
         source = "file"
 
+    if flat_state == "ok":
+        # Flat form fields are per-field authoritative and preserve everything
+        # else in the file/opaque payload they are layered over.
+        if raw is None and native_state == "unset":
+            raw = {"schema": CONFIG_SCHEMA, "version": CONFIG_VERSION}
+        raw = _merge_flat_payload(raw, flat_raw)
+        source = "native"
+
     if raw is None:
         config = default_config()
-        return LoadedConfig(config=config, present=False, source="defaults")
+        return LoadedConfig(config=config, present=False, source="defaults",
+                            provenance={"mode": "defaults", "fields": [],
+                                        "present": []})
 
+    provenance = onboarding_provenance(raw)
     config = validate_config(raw)
     explicit_version = config.get("_explicit_version", CONFIG_VERSION)
     migrated = False
@@ -675,8 +1085,9 @@ def load_user_config(
         if not migrate:
             raise ConfigError(
                 f"config version {explicit_version} requires migration to {CONFIG_VERSION}",
-                remedy="run `hermes secretary configure migrate --from-policy <policy.json>` "
-                       "or `hermes secretary configure migrate --file <config.json>`",
+                remedy="run `hermes secretary configure migrate` to migrate the "
+                       "existing config file in place, or add `--from-policy "
+                       "<policy.json>` for a legacy policy",
             )
         config, report = migrate_config(config)
         migrated = True
@@ -684,7 +1095,8 @@ def load_user_config(
         config.pop("_warnings", None)
     warnings = list(config.get("_warnings", []))
     return LoadedConfig(config=config, present=True, source=source,
-                        warnings=warnings, migrated=migrated, migration_report=report)
+                        warnings=warnings, migrated=migrated, migration_report=report,
+                        provenance=provenance)
 
 
 # --------------------------------------------------------------------------- #
@@ -737,7 +1149,8 @@ def migrate_legacy(
                              ("daily_normal_cap", "daily_normal_cap"),
                              ("cooldown_minutes", "cooldown_minutes")):
         if _is_int(policy.get(src_key)):
-            notif[dst_key] = policy[src_key]
+            notif[dst_key] = (_nonnegative_int(policy[src_key], src_key, notif[dst_key])
+                              if src_key == "daily_normal_cap" else policy[src_key])
     report["mapped"].append("notification")
 
     config["sources"]["public_feeds"] = bool(policy.get("feeds_enabled", True))
@@ -862,7 +1275,8 @@ def migrate_legacy(
         "feed_seed_sources", "adaptive_mode", "adaptive_privacy_review_enabled",
         "adaptive_inferred_goals_enabled", "collector_budget_seconds",
         "max_candidates_per_kind", "feed_max_sources_per_run",
-        "health_critical_sources",
+        "health_critical_sources", "preparation_enabled", "preparation_scopes",
+        "preparation_source_consent",
         "firecrawl_enabled", "firecrawl_consent", "firecrawl_mcp_server",
         "firecrawl_mcp_tool", "firecrawl_max_attempts_per_cycle",
         "firecrawl_max_attempts_per_day", "firecrawl_concurrency",
@@ -928,5 +1342,6 @@ __all__ = [
     "CONFIG_SCHEMA", "CONFIG_VERSION", "DEFAULT_TIMEZONE", "NATIVE_SETTINGS_KEY",
     "ConfigError", "LoadedConfig", "default_config", "validate_config",
     "load_user_config", "migrate_legacy", "migrate_config", "policy_overrides",
-    "apply_user_config", "schema_summary",
+    "apply_user_config", "native_flat_values", "project_native_settings",
+    "schema_summary",
 ]

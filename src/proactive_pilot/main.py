@@ -21,7 +21,8 @@ from pathlib import Path
 
 from . import __version__
 from .candidates import build_packet, packet_digest
-from .clock import Clock, SeededClock
+from .clock import Clock, SeededClock, build_clock
+from .alertrefs import remember_alert
 from .collectors import default_sources
 from .contextsnapshot import inspect_metadata as snapshot_metadata
 from .contextsnapshot import load_context_snapshot
@@ -83,14 +84,41 @@ def _diag(payload: dict) -> None:
     sys.stderr.write(json.dumps(payload, indent=2) + "\n")
 
 
-def _interest_context(results: list) -> list[str]:
+_PRIVATE_IDENTIFIER = __import__("re").compile(
+    r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\+?\d[\d ()-]{7,}\d|"
+    r"\b(?:[A-Za-z]*\d[A-Za-z0-9_-]{8,})\b")
+
+
+def _public_interest_context(policy: dict | None) -> list[str]:
+    """Approved ``public_interests`` only, screened for private identifiers."""
+    if not isinstance(policy, dict):
+        return []
+    raw = policy.get("public_interests")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    for value in raw:
+        text = str(value or "").strip()
+        if not text or len(text) > 160:
+            continue
+        if _PRIVATE_IDENTIFIER.search(text):
+            continue
+        if text not in out:
+            out.append(text)
+        if len(out) >= 10:
+            break
+    return out
+
+
+def _interest_context(results: list, policy: dict | None = None) -> list[str]:
     """Bounded, non-private context for public discovery.
 
     Only the user's OWN task titles and calendar titles are used (never raw mail
-    subjects or bodies). These titles are ephemeral DATA only: the inferred-goal
-    privacy boundary (structural always-on plus an optional semantic review)
-    screens every proposed concept before any public search query. Raw titles are
-    never persisted, and no closed topic vocabulary is restored.
+    subjects or bodies), plus explicitly approved ``public_interests``. These
+    values are ephemeral DATA only: the inferred-goal privacy boundary
+    (structural always-on plus an optional semantic review) screens every
+    proposed concept before any public search query. Raw titles are never
+    persisted, and no closed topic vocabulary is restored.
     """
     context: list[str] = []
     for res in results:
@@ -103,6 +131,13 @@ def _interest_context(results: list) -> list[str]:
                 context.append(text[:160])
             if len(context) >= 20:
                 return context
+    # Approved interests extend the bounded context (never private connectors
+    # and never a fixed extra model call); duplicates are removed.
+    for text in _public_interest_context(policy):
+        if text not in context:
+            context.append(text)
+        if len(context) >= 24:
+            break
     return context
 
 
@@ -310,7 +345,6 @@ def run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) ->
 def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -> int:
     if not getattr(args, "command", None):
         args.command = "run"
-    clock = SeededClock(args.seeded_clock) if args.seeded_clock else Clock()
     policy = load_policy(args.policy)
     # Optional validated per-user configuration lives beside the policy file.
     # A present-but-invalid configuration fails CLOSED (no collection, no
@@ -319,6 +353,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
         from .userconfig import ConfigError, apply_user_config, default_config, load_user_config
         _uc_path = Path(args.policy).with_name("user_config.json") if args.policy else None
         _loaded = load_user_config(_uc_path, native=getattr(args, "native_ctx", None))
+        policy["_config_present"] = bool(_loaded.present)
         if _loaded.present:
             policy = apply_user_config(policy, _loaded.config)
             if _loaded.warnings:
@@ -331,6 +366,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             # Exact-time reminders are unaffected; only explicit configuration
             # re-enables any private source.
             policy = apply_user_config(policy, default_config())
+            policy["_config_present"] = False
             print("proactive-pilot: no user configuration present; applying neutral "
                   "generic defaults (run `hermes secretary configure init|migrate`)",
                   file=sys.stderr)
@@ -339,6 +375,10 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
               file=sys.stderr)
         _emit("")
         return 1
+    # ONE configured-timezone clock feeds every runtime gate, local-day counter
+    # and state store. The effective policy (including native settings) decides
+    # the zone; regional adapters keep their own explicit SG semantics.
+    clock = build_clock(policy.get("timezone"), getattr(args, "seeded_clock", None))
     try:
         prefs = load_preferences(args.preferences, strict=True)
     except FeedbackError as exc:
@@ -371,6 +411,15 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
     # silent-but-empty.
     emit_skip_diagnostics = bool(args.check or args.dry_run)
     store = StateStore(Path(args.state_dir), clock)
+    # Bind the same profile store to the central model-route boundary so a
+    # successful configured-route call (including fallback success, for which
+    # the host emits no metadata) truthfully recovers an outage, and a terminal
+    # failure arms the shared logical incident from ANY lane.
+    try:
+        from .native_runtime import bind_health_store
+        bind_health_store(getattr(args, "native_ctx", None), store, clock)
+    except Exception:  # noqa: BLE001 - health bookkeeping is never a run blocker
+        pass
 
     with store.lock() as acquired:
         if not acquired:
@@ -475,7 +524,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             # read a private connector or the local location context.
             if not getattr(args, "no_model", False):
                 private_context = _collect_private_context()
-            context = _interest_context(results)
+            context = _interest_context(results, policy)
         else:
             from .collectors import Budget, SourceResult, safe_source_error
             # Fair category budgets over one overall 60 s wallclock. Each
@@ -502,7 +551,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             # assistant-mediated snapshot) reaches the inferred-interest proposer
             # and its privacy boundary; the snapshot is screened exactly like the
             # titles so a copied identifier can never become a public search.
-            context = _interest_context(results)
+            context = _interest_context(results, policy)
             # Explicitly source-separated merge: task/calendar titles keep their
             # legacy proposer bound, accepted snapshot entries keep their own
             # 12/500 bound, and the proposer renders snapshot-first with reserved
@@ -573,6 +622,14 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                                                 error=safe_source_error(exc, kind="obligation"),
                                                 checked_at=clock.now().isoformat()))
 
+        # Persist only already-authorised collector items for later private
+        # preparation. This performs no new read/network call and writes nothing
+        # unless preparation + source consent + an approved scope are all set.
+        try:
+            from . import evidence_cache
+            evidence_cache.record_results(store, results, policy=policy, now=clock.now())
+        except Exception:  # noqa: BLE001 - evidence caching never breaks a run
+            pass
         policy.pop("_source_dispatch", None)
         policy.pop("_source_observe", None)
         packet = build_packet(results, clock=clock, policy=policy, baseline=state,
@@ -645,6 +702,10 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             _emit("")
             return 0
 
+        _ready_rc = _maybe_emit_ready_notice(args, store, state, policy, prefs, clock)
+        if _ready_rc is not None:
+            return _ready_rc
+
         if not health_alert(state, clock.now(), policy, commit=False) and should_skip_inference(state, digest, clock.now(), policy,
                                  context_fingerprint=context_digest,
                                  context_present=context_present):
@@ -684,6 +745,11 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                 "latency_ms": proposal.latency_ms,
             }, indent=2))
             return 0
+
+        _outage_rc = _maybe_model_outage_notice(
+            args, store, state, policy, prefs, clock, proposal)
+        if _outage_rc is not None:
+            return _outage_rc
 
         # Health alerts are not an escape hatch: they obey the shared quiet /
         # pause / snooze / cooldown / cap guards, and the incident is only
@@ -781,8 +847,211 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             state["baseline_task_refs"] = sorted(baseline_tasks)
         store.prune_notify_state(state, int(policy.get("state_retention_days", 30)))
         store.save("notify_state.json", state)
+        if decision.get("message"):
+            _remember_emitted_alert(args, decision, packet, clock, policy)
+            _emit(decision.get("message", ""))
+            return 0
         _emit(decision.get("message", ""))
         return 0
+
+
+
+def _maybe_model_outage_notice(args: Any, store: Any, state: dict[str, Any],
+                               policy: dict[str, Any], prefs: dict[str, Any],
+                               clock: Any, proposal: Any) -> int | None:
+    """Consume ONLY explicit strict-host outcome facts for the outage notice.
+
+    A generic ``ctx.llm`` exception never fabricates a role, attempt or outage:
+    without a validated ``aux_route_outcome`` this returns ``None`` and the
+    unchanged evaluator-failure path applies. With facts:
+
+    * primary failure + fallback success -> record recovery, no incident notice;
+    * assigned primary + fallback exhaustion -> exactly one fixed, model-free
+      notice per incident through the existing attention/receipt atomic claim.
+
+    Returns ``None`` (continue), ``0`` (handled/emitted) or ``1`` (ambiguous
+    emission marked unknown; never retried).
+    """
+    outcome = getattr(proposal, "outcome", None)
+    try:
+        from . import modelhealth as _mh
+        facts = _mh.validate_aux_route_outcome(outcome)
+        if facts is not None:
+            # The shared consumer is idempotent and is also used at the LlmRoute
+            # boundary, so a planner/intake/preparation failure feeds the same
+            # logical incident instead of only the evaluator path.
+            _mh.consume_terminal_outcome(store, facts, now=clock.now())
+    except Exception:  # noqa: BLE001 - unavailable metadata is not evidence
+        facts = None
+    if facts is None:
+        if (str(getattr(proposal, "route", "")) == "ctx.llm"
+                and str(getattr(proposal, "action", "")) == "error"):
+            _diag({"diagnostic": "model-outage-unavailable",
+                   "reason": "strict route outcome metadata absent or malformed"})
+    try:
+        allowed, guard_reason = notice_allowed(state, policy, prefs, clock.now())
+        notice = _mh.claim_notice(
+            store, now=clock.now(),
+            attention_fn=lambda: (allowed, guard_reason))
+        if not notice.get("eligible"):
+            return None
+        state["last_delivery_at"] = clock.now().isoformat()
+        state.setdefault("delivered", []).append({
+            "at": clock.now().isoformat(),
+            "signature": "model-outage:" + str(notice.get("incident_id") or ""),
+            "urgent": False,
+        })
+        store.save("notify_state.json", state)
+        try:
+            _emit(str(notice.get("text") or _mh.NOTICE_TEXT))
+        except (OSError, RuntimeError) as exc:
+            _diag({"diagnostic": "model-outage-emission-uncertain",
+                   "error": type(exc).__name__})
+            try:
+                _mh.mark_notice_unknown(
+                    store, incident_id=notice["incident_id"],
+                    notice_token=notice["notice_token"], now=clock.now())
+            except Exception:  # noqa: BLE001 - unknown stays terminal
+                pass
+            return 1
+        try:
+            _mh.mark_notice_delivered(
+                store, incident_id=notice["incident_id"],
+                notice_token=notice["notice_token"], now=clock.now())
+        except Exception:  # noqa: BLE001 - emitted once; never duplicate
+            pass
+        return 0
+    except Exception:  # noqa: BLE001 - outage metadata never breaks business alerts
+        return None
+
+
+def _maybe_emit_ready_notice(args: Any, store: Any, state: dict[str, Any],
+                             policy: dict[str, Any], prefs: dict[str, Any],
+                             clock: Any) -> int | None:
+    """Emit at most one artifact-ready notice through the ordinary envelope.
+
+    Returns ``None`` when no artifact is eligible, ``0`` after an emission, and
+    ``1`` when emission was ambiguous (marked ``unknown``; never retried). This
+    never runs in dry/check modes and never prints private facts or a claim token.
+    """
+    if getattr(args, "check", False) or getattr(args, "dry_run", False):
+        return None
+    try:
+        from . import preparation as _prep
+        from . import responsibilities as _resp
+        # Recheck the CURRENT preparation enable/consent/scope gate before any
+        # claim: a queued artifact from an earlier generation must not notify
+        # after preparation is disabled or a required scope is revoked.
+        gate = _prep.gate_status(
+            policy, prefs,
+            config_present=bool(policy.get("_config_present", False)),
+            now=clock.now())
+        if not gate.get("allowed"):
+            return None
+        allowed, guard_reason = notice_allowed(state, policy, prefs, clock.now())
+        if not allowed:
+            return None
+
+        def _scope_ok(item: dict) -> bool:
+            try:
+                rec = _resp.inspect(store, item["responsibility_id"])
+            except Exception:  # noqa: BLE001 - stale/corrupt row fails closed
+                return False
+            return bool(_prep.scope_decision(policy, rec).get("allowed"))
+
+        notice = _prep.claim_ready_notice(
+            store, now=clock.now(),
+            attention_fn=lambda: (allowed, guard_reason),
+            scope_fn=_scope_ok)
+        if not notice.get("eligible"):
+            return None
+        public_ref = _prep.public_artifact_ref(notice["artifact_ref"])
+        text = ("A private secretary preparation draft is ready for your review. "
+                f"Responsibility {notice['responsibility_id']}; "
+                f"artifact {public_ref}. "
+                "No external action was taken.")
+        alert_ref = ""
+        try:
+            facade = getattr(getattr(args, "native_ctx", None), "state", None)
+            record = remember_alert(
+                facade,
+                signature="preparation-ready:" + str(public_ref),
+                kind="preparation",
+                candidate_refs=[{"ref": notice["responsibility_id"],
+                                 "version": str(notice.get("generation") or ""),
+                                 "source": "responsibility"}],
+                destination=policy.get("deliver_target") or policy.get("destination") or "",
+                emitted_at=clock.now().isoformat(),
+                source_version=str(notice.get("source_version") or ""))
+            if isinstance(record, dict) and record.get("ref"):
+                alert_ref = str(record["ref"])
+        except Exception:  # noqa: BLE001 - ref bookkeeping never blocks emission
+            alert_ref = ""
+        if alert_ref:
+            text += f" Reference {alert_ref}."
+        state["last_delivery_at"] = clock.now().isoformat()
+        state.setdefault("delivered", []).append({
+            "at": clock.now().isoformat(),
+            "signature": "preparation-ready:" + str(public_ref)[:80],
+            "urgent": False,
+        })
+        store.save("notify_state.json", state)
+        try:
+            _emit(text)
+        except (OSError, RuntimeError) as exc:
+            _diag({"diagnostic": "preparation-notice-uncertain",
+                   "error": type(exc).__name__})
+            try:
+                _prep.mark_ready_notice_unknown(
+                    store, notice["responsibility_id"],
+                    notice_token=notice["notice_token"],
+                    generation=notice["generation"],
+                    source_version=notice["source_version"],
+                    artifact_ref=notice["artifact_ref"],
+                    artifact_hash=notice["hash"], now=clock.now())
+            except Exception:  # noqa: BLE001 - ambiguous emission stays terminal
+                pass
+            return 1
+        try:
+            _prep.mark_ready_notice_delivered(
+                store, notice["responsibility_id"],
+                notice_token=notice["notice_token"],
+                generation=notice["generation"],
+                source_version=notice["source_version"],
+                artifact_ref=notice["artifact_ref"],
+                artifact_hash=notice["hash"], now=clock.now())
+        except Exception:  # noqa: BLE001 - already emitted; never duplicate here
+            pass
+        return 0
+    except Exception:  # noqa: BLE001 - preparation metadata never breaks alerts
+        return None
+
+
+def _remember_emitted_alert(args: Any, decision: dict[str, Any], packet: dict[str, Any],
+                            clock: Any, policy: dict[str, Any]) -> None:
+    """Record bounded alert refs in plugin state for later mobile follow-up."""
+    ctx = getattr(args, "native_ctx", None)
+    facade = getattr(ctx, "state", None) if ctx is not None else None
+    if facade is None:
+        return
+    key = decision.get("key")
+    kind = decision.get("kind")
+    candidates = [
+        candidate for candidate in packet.get("candidates", [])
+        if isinstance(candidate, dict)
+        and (candidate.get("ref") == key or candidate.get("kind") == kind)
+    ][:3]
+    try:
+        remember_alert(
+            facade,
+            signature=decision.get("signature") or key or kind,
+            kind=kind or "",
+            candidate_refs=candidates,
+            destination=policy.get("deliver_target") or policy.get("destination") or "",
+            emitted_at=clock.now().isoformat(),
+        )
+    except Exception:  # noqa: BLE001 - context refs never affect emission
+        return
 
 
 def select_evaluator(args, policy: dict, injected=None):
@@ -799,10 +1068,12 @@ def select_evaluator(args, policy: dict, injected=None):
         return FakeEvaluator(EvaluatorResult("silence")), "no-model"
     ctx = getattr(args, "native_ctx", None)
     if ctx is not None:
+        # A host context exists: this is the registered/native production path.
+        # If the configured-only lane is unavailable we must NOT fall through to
+        # the subprocess (main chat) model. The evaluator fails closed with an
+        # error verdict and deterministic reminders keep running.
         from .evaluator import NativeLlmEvaluator
-        llm_evaluator = NativeLlmEvaluator(ctx, policy)
-        if llm_evaluator.route.available:
-            return llm_evaluator, "ctx.llm"
+        return NativeLlmEvaluator(ctx, policy), "ctx.llm"
     return NativeEvaluator(), "subprocess"
 
 

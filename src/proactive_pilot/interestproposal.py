@@ -447,7 +447,10 @@ class NativePrivacyVerifier:
 
         lane = build_model_lane(self.ctx, policy, path="verifier",
                                 purpose="secretary.privacy")
-        return lane if lane.available else None
+        if lane.available:
+            return lane
+        raise PrivacyReviewError(
+            f"configured model lane unavailable: {lane.route.reason}")
 
     def build_prompt(self, topic: str, include: list[str], exclude: list[str],
                      context: list[str]) -> str:
@@ -613,7 +616,10 @@ class NativeInterestProposer:
 
         lane = build_model_lane(self.ctx, policy, path="proposer",
                                 purpose="secretary.infer")
-        return lane if lane.available else None
+        if lane.available:
+            return lane
+        raise InferredProposalError(
+            f"configured model lane unavailable: {lane.route.reason}")
 
     def build_prompt(self, context: list[str]) -> str:
         items = bound_interest_context(context)

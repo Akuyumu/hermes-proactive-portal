@@ -192,6 +192,27 @@ def test_novel_topic_plans_and_retrieves():
         assert "success" in statuses
 
 
+def test_approved_interest_plan_executes_real_acquisition():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        policy = _policy(adaptive_mode="active", feeds_enabled=True,
+                         public_interests=["marine biology"])
+        planner = FakePlanner(_reddit_plan("marine biology"))
+        prepared = adaptive.prepare_adaptive_plan(
+            policy, SeededClock(NOW.isoformat()), store=store, planner=planner, now=NOW)
+        assert prepared["origin"] == "approved_interest"
+        fetcher = FixtureFetcher({"https://www.reddit.com/search.rss": {"body": RSS}})
+        summary = collect_adaptive(
+            policy, SeededClock(NOW.isoformat()), store=store, planner=planner,
+            fetcher=fetcher, prepared=prepared, now=NOW)
+        assert summary["status"] == "ok", summary
+        assert summary["origin"] == "approved_interest"
+        assert any("marine+biology" in url and url.startswith("https://www.reddit.com/")
+                   for url in fetcher.calls)
+        # Approved interests are never persisted as explicit watchstore records.
+        assert load_watchstore(store)["watches"] == {}
+
+
 def test_change_retires_old_query():
     with tempfile.TemporaryDirectory() as tmp:
         store = _store(tmp)

@@ -1,50 +1,54 @@
 {
-  "schema": 1,
-  "version": 1,
-  "timezone": "UTC",
-  "notification": {
-    "persona": "Hermes",
-    "notify_address": "the user",
-    "destination": "local",
-    "quiet_start_hour": 0,
-    "quiet_end_hour": 8,
-    "daily_normal_cap": 3,
-    "cooldown_minutes": 30
+  "adapters": {
+    "gws_calendar": false,
+    "productivity_secretary": false
   },
-  "sources": {
-    "public_feeds": false,
-    "obligations": false,
-    "mail": false,
-    "calendar": false,
-    "tasks": false
+  "adaptive": {
+    "inferred_goals": false,
+    "mode": "disabled",
+    "privacy_review": false
   },
-  "mail": {
-    "accounts": [],
-    "aliases": {}
+  "bounds": {
+    "collector_budget_seconds": 60,
+    "feed_max_sources_per_run": 2,
+    "max_candidates_per_kind": 60
   },
   "calendar": {
     "accounts": [],
     "calendars": []
   },
-  "tasks": {
+  "mail": {
     "accounts": [],
-    "lists": [],
-    "adapter": ""
+    "aliases": {}
+  },
+  "notification": {
+    "cooldown_minutes": 30,
+    "daily_normal_cap": 5,
+    "destination": "local",
+    "notify_address": "the user",
+    "persona": "Hermes",
+    "quiet_end_hour": 8,
+    "quiet_start_hour": 0
+  },
+  "preparation": {
+    "enabled": false,
+    "scopes": []
   },
   "public_interests": [],
   "public_sources": [],
-  "adaptive": {
-    "mode": "disabled",
-    "privacy_review": false,
-    "inferred_goals": false
+  "schema": 1,
+  "sources": {
+    "calendar": false,
+    "mail": false,
+    "obligations": false,
+    "public_feeds": false,
+    "tasks": false
   },
-  "bounds": {
-    "collector_budget_seconds": 60,
-    "max_candidates_per_kind": 60,
-    "feed_max_sources_per_run": 2
+  "tasks": {
+    "accounts": [],
+    "adapter": "",
+    "lists": []
   },
-  "adapters": {
-    "productivity_secretary": false,
-    "gws_calendar": false
-  }
+  "timezone": "UTC",
+  "version": 1
 }

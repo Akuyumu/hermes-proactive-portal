@@ -26,6 +26,7 @@ from typing import Any, Protocol
 DEFAULT_PERSONA = "Hermes"
 DEFAULT_NOTIFY_ADDRESS = "the user"
 
+from . import ownerpaths as _ownerpaths
 from .candidates import SCHEMA_VERSION
 
 VALID_KINDS = {"calendar", "tasks", "mail", "feed", "obligation"}
@@ -127,6 +128,7 @@ class EvaluatorResult:
     latency_ms: int = 0
     error: str = ""
     route: str = ""  # which model route was used (ctx.llm | subprocess | fixture)
+    outcome: dict[str, Any] | None = None  # typed strict-route facts, never raw text
 
 
 class Evaluator(Protocol):
@@ -197,15 +199,15 @@ def _injection_flag(text: str) -> str | None:
 def _default_agent_src() -> str:
     """Profile-safe fallback for the native agent source path.
 
-    Order: explicit env override, then ``$HERMES_HOME/hermes-agent``, then
-    ``~/.hermes/hermes-agent``. Never a hardcoded absolute personal path.
+    Order: explicit operator env override, then the active profile's
+    ``hermes-agent``. Never a hardcoded absolute personal path. A present host
+    profile that cannot be resolved fails closed instead of reading the launch
+    profile's home.
     """
     override = os.environ.get("HERMES_AGENT_SRC")
     if override:
         return override
-    hermes_home = os.environ.get("HERMES_HOME")
-    base = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
-    return str(base / "hermes-agent")
+    return str(_ownerpaths.hermes_home() / "hermes-agent")
 
 
 def resolve_toolset_tools(
@@ -481,9 +483,11 @@ class NativeLlmEvaluator:
                 temperature=0.0,
             )
         except Exception as exc:  # noqa: BLE001 - sanitized route failure
-            return EvaluatorResult("error", error=f"ctx.llm unavailable: {type(exc).__name__}",
-                                   route="ctx.llm",
-                                   latency_ms=int((time.monotonic() - started) * 1000))
+            return EvaluatorResult(
+                "error", error=f"ctx.llm unavailable: {type(exc).__name__}",
+                route="ctx.llm",
+                outcome=getattr(exc, "aux_route_outcome", None),
+                latency_ms=int((time.monotonic() - started) * 1000))
         latency = int((time.monotonic() - started) * 1000)
         parsed = getattr(result, "parsed", None)
         raw_text = getattr(result, "text", "") or ""

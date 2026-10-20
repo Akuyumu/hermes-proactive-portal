@@ -30,7 +30,7 @@ class ParentLocationAcceptance(unittest.TestCase):
         def fake(*args, **kwargs):
             return L.LocationHttpResponse(status=0, error=secret)
         ctx = L.collect_location_context([calendar([event()])], clock=T,
-            policy=policy(), prefs={}, state={}, http_get=fake)
+            policy=policy(timezone="Asia/Singapore"), prefs={}, state={}, http_get=fake)
         self.assertNotIn(secret, repr(ctx.to_packet()))
         self.assertEqual(ctx.status, 'location fetch failed')
 

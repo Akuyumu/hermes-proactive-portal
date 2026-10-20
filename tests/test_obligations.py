@@ -115,6 +115,7 @@ def _sig(**kwargs):
 
 def _policy():
     policy = load_policy(None)
+    policy["timezone"] = "Asia/Singapore"
     policy["_preferences"] = {"explicit": [], "inferred": [], "snoozes": []}
     return policy
 

@@ -37,6 +37,7 @@ def _clock(at=NOW):
 
 def _policy():
     p = json.loads(json.dumps(DEFAULT_POLICY))
+    p["timezone"] = "Asia/Singapore"
     p["_preferences"] = {"explicit": [], "inferred": [], "snoozes": []}
     return p
 

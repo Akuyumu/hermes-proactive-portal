@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -283,6 +284,90 @@ def prepare_inferred_plan(
             "goal_id": str(goal.get("id") or "")}
 
 
+INTEREST_STATE = "interest_discovery.json"
+_INTEREST_PRIVATE = re.compile(
+    r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\+?\d[\d ()-]{7,}\d|"
+    r"\b(?:[A-Za-z]*\d[A-Za-z0-9_-]{8,})\b")
+
+
+def approved_interest_targets(policy: dict[str, Any]) -> list[str]:
+    """Bounded approved interests, with private identifiers rejected."""
+    raw = policy.get("public_interests")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    for value in raw:
+        text = " ".join(str(value or "").split())
+        if not text or len(text) > 160 or _INTEREST_PRIVATE.search(text):
+            continue
+        if text not in out:
+            out.append(text)
+        if len(out) >= 10:
+            break
+    return out
+
+
+def _prepare_interest_plan(policy: dict[str, Any], clock: Any, *, store: Any,
+                           planner: Any, now: datetime,
+                           plan_timeout: float | None = None) -> dict[str, Any] | None:
+    """Rotate one approved interest into a real bounded public query plan.
+
+    Cache-first: a fresh plan for the same interest is reused with ZERO model
+    call. A new installation has no interests and therefore enters none of this.
+    """
+    interests = approved_interest_targets(policy)
+    if not interests:
+        return None
+    cadence = max(1, int(policy.get("adaptive_plan_cadence_minutes", 360))) * 60
+    with store.lock("interest_discovery.lock") as acquired:
+        if not acquired:
+            return None
+        data = store.load(INTEREST_STATE, {"schema": 1, "cursor": 0, "plans": {}},
+                          strict=True)
+        if not isinstance(data, dict):
+            data = {"schema": 1, "cursor": 0, "plans": {}}
+        plans = data.get("plans") if isinstance(data.get("plans"), dict) else {}
+        cursor = int(data.get("cursor") or 0) % len(interests)
+        interest = interests[cursor]
+        key = hashlib.sha256(interest.encode("utf-8")).hexdigest()[:20]
+        cached = plans.get(key) if isinstance(plans.get(key), dict) else None
+        watch = {
+            "id": "interest:" + key,
+            "public_topic": interest,
+            "include": [],
+            "exclude": [],
+            "scope": "public",
+            "version": 1,
+            "origin": "approved_interest",
+        }
+        if cached:
+            try:
+                planned = datetime.fromisoformat(str(cached.get("planned_at") or ""))
+            except ValueError:
+                planned = None
+            if planned is not None and (now - planned).total_seconds() < cadence:
+                plan = dict(cached.get("plan") or {})
+                if plan:
+                    return {"status": "prepared", "reason": "", "watch": watch,
+                            "plan": plan, "used_model": False,
+                            "planning_deferred": False, "origin": "approved_interest",
+                            "cached": True}
+        plan, used_model = plan_for_watch(
+            watch, policy, planner, now=now, force=True, plan_timeout=plan_timeout)
+        plans[key] = {"plan": plan, "planned_at": now.isoformat(),
+                      "interest": interest}
+        # Bounded cache and fair rotation.
+        ordered = sorted(plans.items(),
+                         key=lambda pair: str((pair[1] or {}).get("planned_at") or ""),
+                         reverse=True)[:10]
+        data = {"schema": 1, "cursor": (cursor + 1) % len(interests),
+                "plans": dict(ordered)}
+        store.save(INTEREST_STATE, data)
+    return {"status": "prepared", "reason": "", "watch": watch, "plan": plan,
+            "used_model": bool(used_model), "planning_deferred": False,
+            "origin": "approved_interest", "cached": False}
+
+
 def prepare_adaptive_plan(
     policy: dict[str, Any],
     clock: Any,
@@ -340,6 +425,19 @@ def prepare_adaptive_plan(
                 if inferred is not None:
                     inferred["plan_elapsed"] = time.monotonic() - started
                     return inferred
+            # Approved interests are real discovery inputs, not evaluator-only
+            # decoration. They reuse the SAME planner, public scope, privacy
+            # boundary, shared budget and cache/rotation. No interests -> no call.
+            if (str(policy.get("adaptive_mode") or "disabled") == "active"
+                    or bool(policy.get("adaptive_evidence_enabled"))
+                    or bool(policy.get("adaptive_interest_discovery_enabled", False))):
+                interest_plan = _prepare_interest_plan(
+                    policy, clock, store=store, planner=planner, now=now,
+                    plan_timeout=(float(policy.get("adaptive_plan_timeout_seconds", 60))
+                                  if overall_budget is None else None))
+                if interest_plan is not None:
+                    interest_plan["plan_elapsed"] = time.monotonic() - started
+                    return interest_plan
             return {"status": "no_active_watch", "reason": "no active watch", "watch": None,
                     "plan": None, "used_model": False, "planning_deferred": False,
                     "plan_elapsed": time.monotonic() - started}
@@ -758,6 +856,7 @@ def collect_adaptive(
         coverage = load_coverage(store)
 
         inferred_goal = False
+        interest_goal = False
         if prepared is not None:
             plan = dict(prepared.get("plan") or {})
             used_model_any = bool(prepared.get("used_model"))
@@ -780,6 +879,20 @@ def collect_adaptive(
                 watch = ip.goal_to_watch(current)
                 watch["plan"] = plan
                 inferred_goal = True
+            elif str(prepared.get("origin") or "") == "approved_interest":
+                # Approved interests are planned from policy, NOT persisted in
+                # the explicit watch store. Validate the prepared watch directly
+                # (still approved + same identity/version) instead of looking it
+                # up as a watchstore record and silently deferring.
+                prepared_watch = dict(prepared.get("watch") or {})
+                topic = str(prepared_watch.get("public_topic") or "")
+                if (not plan or prepared_watch.get("origin") != "approved_interest"
+                        or prepared_watch.get("id") != watch_id
+                        or topic not in approved_interest_targets(policy)):
+                    return _empty_summary("deferred", "approved interest changed between planning and acquisition")
+                watch = prepared_watch
+                watch["plan"] = plan
+                interest_goal = True
             else:
                 current = data.get("watches", {}).get(watch_id)
                 # A user edit/retirement between planning and acquisition must fail
@@ -840,6 +953,7 @@ def collect_adaptive(
                 used_model_any = bool(used_model)
 
         inferred_goal = str((prepared or {}).get("origin") or "") == "inferred"
+        interest_goal = interest_goal or str((prepared or {}).get("origin") or "") == "approved_interest"
         scope = str(plan.get("scope") or "public")
         watch_id = str(watch.get("id") or "")
 
@@ -855,7 +969,8 @@ def collect_adaptive(
             "provenance": str(plan.get("provenance") or ""),
             "queries": list(plan.get("queries") or []),
             "planning_deferred": planning_deferred,
-            "origin": "inferred" if inferred_goal else "explicit",
+            "origin": ("inferred" if inferred_goal else
+                       "approved_interest" if interest_goal else "explicit"),
         }
 
         unsupported_reason = str(plan.get("unsupported_reason") or "")
@@ -890,7 +1005,8 @@ def collect_adaptive(
                     "pipeline_status": "completed",
                     "coverage_status": _coverage_status(sources_out),
                     "results": raw_results,
-                    "origin": "inferred" if inferred_goal else "explicit"}
+                    "origin": ("inferred" if inferred_goal else
+                               "approved_interest" if interest_goal else "explicit")}
 
         ensure_adaptive_sources(registry, plan, policy, now)
 
@@ -1018,7 +1134,8 @@ def collect_adaptive(
                 "pipeline_status": "completed",
                 "coverage_status": _coverage_status(sources_out),
                 "results": raw_results,
-                "origin": "inferred" if inferred_goal else "explicit"}
+                "origin": ("inferred" if inferred_goal else
+                               "approved_interest" if interest_goal else "explicit")}
 
 
 def _record_coverage(

@@ -1,505 +1,246 @@
 # hermes-proactive-secretary
 
-A proactive secretary plugin for [Hermes](https://hermes-agent.nousresearch.com):
-read-only collectors over **your own authorised** mail, calendar and tasks plus
-optional public sources, a conservative zero-tool evaluator, bounded
-notification gates, and a durable requested-reminder registry.
+A conservative, opt-in proactive secretary for [Hermes](https://hermes-agent.nousresearch.com). It reads only the sources you explicitly authorise, judges whether anything is genuinely worth interrupting you for, and stays silent otherwise. It never sends mail, changes calendars or tasks, books, purchases, publishes, or expands its own access.
 
-It is deliberately quiet: silence is the default, and an alert only goes out for
-a genuine, evidence-backed, time-bound reason. It never sends mail, mutates
-calendars or tasks, books, purchases, or expands permissions.
+Version **0.5.0** is a pre-1.0 release. The default posture is user-agnostic: no accounts, no public seeds, no personal interests, and no assumed location. Every source and permission is opt-in. See the compatibility and qualification limits below.
 
-For agent-assisted installation, give your agent [AGENT_SETUP.md](AGENT_SETUP.md).
-It covers environment discovery, the few choices that require consent, connector
-limits, configuration, verification and safe uninstall.
+## How it works
 
-This repository is currently **private**. Other users need repository access or
-an authorised distribution of the package; this is not a public catalog listing.
-The package is profile/path-safe. Its configured source/account mapping is
-explicit: without configuration it keeps the legacy `formal`/`informal` Himalaya
-accounts and the external productivity-secretary library; with a validated user
-configuration you name the accounts, calendars and task lists that are read.
-Calendar/tasks via the bundled optional Google Workspace adapter still need the
-installed skill and its existing authorisation. See the guide before promising
-compatibility.
+```mermaid
+flowchart LR
+    A[Your authorised sources] --> G[Deterministic gates]
+    P[Explicit public sources] --> G
+    G -->|nothing due| Q[Silence]
+    G -->|evidence| H{Host supports<br/>configured-only route?}
+    H -->|no| D[Deterministic reminders<br/>and controls only]
+    H -->|yes| E[Zero-tool judgment]
+    E --> N[Attention-gated notice]
+    N --> F[Foreground action,<br/>only with exact approval]
+```
 
-## Quickstart
+The secretary collects bounded, read-only evidence; applies quiet hours, a daily ceiling, cooldown, dedupe and expiry; and writes at most one short message per run to stdout. The native Hermes scheduler owns actual delivery. "Emitted" means a message was written; it does **not** mean delivery was confirmed.
+
+## Host compatibility is a strict feature gate
+
+Model-dependent work requires an explicit host contract: `register_auxiliary_task(..., fallback_policy="configured_only")`. The plugin detects that keyword on the host signature; a wrapper that merely accepts `**kwargs` is not proof. On a host without the contract, model work is blocked **before dispatch** while deterministic controls and requested reminders continue. Optional route-outcome metadata is consumed only when the host supplies its documented `aux_route_outcome` shape; otherwise the plugin reports "metadata unavailable" rather than guessing which route failed.
+
+The plugin does **not** patch Hermes or install this host contract for you. Verify your installed host with `hermes secretary status` and `doctor`; installation alone is not proof of compatibility. A host without the contract needs a compatible Hermes implementation before model-dependent features can run. Do not bypass the gate or assume an arbitrary upstream version supports it.
+
+## Requirements
+
+- Hermes with the native plugin and cron surfaces; Linux or macOS. Windows and fresh-machine portability are not independently certified.
+- Python dependencies provided by the Hermes runtime; the plugin does not install a second runtime.
+- Optional connectors only when already authorised: Himalaya CLI for read-only mail metadata; the external `productivity-secretary` library for calendar/tasks, or the Google Workspace calendar adapter with its installed skill and existing authorisation; a native messaging target such as a Telegram DM.
+
+The source is MIT-licensed, but the canonical repository is currently private. Installation requires access to `Akuyumu/hermes-proactive-secretary`.
+
+## Install
 
 ```bash
-# 1. install + enable the plugin (standalone repo, installed under ~/.hermes/plugins)
 hermes plugins install Akuyumu/hermes-proactive-secretary --no-enable
 hermes plugins enable hermes-proactive-secretary
+hermes secretary doctor
+```
 
-# 2. prepare policy/state without schedules; review timezone, coverage and interests
+If the Git transport cannot access the private repository, stop and report the access requirement. Do not bypass it. A reviewed release may be pinned with the native `--ref` option.
+
+## First run: prepare, preview, consent
+
+Prepare the owner-only runtime and run offline checks **without arming jobs**:
+
+```bash
 hermes secretary setup --no-cron
-
-# 3. write/validate the validated per-user configuration (generic neutral defaults)
-hermes secretary configure init
+hermes secretary configure show
 hermes secretary configure validate
 hermes secretary configure preview
+```
 
-# 4. arm the verified jobs with an explicitly authorised destination
-hermes secretary setup --deliver '<verified-delivery-target>' # or --deliver local
+`setup --no-cron` writes a neutral policy/preferences baseline and, on a new install, a neutral `user_config.json`. It creates no cron jobs. `configure preview` shows which policy keys would change. A nonempty configuration is never overwritten without `--force`.
 
-# 5. verify
-hermes secretary status
+Settings, grants and memory facts are separate. Settings are the validated configuration and native form fields. Grants are explicit typed permissions (`mail`, `calendar`, `tasks`, `public_sources`, `memory`, `discretionary`). Foreground-memory facts may be proposed as tentative facts; a proposal is not a fact, and accepting a fact is not a grant.
+
+On a phone, prefer the Telegram DM workflow below. The CLI `setup` command is not a substitute for the conversational onboarding interview.
+
+## Mobile-first Telegram DM workflow
+
+Use a one-to-one DM with the bot. Onboarding deliberately ignores groups, channels, shared chats, cron, a2a, subagent and internal turns.
+
+1. Send `/secretary setup`.
+2. The reply shows the real next question and a short-lived continuation code such as `sec-cont-ab12cd34ef56`.
+3. Reply with your answer **and the code together** in the same message. The code is required when the host does not expose a verified session id to slash commands; it is a routing token, not a credential.
+4. Repeat `/secretary setup` to resume. Only genuine gaps or conflicts are asked; existing explicit settings are not asked again.
+5. Use `/secretary status` to inspect progress, jobs, the effective model route and limits.
+
+Supported chat controls:
+
+| Command | Effect |
+|---|---|
+| `/secretary setup` | Start or resume gap-only onboarding |
+| `/secretary status` | Inspect onboarding, jobs, route and limits |
+| `/secretary pause` | Global pause: stop collection and delivery, including requested reminders |
+| `/secretary resume` | Clear the pause; reports whether owned jobs are recorded |
+| `/secretary disable` | Pause and remove only plugin-owned jobs/runners |
+| `/secretary cancel-setup` | Cancel setup while retaining progress |
+| `/secretary cancel` | Alias for cancel-setup; it does not pause alerts |
+
+A global pause is absolute. Requested reminders remain registered but are not read or emitted until you resume; they may then fire late.
+
+Onboarding is resumable and cancellable. The destination is recorded as `user_confirmed` at most, never live-verified. Completion therefore stays `pending_verification`, and **no jobs are armed by onboarding**. The completion text names the exact next command.
+
+The plugin does not promise perfect quote/reply correlation. It uses explicit opaque `sec-...` references when present and asks for clarification when a reference is missing or ambiguous. It never guesses a sender, creates a DM, or runs a global interceptor.
+
+## Arm the owned jobs
+
+Configuration or onboarding alone does not arm anything or deliver anything. After reviewing the preview, arm explicitly:
+
+```bash
+hermes secretary setup --deliver local   # safe local/no-send first
+hermes secretary setup --deliver telegram
+hermes secretary status --json
 hermes secretary doctor
 hermes secretary self-test
+hermes cron list
 ```
 
-`hermes secretary setup` is safe to re-run. It verifies the offline self-test
-and a no-model dry-run **before** installing launchers or creating any cron job,
-so a failing check arms nothing. It never overwrites an existing policy unless
-you pass `--force`, and it reports honestly if a rollback removal does not
-complete.
+`telegram` is the native Telegram delivery target. Use `telegram:<chat_id>` only when you already know the exact native chat id and your host's `hermes cron create --help` shows that form. Never guess a chat id. Use `origin` only when the command truly runs with chat context; a terminal command does not.
 
-### Importing existing legacy state
+A successful `setup` creates and records ownership of two native `--no-agent` script jobs: `hermes-proactive-secretary-pilot` (every 15 minutes; may use a host-owned model lane for judgment) and `hermes-proactive-secretary-reminders` (every minute; deterministic, zero model calls).
 
-If you already have a legacy tree (`<legacy>/var/`, `<legacy>/policy/policy.json`,
-`<legacy>/policy/preferences.json`), preview and then import it:
+Keep these states distinct: **installed** (plugin present), **configured** (settings validate), **scheduled** (owned jobs recorded), **delivery-confirmed** (a real receipt from an explicit native canary; not a state this plugin can set). This plugin has no send or canary command; a canary is your own foreground action through your existing native channel. If you cannot verify a destination, keep `--deliver local`; the honest state is `unverified`.
 
-```bash
-hermes secretary setup --import-from <legacy_tree> --import-dry-run   # inventory + hashes, no changes
-hermes secretary setup --import-from <legacy_tree>                    # copy byte-for-byte, then verify
-```
+## Settings, model routes and attention
 
-The import copies durable files byte-for-byte with owner-only permissions
-(`0700` dirs / `0600` files), never rebuilds reminders, refuses any conflicting
-target file, is a safe no-op on an identical re-run, and rejects symlinks and
-path traversal. It never deletes or adopts legacy cron jobs; that stays a manual,
-verified cutover step.
+The ordinary settings surface is the **native plugin form** (Settings -> Plugins -> Proactive Secretary), projected from the `config_schema` in `plugin.yaml`. It includes timezone, destination, daily ceiling, quiet hours, cooldown, source toggles, public interests/sources, discovery, budgets, preparation and the four model-route fields. The validated `user_config` remains the single owner; the form is not a second store.
 
-## Native disable vs `hermes secretary disable`
+Configuration precedence: native `plugins.entries.hermes-proactive-secretary.settings.user_config` and ordinary flat form fields, then local `user_config.json` beside `policy.json`, then neutral defaults. A present-but-malformed native setting fails closed; it never silently falls back. See `policy/user-config.example.json` for the neutral shape.
 
-Both scheduled runners check the native `plugins.enabled` / `plugins.disabled`
-config before they import the pipeline, read state, collect, evaluate or emit.
-So `hermes plugins disable hermes-proactive-secretary` stops work on each next
-run (empty stdout, no alert). It does **not** remove the cron schedules — it
-cannot — so the schedules remain inert until you clean them up. The enabled list
-must explicitly contain the plugin; a missing, malformed or empty enabled list
-fails closed and the runners stay silent.
+Model routing: operator native `auxiliary.proactive_secretary` pin **>** plugin primary/fallback fields **>** initial chat-model inheritance only when no secretary primary is configured. `primary_provider`/`primary_model` are both-or-none; `fallback_provider`/`fallback_model` are both-or-none and require an assigned primary. After the assigned fallback fails there is no extra main/global/chat escalation; on a host without the strict contract, nothing is dispatched. Route changes are read by the next secretary process or a native plugin reload; instant in-process reload is not promised.
 
-Use `hermes secretary disable` (or `uninstall`) to pause **and** remove this
-plugin's own jobs and installed launchers before a native uninstall. Messages
-already delivered are not revoked.
+The **attention envelope**:
 
-## Offline verification vs. live cutover
-
-The release was checked with an offline suite and with an installed Linux
-profile: setup, state migration, idempotency, native disable and both real
-scheduler paths were exercised. This is not certification for every fresh host
-or connector. The one-minute reminder runner is deterministic and model-free;
-the 15-minute monitoring runner may invoke LLMs internally even though both
-cron jobs use `--no-agent`.
-
-Each new installation still needs its own capability, destination and schedule
-verification. Migration does not pause or remove old jobs automatically.
-
-## Agent-guided alternative
-
-If you'd rather have the agent drive it, ask it to "load the proactive-secretary
-skill and set the plugin up". The bundled skill walks through the same steps,
-what to check after each, the exact commands, and the honest limits. The agent
-can then explain the coverage on your machine.
-
-## What it does
-
-- Collects (read-only, bounded, fixed-argv) from whichever connectors are
-  available:
-  - calendar + tasks through an external productivity-secretary library when
-    installed and authorised (not bundled with this plugin), or through the
-    optional Google Workspace calendar adapter when explicitly enabled;
-  - mail metadata through the Himalaya CLI using exactly the accounts named in
-    the validated user configuration (legacy deployments keep `formal`/
-    `informal`), never message bodies beyond a short redacted preview;
-  - public feeds/pages when a user saves a public watch.
-- Builds a bounded evidence packet and asks the native evaluator (resolved to a
-  **zero-tool** toolset) whether anything merits interrupting you now. Every
-  judgment lane -- evaluator, semantic planner, inferred-interest proposer,
-  privacy verifier and conversational intake -- prefers the host-owned `ctx.llm`
-  lane (the user's active model) and reports which route was used; the native
-  zero-tool subprocess route remains only an explicit compatibility fallback for
-  an older runtime that cannot provide a context.
-- On the normal schedule the pilot runner does **not** import the pipeline
-  directly: it invokes the registered `hermes secretary pipeline` handler with
-  fixed argv and the same profile/data paths, so the host-built `ctx` from native
-  plugin discovery (and therefore `ctx.llm` plus native `get_config`) is
-  authoritative. The reminder runner likewise enters the registered
-  `hermes secretary reminders` handler: it is deterministic, makes zero model
-  calls and never touches `ctx.llm`. A subprocess timeout/error AFTER the native
-  handler was started fails closed (no second collector/model run and no
-  fallback); the direct-import compatibility path is used only when the native
-  CLI is verifiably unavailable before any work, and that is reported.
-- Applies deterministic envelope guards: quiet hours, daily cap, cooldown,
-  dedupe, expiry, stale-source handling, a single-writer lock, and your
-  explicit preferences.
-- Dispatches at most one short message per run through the native scheduler.
-- Holds explicit **requested reminders** (event-bound or exact-time) in a
-  durable owner-only registry and dispatches them once, with overlap, move,
-  cancellation and source-failure handling.
-
-## What it does not do
-
-- It does not send mail, create/modify calendar events or tasks, purchase,
-  book, or take any external action on your behalf.
-- It does not guarantee complete coverage: blocked, failed, deferred and
-  truncated sources are recorded separately. Undated tasks are not covered.
-- It does not confirm delivery. "Emitted" means a message was written to stdout;
-  the native scheduler owns actual delivery.
-- It does not fabricate urgency, personal fit, location, or a deadline.
-
-## Source health and bounded recovery (limited, not self-healing)
-
-Ordinary scheduled scans no longer emit a coverage notice every time a source
-fails. Instead the plugin keeps a schema-validated per-source incident (actual
-attempted checks, first/last failure, success and streak) in durable state:
-
-- Only an **attempted** read counts. A missing, cached, partial, truncated,
-  deferred or busy observation is neither a success nor a failure and can never
-  be recorded as a recovery.
-- A retryable timeout/503 stays **silent without an identifiable owner fix**. A `429` honours its
-  `Retry-After`/backoff: the per-source dispatch gate blocks the next real call
-  until that deadline, then permits exactly one **half-open** probe.
-- A single critical-source alert is emitted **at most once per unresolved
-  incident**, even across restarts, and only when the source was explicitly
-  named critical in configuration, has failed repeatedly, has stayed failed for
-  the persistent window (>= 2h by default), safe recovery is exhausted, and
-  an explicitly classified revoked/missing grant requires owner action. A
-  new incident can only qualify after an authoritative attempted success.
-  Scoped clients are gated before requests; unrelated accounts continue under
-  their existing budgets. Two bounded next-scheduled probes are the default;
-  later cooldown-spaced checks are ordinary reads, not claimed auth repair.
-  Health emission uses a durable incident-specific outbox: interruption after
-  emission starts is marked uncertain across restart and is not blindly resent.
-
-This is deliberately **limited repair**, not universal self-healing: the plugin
-cannot fix a revoked credential, an outage at a provider, or a network fault. It
-only stops ordinary scan spam, retries boundedly, and tells you once when an
-actionable source you marked critical is persistently lost. Mail and calendar are NOT
-critical by default; name them under `health.critical_sources` if you want an
-alert. A provider overload or timeout alone is never presented as something you
-can fix yourself.
-
-## Permissions and privacy
-
-- Collectors, searches and fetches can contact external authorised services and
-  public sources. Native LLM calls for judgment and optional adaptive planning /
-  privacy review use the user's configured provider; this is not an offline-only
-  automation.
-- Source content is treated as untrusted evidence, never as instructions.
-- Credential/OTP messages are never fetched; URLs and codes are redacted from
-  previews.
-- Runtime state lives in an owner-only directory (`0700` dir / `0600` files)
-  under `$HERMES_HOME/plugin-data/hermes-proactive-secretary/` (state, policy
-  copy, preferences). It is never written into the installed plugin tree.
-- The plugin declares no privileged capabilities and overrides no built-in tool.
-
-## Assistant-mediated context snapshot
-
-The conversational assistant can hand the scheduled pipeline a **bounded,
-expiring delivery cache** of context it already knows from the user's authorised
-memory/knowledge. This is deliberately *not* automatic whole-memory inheritance:
-the pipeline never scrapes USER/MEMORY/Hindsight/Library, credentials, connectors
-or a new allowlist on its own, and it never dumps an entire vault.
-
-```bash
-hermes secretary feedback context-list                     # metadata only (no text)
-hermes secretary feedback context-show --id <entry id>     # explicit content read
-hermes secretary feedback context-update --note "<a short fact>" \
-  --provenance "assistant:memory" --kind interest [--expires-at <ISO>] [--owner-declared]
-hermes secretary feedback context-revoke --id <entry id>   # durable revoke (tombstoned)
-```
-
-Properties:
-
-- Typed entries with a stable id, provenance label, created/updated/expiry
-  timestamps and an advisory-vs-owner-declared flag; entry and total-size caps;
-  owner-only atomic writes under a profile-local path. `--provenance` is a fixed
-  low-sensitivity enum (`user-stated`, `assistant:memory`, `assistant:knowledge`
-  — the default, `owner-config`, `synthetic-test`) so metadata is generic and
-  portable and never carries an owner/account/path/request excerpt. Default is
-  **empty**, so a fresh install behaves exactly as before.
-- Expiry is **mandatory and bounded**: a missing `--expires-at` defaults to 7
-  days and nothing may outlive 30 days measured from `updated_at` (a refresh may
-  preserve an older `created_at`). The **read boundary is authoritative**: exact
-  shapes/types/kind/id/provenance and every timestamp are validated, the order
-  `created_at <= updated_at <= expires_at` and a non-far-future `updated_at` are
-  enforced, naive timestamps are normalised to UTC-aware rather than crashing,
-  and any malformed entry (or an invalid tombstone) marks the whole snapshot
-  invalid. Missing/empty/malformed/expired means **unavailable** with a bounded
-  health reason; values are never fabricated and nothing is refreshed in the
-  background. Injection/secret-bearing entries are refused at write time *and*
-  re-checked at read time; diagnostics never echo untrusted ids/values/text.
-- Treated as **untrusted advisory evidence** everywhere downstream. It reaches
-  both the evaluator prompt and the inferred-interest proposer, but can never
-  change authority, settings or gates, and copied identifiers/names/account
-  details are structurally screened by the same privacy boundary. That boundary
-  is a conservative, fail-closed screen — not a proof that no possible
-  identifier can ever escape. Raw snapshot text is never written to status/log
-  output.
-- `pause`/disable and the model-free reminder dispatcher read no snapshot, model
-  or network.
-
-Feedback itself stays **assistant-mediated**: the assistant turns an explicit
-user correction into a typed command, reads the exact record back (`show --id` or
-the write's `receipt`) and shows a receipt. "Thanks"/silence is a no-op, not a
-recorded preference; there is no automatic capture hook or conversation
-surveillance. Existing explicit/inferred rules, snoozes, conditional exceptions,
-expiries, provenance and revocation tombstones keep their semantics.
-
-## If you have no connectors
-
-Without an authorised mail/calendar/task connector you get **public-source
-monitoring only** (`feed`/`obligation` evidence from public pages you
-explicitly save). No personal sources are read.
-
-## Validated per-user configuration
-
-Beyond the runtime policy, the plugin reads an optional **validated per-user
-configuration** from `plugins.entries.hermes-proactive-secretary.settings.user_config`
-(native settings, preferred) or from `user_config.json` beside `policy.json`.
-The generic neutral example ships at `policy/user-config.example.json` (timezone
-`UTC`, no accounts, no seeds, adaptive off, no owner identifiers).
-
-```bash
-hermes secretary configure init        # write the neutral example, idempotent
-hermes secretary configure show        # schema + effective config + overrides
-hermes secretary configure validate    # fail-closed validation (non-zero on error)
-hermes secretary configure preview     # policy keys that would change
-hermes secretary configure migrate --from-policy <legacy-policy.json> [--dry-run]
-```
-
-Rules the configuration layer enforces:
-
-Compatibility source scope: task accounts are independent of calendar and mail
-accounts; a task-only configuration works with calendars disabled. Empty account
-arrays read no connector. Within configured calendar accounts, an empty
-`calendar.calendars` array retains the library's selected/primary/holiday
-calendars; a nonempty array intersects those with exact calendar IDs **before**
-event reads, including the birthday pass and page-token requests. Requested
-reminders use the same selected-calendar and ID boundary. Within configured task
-accounts, empty `tasks.lists` retains all visible lists; nonempty entries match
-exact case-sensitive IDs or titles before task reads. Use `id:LIST_ID` or
-`name:LIST_TITLE` to disambiguate. `tasks.adapter` supports `""`, `"tasks"` and
-`"productivity_secretary"` (the same compatibility client); other values fail
-closed. The compatibility route also requires `adapters.productivity_secretary`.
-
-Migration inputs override prior fields; omission preserves prior explicit
-accounts, aliases, IDs, lists, adapters and interests, including empty arrays.
-For old user configs omitting `tasks.accounts`, validation copies only their
-explicit calendar accounts and reports a warning; setting `tasks.accounts: []`
-opts out. Explicit legacy-policy migration records formerly omitted calendar/task
-account scopes in `advanced.legacy_account_discovery`, preserving the original
-library alias discovery without reading connectors during migration. This marker
-is absent from neutral defaults. Review `report.source_mappings` before writing.
-
-- **Versioned and fail-closed.** An unknown/corrupt or newer version is refused;
-  a stale version needs the explicit `migrate` step and is never rewritten
-  silently. A nonempty configuration is not overwritten without `--force`.
-  A present-but-malformed native `user_config` setting (bad JSON, non-object, or
-  an unreadable settings accessor) fails closed; it never silently falls back to
-  a local file or built-in defaults. An *absent* setting is simply unset.
-- **Complete migration parity.** `migrate` retains every remaining effective
-  legacy policy field as an explicit, reported compatibility passthrough (see
-  `advanced.legacy_policy` and `report.retained_effective_fields`), and explicit
-   `--mail-account`/`--calendar-account`/`--calendar-id`/`--task-account`/`--task-list`/`--adapter`
-  inputs preserve an existing configured scope verbatim instead of hardcoding it.
-- **One semantics for monitoring and reminders.** The deterministic reminder
-  dispatcher loads/validates the exact same configuration precedence, timezone,
-  quiet hours, limits and authorised scope, and never falls back to a broad
-  account list when an explicit configuration restricts it. Event reads use ONLY
-  the explicit `calendar.accounts`/`calendar.calendars`; mail accounts are never
-  unioned into calendar authorisation. A disabled calendar or an empty explicit
-  calendar account set makes zero event getter/source calls (the reminder stays
-  active), while exact-time reminders keep working.
-- **Production entries require configuration.** The scheduled pipeline and the
-  `run-once`/`reminders` production commands thread the host `ctx` and apply the
-  neutral generic defaults when no configuration is present (or fail closed on a
-  malformed one), so a deleted/missing `user_config.json` can never silently
-  re-enable the legacy private `formal`/`informal` sources. The legacy low-level
-  API remains available only through an explicit flag for tests/back-compat.
-- **No credential values.** Credential-shaped keys (`token`, `api_key`,
-  `client_secret`, `password`, ...) are rejected; no token store lives here.
-- **Explicit access.** `mail.accounts`, `calendar.accounts`, `calendar.calendars`,
-   `tasks.accounts` and `tasks.lists` name what may be read. Credential presence alone never widens
-  access. Unknown account names are supported through bounded fixed-argv calls
-  once you name them.
-- **Configuration ≠ preferences ≠ state.** Learned preferences stay in
-  `preferences.json` and mutable state in `var/`; migration never moves a global
-  pause, so it can never silently pause or unpause.
-
-| Section | Example | Meaning |
+| Surface | Counts against the ordinary daily ceiling? | Model? |
 |---|---|---|
-| `timezone` | `"UTC"` | IANA timezone; neutral `UTC` when unset |
-| `notification.destination` | `"local"` | Native `--deliver` target (empty = keep existing) |
-| `notification.quiet_start_hour` / `quiet_end_hour` | `0` / `8` | Quiet hours |
-| `notification.daily_normal_cap` / `cooldown_minutes` | `3` / `30` | Envelope limits |
-| `sources.*` | `false` | Per-source enablement (public feeds, obligations, mail, calendar, tasks) |
-| `mail.accounts` | `[]` | Explicit Himalaya accounts (empty = no private mail) |
-| `calendar.accounts` / `calendar.calendars` | `[]` | Explicit calendar account/ID selection |
-| `tasks.lists` / `tasks.adapter` | `[]` / `""` | Task lists and adapter name |
-| `public_interests` / `public_sources` | `[]` | Public interests and vetted source specs |
-| `adaptive.mode` / `privacy_review` / `inferred_goals` | `"disabled"` | Adaptive discovery + paired privacy review |
-| `bounds.*` | `60` | Collector budget, candidate cap, per-run source cap |
-| `adapters.productivity_secretary` | `false` | Optional compatibility calendar/tasks library |
-| `adapters.gws_calendar` | `false` | Optional Google Workspace calendar adapter |
+| Requested reminder (exact-time or event-bound) | No; distinct deterministic policy | No |
+| Ordinary alert, discovery or approval request | Yes; shared ceiling, cooldown and dedupe | Yes, when supported |
+| Artifact-ready private-preparation notice | Yes; same ceiling/cooldown/dedupe | No extra model call |
+| Model-outage notice | Yes; subject to pause/quiet/attention | Never |
 
-### Optional Google Workspace calendar adapter
+The default is **5 per local day**, configurable to **any nonnegative integer**. It is a ceiling, never a target; zero useful reasons means zero messages. Zero suppresses ordinary discretionary messages only, not collection, requested reminders or a genuine operational notice. Urgent evidence uses the existing urgency policy. Quiet hours default to 00:00-08:00; start equal to end gives a zero-length window. Requested reminders bypass quiet hours, cap and cooldown, but never a global pause or the explicit-provenance requirement.
 
-When `adapters.gws_calendar` is enabled and calendars are named, calendar reads
-go through the already-installed `productivity/google-workspace` skill CLI
-(`google_api.py calendar list`) using the active `HERMES_HOME` authorisation.
-The adapter runs a fixed, read-only argv, parses the native JSON contract and
-requires absolute offsets; it fails closed (naming the disabled capability) on a
-missing skill, missing dependency, absent token, unsupported account routing,
-malformed response, non-zero exit or timeout. Readiness probing never refreshes
-or reads a token value and never calls a connector API; a real source call only
-happens after you explicitly enable the adapter. There is no Google Tasks
-command in that surface, so no Tasks adapter is invented.
+## What it monitors, and what it does not
 
-## Configuration reference
+With explicitly configured and authorised connectors it can read mail metadata through Himalaya for exactly the accounts in `mail.accounts` (never bodies beyond a short redacted preview), calendar/tasks through the external productivity-secretary library or calendar through the optional Google Workspace adapter, and public feeds/pages you explicitly save from public keyless endpoints.
 
-A generic default ships at `policy/policy.default.json`. Setup copies it to the
-data directory as `policy.json`. This legacy policy file remains the runtime
-default (its shipped timezone is `Asia/Singapore`); the neutral user
-configuration above defaults to `UTC` and only overrides what it defines.
-Notable keys:
+With no private connector it is public-source monitoring only. It does not send mail, mutate calendars or tasks, book, purchase, publish, or perform any external action; guarantee complete coverage (blocked, failed, deferred and truncated sources are recorded separately); cover undated tasks; confirm delivery; or fabricate urgency, personal fit, location or a deadline.
 
-| Key | Default | Meaning |
-|---|---|---|
-| `persona` | `"Hermes"` | Name used in the evaluator prompt |
-| `notify_address` | `"the user"` | How the evaluator addresses you |
-| `timezone` | `"Asia/Singapore"` | Display/reference timezone |
-| `quiet_start_hour` / `quiet_end_hour` | `0` / `8` | Quiet hours (urgent may bypass) |
-| `daily_normal_cap` | `3` | Max ordinary alerts per day |
-| `cooldown_minutes` | `30` | Minimum gap between deliveries |
-| `feeds_enabled` / `obligations_enabled` | `true` | Public feeds / mail obligations |
-| `feed_seed_sources` | `[]` | **Empty by default** — add your own public sources |
-| `adaptive_mode` | `"disabled"` | Keep disabled unless you want adaptive discovery |
-| `location_context_enabled` | `false` | Local phone context is opt-in and off by default |
-| `native_render_fallback_enabled` / `native_render_consent` | `false` | Opt-in bounded JS-shell rendering (needs a host renderer) |
-| `firecrawl_enabled` / `firecrawl_consent` | `false` | Opt-in Firecrawl extract via native `ctx.call_mcp` (host OAuth) |
-| `firecrawl_mcp_server` / `firecrawl_mcp_tool` | `""` | Named MCP server/tool (never an endpoint or a key) |
-| `firecrawl_max_attempts_per_cycle` / `firecrawl_max_attempts_per_day` | `1` / `10` | Local metered-attempt ceilings (not paid credits) |
-| `firecrawl_concurrency` / `firecrawl_timeout_seconds` | `1` / `30` | Bounded concurrent calls / call timeout |
-| `firecrawl_cooldown_minutes` / `firecrawl_cache_ttl_minutes` | `60` / `60` | 429 cooldown / repeat-scrape freshness |
-| `evaluator.toolset` | `"context_engine"` | Must resolve to zero tools |
-| `evaluator.hermes_bin` / `evaluator.profile` | unset | Override the native binary/profile |
+## Onboarding, memory and consent
 
-### Adding public sources
+Onboarding asks only for missing or conflicting facts. It can seed known values from an existing effective configuration, but does not treat generated neutral defaults as user decisions. Foreground memory may be proposed through the `secretary_onboarding` tool. This is deliberately **not** a new memory-provider API and not a background scrape. For context, the scheduled pipeline never scrapes USER/MEMORY/Hindsight/Library, credentials or connectors, and never creates a new allowlist. Conflicting facts require explicit resolution.
 
-`feed_seed_sources` ships **empty**. Add entries you have vetted, for example:
+Proposals grant no source access; only an explicit typed permission decision does. `resume` reports actual readiness and never claims monitoring is active when no owned job is recorded.
 
-```json
-{
-  "kind": "github_releases",
-  "url": "https://api.github.com/repos/<owner>/<repo>/releases",
-  "provenance": "configured by me",
-  "interest": "release notes",
-  "cadence_minutes": 360
-}
-```
+## Requested reminders
 
-The `kind` must be one the bundled parsers support (for example
-`github_releases`, `reddit_rss`, `rss_atom`, `web_page`, `nea_forecast`,
-`ntu_json`, `ntu_opportunity`, `smrt_notice`, `cna_rss`). Only add public,
-keyless endpoints you trust.
-
-### Routed retrieval fallbacks (v0.4.0, opt-in, off by default)
-
-The direct DNS-pinned public HTTPS transport is always the default. A 200
-JavaScript shell on a public page may *optionally* be rendered by a
-host-supplied, constrained renderer, and Firecrawl may *optionally* be used as a
-metered extraction backend — but **only** when you set the enable **and** consent
-flag for that route and a verified host interface exists. Both are reported
-candidly by `hermes secretary status` / `doctor`: when unavailable, the honest
-reason is shown and nothing is faked.
-
-```json
-{
-  "native_render_fallback_enabled": false,
-  "native_render_consent": false,
-  "firecrawl_enabled": false,
-  "firecrawl_consent": false,
-  "firecrawl_mcp_server": "",
-  "firecrawl_mcp_tool": "",
-  "firecrawl_max_attempts_per_cycle": 1,
-  "firecrawl_max_attempts_per_day": 10,
-  "firecrawl_concurrency": 1,
-  "firecrawl_timeout_seconds": 30,
-  "firecrawl_cooldown_minutes": 60,
-  "firecrawl_cache_ttl_minutes": 60,
-  "retrieval_fallback_max_bytes": 2097152
-}
-```
-
-- A `blocked` challenge/interstitial/paywall/login page is **terminal**: it is
-  never rendered, bypassed, or treated as evidence. Fallback applies only to a
-  `dynamic` JS shell. A private/SSRF-rejected URL is denied *before* any metered
-  attempt is reserved.
-- The generic shared Hermes browser is deliberately **not** reused (owner
-  session/cookies, SSRF/subresource surface). Without a host-injected
-  constrained renderer the native-render capability is reported unavailable.
-- Firecrawl goes through the **supported native plugin contract**
-  `ctx.call_mcp(server, tool, arguments, timeout)`: the host owns the OAuth
-  connection and the MCP allowlist. This plugin embeds no endpoint, key or OAuth
-  client, and sends only one narrow request
-  (`{"url": <public-https-url>, "formats": ["markdown"]}`) to the one configured
-  server/tool. The remote tool schema is host-owned; until a verified reference
-  is supplied it is reported as unverified rather than guessed.
-- Every Firecrawl call is a **reserved, persisted local attempt**: ceilings are
-  enforced per cycle and per UTC day, shared across collectors and restarts, with
-  a provider 429 cooldown. A failed attempt still consumes the reserved attempt.
-  Local attempt counts are **not** provider billing credits, and the plugin never
-  switches to another metered service when a budget is exhausted — it defers.
-
-
-### Paths and overrides
-
-- `HERMES_HOME` selects the profile home (default `~/.hermes`).
-- `HERMES_PROACTIVE_SECRETARY_DATA` overrides the runtime data root.
-- `HERMES_AGENT_SRC` / `SECRETARY_SRC` override the native agent and
-  productivity-secretary source locations.
-- `HERMES_BIN` overrides the `hermes` binary used for the cron surface.
-
-## Troubleshooting
-
-- **setup: "cron surface unavailable"** — `hermes cron` is not reachable.
-  Fix that first; `--no-cron` only performs an offline check and creates nothing.
-- **doctor fails** — read the failing check name. Missing launchers or policy
-  mean an incomplete plugin tree; a failing cron check means the scheduler is
-  unavailable.
-- **No alerts** — run `hermes secretary status`, then
-  `hermes secretary run-once --check` for a coverage diagnostic. An empty result
-  is not proof of healthy collection.
-- **Reminder did not fire** — inspect the registry list/status; overlap makes a
-  dispatch skip silently by design, and `emitted` is not delivery-confirmed.
-- **Corrupt state/preferences** — the runtime fails closed instead of re-sending.
-  Restore from a known-good file; do not delete the lock to "fix" a symptom.
-
-## Uninstall
+Requested reminders live in a durable owner-only registry and dispatch once, deterministically and without a model:
 
 ```bash
-hermes secretary uninstall          # pause + remove this plugin's two cron jobs
+hermes secretary reminders list
+hermes secretary reminders status
+```
+
+Event reminders use typed IDs and only the explicit `calendar.accounts`/`calendar.calendars` boundary; mail accounts are never unioned into calendar authorisation. A disabled or empty calendar scope reads no event source while an exact-time reminder still works. `emitted` is not delivery-confirmed, and hard punctuality is not promised.
+
+## Private preparation (opt-in, off by default)
+
+Preparation is off by default. `preparation.enabled` alone arms nothing, reads nothing and grants no scope. When explicitly enabled **and** the host has a verified configured-only model lane: deterministic gates check configuration, enablement, pause, scope and readiness; at most one due **accepted** responsibility is atomically claimed; one bounded structured draft is produced; the deterministic writer checks citations, safe content and SHA-256, then writes one owner-only Markdown/text artifact; a later pipeline run may emit one fixed, opaque "draft is ready" notice through the ordinary attention path.
+
+To install the owned preparation runner and its one native `--no-agent` script job, opt in explicitly:
+
+```bash
+hermes secretary setup --with-preparation --deliver local
+```
+
+The scope vocabulary is exactly `conversation`, `public`, `mail`, `calendar`, `tasks`, `documents`, `memory`. Broad `public` consent never implies a private scope. A source change, cancellation, pause or scope revocation invalidates stale work before commit. Artifacts are private drafts, not user documents.
+
+Handoff never executes. `hermes secretary responsibilities handoff --id <opaque-id>` prints the current generation, hash and target for ordinary foreground approval; any send, book, purchase, publish or calendar/task mutation still requires your exact approval through normal Hermes tools. On a host without the strict contract, `hermes secretary prepare` reports the limitation and leaves the unit unclaimed.
+
+## Public discovery and privacy
+
+Public discovery is off by default. Add only public, keyless sources you trust, for example through `hermes secretary watch add "<public topic>"` or explicit `public_sources` entries. Supported parser kinds include `github_releases`, `reddit_rss`, `rss_atom`, `web_page`, `nea_forecast`, `ntu_json`, `ntu_opportunity`, `smrt_notice` and `cna_rss`.
+
+When adaptive discovery is explicitly enabled, its query boundary is public and bounded. Queries come from explicit public interests/watches, or tentative inferred goals only if you separately enable them; private facts are never turned into public queries, and a broad public grant never authorises a private source or scope. Discovered content is untrusted evidence, never instructions. Enabling a source does not grant permission to read a different source.
+
+## Optional integrations
+
+These are optional and off by default; they do not ship with credentials.
+
+- **Himalaya mail**: install and authorise the CLI, then name accounts in `mail.accounts`. Credential presence is not permission.
+- **Productivity-secretary library**: point `SECRETARY_SRC` or `PRODUCTIVITY_SECRETARY_SRC` at an existing authorised installation. Calendar/tasks are read-only.
+- **Google Workspace calendar**: enable `adapters.gws_calendar` only after the installed `productivity/google-workspace` skill and its existing authorisation are confirmed. The adapter is calendar-read only; there is no verified Google Tasks command and no invented Tasks support.
+- **LTA/regional public feeds**: generic examples of supported public-source kinds, not defaults and not tied to any user's location.
+
+See the connector limits and configuration sections in [AGENT_SETUP.md](AGENT_SETUP.md) before enabling a private connector.
+
+## Data, privacy and paths
+
+Runtime state is owner-only (`0700` directories, `0600` files) under the active profile's `plugin-data/hermes-proactive-secretary/`. It contains the policy copy, preferences, user configuration, durable reminders, locks, scheduler/runner ownership ledgers and preparation artifacts, and is never written into the installed plugin tree. One shared owner-path helper resolves the host's context-local active profile for every foreground and preparation owner: runtime data/state/policy/preferences/config, scheduler ledgers and script locations, the enabled gate, and source/connector/token locations. A routed context therefore uses its own profile's home rather than the process launch profile. `HERMES_PROACTIVE_SECRETARY_DATA` is a launch-profile/standalone override only: it is honored when the effective home is the process's own launch profile, while a routed foreign profile ignores it instead of borrowing the launch profile's data. `HERMES_HOME` selects the profile only for standalone use when the host profile API is not installed. If a present host profile getter or launch scope cannot be resolved, every owner fails closed; none falls back to the launch profile or ambient environment. Explicit operator-configured external locations (for example `SECRETARY_SRC`, `HERMES_AGENT_SRC`, an explicit calendar home, or an explicit artifact root) remain explicit and are never silently rewritten under the active profile.
+
+Credentials and OTP messages are never fetched or stored. URLs and codes are redacted from previews. Source content is treated as untrusted evidence. Public retrieval can contact external services; judgment can use the user's configured model provider when the host supports the strict lane. Read-only does not mean offline.
+
+## Migration and uninstall
+
+Preview and import an existing deployment's own durable state; never import another person's deployment:
+
+```bash
+hermes secretary setup --import-from '<legacy-tree>' --import-dry-run
+hermes secretary setup --import-from '<legacy-tree>'
+hermes secretary configure migrate --from-policy '<legacy-policy.json>' --dry-run
+```
+
+Import refuses conflicting targets, rejects symlinks and path traversal, copies owner-only, and never deletes or adopts legacy cron jobs. Migration preserves explicit scope, aliases, interests and adapters; it never moves the global pause into settings.
+
+To stop and remove only this plugin's own jobs and runners while preserving private runtime data:
+
+```bash
+hermes secretary disable
 hermes plugins disable hermes-proactive-secretary
 hermes plugins remove hermes-proactive-secretary
 ```
 
-`uninstall` pauses collection/delivery and removes only this plugin's own jobs.
-Runtime data — including anything brought in by `--import-from` — is preserved;
-add `--purge` only with explicit approval to delete it. A native `hermes plugins disable` on its own leaves
-the schedules inert but present, so run `hermes secretary disable` before a
-native removal to clean up this plugin's own jobs and launchers.
+`hermes secretary uninstall` is an alias of disable. `--purge` deletes runtime data and requires separate explicit approval; there is no need for a separate manual deletion step. A native `plugins disable` on its own leaves owned schedules present but inert until `hermes secretary disable` removes them. Reinstall may preserve a global pause; review state and resume deliberately.
 
-## Development
+## Troubleshooting
+
+- **`cron surface unavailable`**: fix `hermes cron` first. `--no-cron` performs offline checks and creates nothing.
+- **`doctor` fails**: read the failing check name. Missing launchers or policy mean an incomplete tree; a failing cron check means the scheduler is unavailable.
+- **No alerts**: run `hermes secretary status`, then `hermes secretary run-once --check`. An empty result is not proof of healthy collection; silence is the expected default.
+- **Reminder did not fire**: inspect `hermes secretary reminders list` and `status`. Overlap skips silently by design; `emitted` is not delivery-confirmed.
+- **Pause did not take**: pause is global. Use `hermes secretary resume` to clear it; requested reminders also wait while paused.
+- **Model-dependent work says unsupported**: the host lacks the explicit configured-only contract. Deterministic controls and reminders still work; do not claim a fallback ladder.
+- **Corrupt state or preferences**: the runtime fails closed. Restore a known-good file; do not delete the lock to "fix" a symptom.
+
+## Development and release
+
+Maintainer commands from the source tree, using a Python environment with the Hermes runtime and test dependencies already available (`python3` below must refer to that environment):
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
 PYTHONPATH=src python3 -m proactive_pilot.selftest
-hermes plugins doctor . --ci
-hermes plugins validate .
+python3 release_export.py scan
+python3 release_export.py build --output ./dist/hermes-proactive-secretary-0.5.0.tar.gz
+python3 release_export.py doctor --installed /path/to/extracted-package
 ```
+
+`release_export.py` builds a deterministic code-only archive, excludes tests, runtime state and `.build-context`, verifies the manifest/module version and scans for personal paths. `doctor` validates package-local files, imports the extracted entrypoints and delegates host validation to `hermes plugins doctor --ci` under an isolated profile. These commands validate packaging; they do not constitute live delivery, connector, model or device qualification.
+
+## Qualification and limitations
+
+The 0.5.0 candidate has automated isolated test evidence. Live host/device qualification is still pending: real Telegram delivery, Desktop form interaction, real connector reads, real model calls, the strict host patch and mobile canaries are not claimed here.
+
+0.5.0 remains limited: delivery is unconfirmed, source coverage is bounded, quiet/attention behavior is deterministic but not omniscient, and model-dependent features require a compatible host. Validate the exact connectors and messaging route you intend to use.
+
+For agent-assisted installation, give your agent [AGENT_SETUP.md](AGENT_SETUP.md). The operational skill is [skills/proactive-secretary/SKILL.md](skills/proactive-secretary/SKILL.md).
 
 ## License
 
-MIT — see `LICENSE`.
+MIT. See [LICENSE](LICENSE).

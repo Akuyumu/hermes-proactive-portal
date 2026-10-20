@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from unittest import mock
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -469,7 +470,8 @@ class SafeErrorTests(unittest.TestCase):
                 raise C.SourceTimeout("expired mid-fetch")
         C._calendar_client = lambda alias: _Client()
         try:
-            res = C.collect_calendar("primary", clock=_clock(), timeout=1)
+            with mock.patch.object(C, "secretary_library_error", return_value=""):
+                res = C.collect_calendar("primary", clock=_clock(), timeout=1)
         finally:
             C._calendar_client = orig
         self.assertEqual(res.status, "ok")

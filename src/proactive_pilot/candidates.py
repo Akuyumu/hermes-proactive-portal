@@ -307,7 +307,7 @@ def build_packet(
         "schema": SCHEMA_VERSION,
         "generated_at": now.isoformat(),
         "quiet_hours": _quiet_label(policy),
-        "daily_normal_cap": int(policy.get("daily_normal_cap", 3)),
+        "daily_normal_cap": int(policy.get("daily_normal_cap", 5)),
         "coverage": coverage,
         "known_task_refs": list(baseline.get("task_refs", []))[:200],
         "candidates": selected,

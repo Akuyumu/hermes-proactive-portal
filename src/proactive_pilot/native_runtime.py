@@ -9,9 +9,10 @@ gate stay authoritative.
 
 Guarantees:
 
-* Model calls go only through the host-owned ``ctx.llm`` facade, defaulting to
-  the user's active provider/model. No provider/model/agent/profile override is
-  ever requested, so no trust flag is needed and none can be widened.
+* Model calls go only through the host-owned ``ctx.llm`` facade and only after
+  the registered configured-only guard allows this exact context. No provider/
+  model/agent/profile override is ever requested, so no trust flag is needed and
+  none can be widened. An unbound/foreign context is denied before dispatch.
 * Every call is attributable: we pass a ``purpose`` and record which route was
   used (``ctx.llm`` vs ``unsupported``) without capturing raw prompts/secrets.
 * The reminder dispatcher (and every known disabled/paused path) is
@@ -23,6 +24,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+# Per-context dispatch guard. The plugin registration binds this AFTER deciding
+# whether the host exposes a real configured-only contract. An unbound context is
+# fail-closed: only the host-built context registered by this plugin may dispatch
+# model work, and a wrong/foreign context cannot borrow another profile's route.
+_MODEL_LANES: dict[int, dict[str, Any]] = {}
+# Optional durable/clock pair bound by the production run for the SAME context.
+# It lets the central LlmRoute boundary record truthful recovery/terminal
+# failures without every caller threading a store into its planner/proposer.
+_HEALTH_LANES: dict[int, dict[str, Any]] = {}
+
 NATIVE_PLUGIN_ID = "hermes-proactive-secretary"
 # Paths that must never spend a model call, ever.
 MODEL_FREE_PATHS = frozenset({"reminder", "disabled", "paused", "public-only"})
@@ -30,6 +41,15 @@ MODEL_FREE_PATHS = frozenset({"reminder", "disabled", "paused", "public-only"})
 # the operator's native config (auxiliary.proactive_secretary); the plugin
 # itself still never names a provider or model.
 AUX_TASK_KEY = "proactive_secretary"
+
+
+def _validated_aux_outcome(value: Any) -> dict[str, Any] | None:
+    """Preserve only the documented strict-host observation attribute."""
+    try:
+        from .modelhealth import validate_aux_route_outcome
+        return validate_aux_route_outcome(value)
+    except Exception:  # noqa: BLE001 - malformed metadata is simply unavailable
+        return None
 
 
 def _aux_task_registered() -> bool:
@@ -43,6 +63,57 @@ def _aux_task_registered() -> bool:
 
 class LlmUnavailable(RuntimeError):
     """No supported host-owned model route is available for this call."""
+
+
+def bind_model_lane(ctx: Any, *, allowed: bool, reason: str = "",
+                    status: dict[str, Any] | None = None) -> None:
+    """Bind this exact host context's model-dispatch decision.
+
+    Called only with the context the host passed to ``register(ctx)`` (or, in
+    tests, an explicit fake). The context object itself is retained so an id
+    reuse after garbage collection cannot inherit the decision.
+    """
+    if ctx is None:
+        return
+    _MODEL_LANES[id(ctx)] = {
+        "ctx": ctx,
+        "allowed": bool(allowed),
+        "reason": str(reason or ""),
+        "status": dict(status or {}),
+    }
+
+
+def bound_model_lane_status(ctx: Any) -> dict[str, Any] | None:
+    """Return the sanitized registration status bound to this exact context."""
+    entry = _MODEL_LANES.get(id(ctx)) if ctx is not None else None
+    if entry is None or entry.get("ctx") is not ctx:
+        return None
+    return dict(entry.get("status") or {})
+
+
+def bind_health_store(ctx: Any, store: Any, clock: Any = None) -> None:
+    """Bind the run's health store for this exact context (best effort)."""
+    if ctx is None or store is None:
+        return
+    _HEALTH_LANES[id(ctx)] = {"ctx": ctx, "store": store, "clock": clock}
+
+
+def _health_for(ctx: Any) -> tuple[Any, Any] | None:
+    entry = _HEALTH_LANES.get(id(ctx)) if ctx is not None else None
+    if entry is None or entry.get("ctx") is not ctx:
+        return None
+    return entry.get("store"), entry.get("clock")
+
+
+def model_lane_allowed(ctx: Any) -> tuple[bool, str]:
+    """Return ``(allowed, reason)`` for this exact context; unbound is denied."""
+    if ctx is None:
+        return False, "no host context supplied"
+    entry = _MODEL_LANES.get(id(ctx))
+    if entry is None or entry.get("ctx") is not ctx:
+        return False, ("secretary model lane is not initialized for this context; "
+                       "fail closed until plugin registration succeeds")
+    return bool(entry.get("allowed")), str(entry.get("reason") or "")
 
 
 def has_native_llm(ctx: Any) -> bool:
@@ -94,7 +165,9 @@ class LlmRoute:
 
     @property
     def available(self) -> bool:
-        return self.kind == "ctx.llm" and has_native_llm(self.ctx)
+        if self.kind != "ctx.llm" or not has_native_llm(self.ctx):
+            return False
+        return model_lane_allowed(self.ctx)[0]
 
     @property
     def calls(self) -> int:
@@ -128,8 +201,9 @@ class LlmRoute:
         Never passes provider/model/agent_id/profile. Raises
         :class:`LlmUnavailable` (with a sanitized reason) when no route exists.
         """
-        if not self.available:
-            raise LlmUnavailable(self.reason or "no supported ctx.llm route")
+        allowed, guard_reason = model_lane_allowed(self.ctx)
+        if not self.available or not allowed:
+            raise LlmUnavailable(guard_reason or self.reason or "no supported ctx.llm route")
         kwargs: dict[str, Any] = {
             "instructions": instructions,
             "input": input,
@@ -148,13 +222,45 @@ class LlmRoute:
             kwargs["task"] = AUX_TASK_KEY
         self._calls += 1
         try:
-            return self.ctx.llm.complete_structured(**kwargs)
+            result = self.ctx.llm.complete_structured(**kwargs)
         except LlmUnavailable:
             raise
         except Exception as exc:  # noqa: BLE001 - sanitized, never leaks provider text
-            raise LlmUnavailable(
-                f"ctx.llm call failed ({type(exc).__name__})"
-            ) from exc
+            error = LlmUnavailable(f"ctx.llm call failed ({type(exc).__name__})")
+            outcome = _validated_aux_outcome(getattr(exc, "aux_route_outcome", None))
+            if outcome is not None:
+                setattr(error, "aux_route_outcome", outcome)
+                self._consume_outcome(outcome)
+            raise error from exc
+        # The strict host emits no success schema. A returned result from the
+        # SAME configured route is still a genuine success (including a fallback
+        # success), so recovery is recorded at this central boundary instead of
+        # being inferred from provider text.
+        self._record_recovery()
+        return result
+
+    def _record_recovery(self) -> None:
+        health = _health_for(self.ctx)
+        if health is None:
+            return
+        store, clock = health
+        try:
+            from . import modelhealth
+            modelhealth.recovery(store, role="route", now=clock.now() if clock else None)
+        except Exception:  # noqa: BLE001 - health bookkeeping never fails a call
+            return
+
+    def _consume_outcome(self, outcome: dict[str, Any]) -> None:
+        health = _health_for(self.ctx)
+        if health is None:
+            return
+        store, clock = health
+        try:
+            from . import modelhealth
+            modelhealth.consume_terminal_outcome(
+                store, outcome, now=clock.now() if clock else None)
+        except Exception:  # noqa: BLE001 - health bookkeeping never masks the call
+            return
 
 
 def build_llm_route(
@@ -175,10 +281,14 @@ def build_llm_route(
                         reason=f"model-free path: {path}")
     if not has_native_llm(ctx):
         return LlmRoute(kind="unsupported", ctx=None, path=path, purpose=purpose,
-                        reason="host contexts does not expose ctx.llm"
+                        reason="host context does not expose ctx.llm"
                         if ctx is not None else "no host context supplied")
+    allowed, guard_reason = model_lane_allowed(ctx)
+    if not allowed:
+        return LlmRoute(kind="unsupported", ctx=None, path=path, purpose=purpose,
+                        reason=guard_reason)
     return LlmRoute(kind="ctx.llm", ctx=ctx, path=path, purpose=purpose,
-                    reason="host-owned active model")
+                    reason="host-owned configured route")
 
 
 def evaluator_route(ctx: Any, policy: dict[str, Any] | None = None) -> LlmRoute:
@@ -258,5 +368,7 @@ def build_model_lane(
 __all__ = [
     "NATIVE_PLUGIN_ID", "MODEL_FREE_PATHS", "LlmUnavailable", "LlmRoute",
     "NativeModelLane", "has_native_llm", "read_native_settings", "native_capabilities",
+    "bind_model_lane", "model_lane_allowed", "bound_model_lane_status",
     "build_llm_route", "build_model_lane", "evaluator_route", "reminder_route",
+    "bind_health_store",
 ]

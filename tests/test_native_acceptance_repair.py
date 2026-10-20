@@ -76,6 +76,8 @@ class FakeCtx:
             self.llm = llm
         self._settings = settings or {}
         self._raise_get = raise_get
+        if llm is not None:
+            nr.bind_model_lane(self, allowed=True, reason="test host lane")
 
     def get_config(self, key, default=None):
         if self._raise_get:

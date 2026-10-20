@@ -79,6 +79,7 @@ class FakeFetcher:
 
 def _policy(seeds=None):
     policy = load_policy(None)
+    policy["timezone"] = "Asia/Singapore"
     policy["feed_seed_sources"] = [] if seeds is None else seeds
     return policy
 
@@ -389,11 +390,12 @@ def test_ntu_absent_date_candidate_is_not_fresh():
 
 def test_cadence_retention_quiet_pause_caps_unchanged():
     policy = load_policy(None)
+    policy["timezone"] = "Asia/Singapore"
     assert policy["feed_max_sources_per_run"] == 2
     assert policy["feed_cadence_minutes"] == 60
     assert policy["max_public_registry"] == 12
     assert policy["public_findings_retention_days"] == 30
-    assert policy["daily_normal_cap"] == 3
+    assert policy["daily_normal_cap"] == 5
     assert policy["cooldown_minutes"] == 30
     assert policy["quiet_end_hour"] == 8
     assert policy["generic_websites_opt_in"] is False

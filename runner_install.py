@@ -1,7 +1,8 @@
-"""Install and own the two native-cron runner scripts.
+"""Install and own the native-cron runner scripts.
 
 The native scheduler runs ``.py`` jobs from the profile's scripts directory
-(``$HERMES_HOME/scripts``). The plugin ships two templates under ``runners/``;
+(``$HERMES_HOME/scripts``). The plugin ships two default templates plus an
+explicit opt-in preparation runner under ``runners/``;
 :func:`install_runners` substitutes the installed plugin root into each and
 writes it into that directory, recording ownership so only files this plugin
 created are ever removed.
@@ -25,6 +26,9 @@ from typing import Any
 RUNNER_FILENAMES = (
     "proactive_secretary_runner.py",
     "proactive_secretary_reminder_runner.py",
+)
+PREPARATION_RUNNER_FILENAMES = (
+    "proactive_secretary_prepare_runner.py",
 )
 PLACEHOLDER = "{{PLUGIN_ROOT}}"
 BACKUP_SUFFIX = ".pre-hermes-proactive-secretary.bak"
@@ -97,12 +101,20 @@ def _atomic_write(target: Path, text: str) -> None:
 
 
 def install_runners(*, plugin_root: Path, template_root: Path, scripts_dir: Path,
-                    ownership_path: Path, now: str | None = None) -> list[dict[str, Any]]:
-    """Install both runner templates into ``scripts_dir`` and record ownership."""
+                    ownership_path: Path, now: str | None = None,
+                    include_preparation: bool = False) -> list[dict[str, Any]]:
+    """Install owned runner templates into ``scripts_dir`` and record ownership.
+
+    The preparation runner is installed only when the caller explicitly opts in
+    (``hermes secretary setup --with-preparation``); merely setting
+    ``preparation_enabled`` in configuration never installs or arms it.
+    """
     installed_at = now or _now()
     ownership = _load_ownership(ownership_path)
     results: list[dict[str, Any]] = []
-    for name in RUNNER_FILENAMES:
+    names = RUNNER_FILENAMES + (
+        PREPARATION_RUNNER_FILENAMES if include_preparation else ())
+    for name in names:
         source = template_root / name
         try:
             text = source.read_text(encoding="utf-8").replace(PLACEHOLDER, str(plugin_root))

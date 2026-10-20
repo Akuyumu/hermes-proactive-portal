@@ -38,6 +38,7 @@ RAW_MARKER = "RAW_RESPONSE_MARKER_XYZ"
 
 def policy(enabled: bool = True, **over) -> dict:
     p = json.loads(json.dumps(DEFAULT_POLICY))
+    p["timezone"] = "Asia/Singapore"
     p["location_context_enabled"] = enabled
     p.update(over)
     return p
@@ -102,7 +103,7 @@ def run_main(tmp: Path, *, fixture: str, getter, enabled: bool = True,
              evaluator=None, over: dict | None = None, prefs: dict | None = None,
              clock_str: str = "2026-10-03T09:00:00+08:00"):
     pol = tmp / "policy.json"
-    body = {"location_context_enabled": enabled}
+    body = {"location_context_enabled": enabled, "timezone": "Asia/Singapore"}
     if over:
         body.update(over)
     pol.write_text(json.dumps(body), encoding="utf-8")

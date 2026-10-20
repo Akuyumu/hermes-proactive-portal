@@ -1,7 +1,8 @@
 """Thin, testable wrapper over the Hermes native cron surface.
 
-The plugin owns exactly two jobs (a 15-minute pilot and a 1-minute requested
-reminder dispatcher). This module speaks to the installed ``hermes cron`` CLI
+The plugin owns two default jobs (a 15-minute pilot and a 1-minute requested
+reminder dispatcher) plus an explicit opt-in preparation script job that is
+never armed merely by enabling preparation. This module speaks to the installed ``hermes cron`` CLI
 through a small :class:`CronBackend` protocol so the CLI logic can be unit
 tested without a live scheduler.
 
@@ -37,12 +38,15 @@ from typing import Any, Callable, Protocol
 
 PILOT_SCRIPT = "proactive_secretary_runner.py"
 REMINDER_SCRIPT = "proactive_secretary_reminder_runner.py"
+PREPARATION_SCRIPT = "proactive_secretary_prepare_runner.py"
 
 # Namespaced to this plugin so a pre-existing unrelated job of a generic name can
 # never be matched (and therefore never removed) by accident.
 PILOT_JOB_NAME = "hermes-proactive-secretary-pilot"
 REMINDER_JOB_NAME = "hermes-proactive-secretary-reminders"
+PREPARATION_JOB_NAME = "hermes-proactive-secretary-preparation"
 OWNED_JOB_NAMES: tuple[str, ...] = (PILOT_JOB_NAME, REMINDER_JOB_NAME)
+OPTIONAL_JOB_NAMES: tuple[str, ...] = (PREPARATION_JOB_NAME,)
 OWNED_PLUGIN = "hermes-proactive-secretary"
 JOB_OWNERSHIP_SCHEMA = 1
 
@@ -270,6 +274,61 @@ class HermesCronBackend:
             raise CronError(f"cron list failed (exit {proc.returncode}): {(proc.stderr or '').strip()[:200]}")
         return parse_cron_list(proc.stdout)
 
+    def list_jobs_for_status(self) -> list[dict[str, Any]]:
+        """Read jobs in-process through the native read-only cron API.
+
+        Status is a projection, not a scheduler command. Spawning another
+        managed runtime here can start a dependency installer under a
+        synthetic/empty profile, so status prefers this in-process read. The
+        native ``cron.jobs.list_jobs`` already normalizes ``load_jobs`` and is
+        read-only; it is never used by ``ensure_job``/``remove_job``. When the
+        native API is missing or cannot be proven to belong to the active
+        profile, raise :class:`CronError` so callers keep the honest
+        recorded-but-unverified state instead of falling back to the CLI.
+        """
+        try:
+            from cron import jobs as native_jobs
+        except Exception as exc:  # noqa: BLE001 - absent/shadowed SDK degrades
+            raise CronError(f"native cron listing is unavailable: {exc}") from exc
+        reader = getattr(native_jobs, "list_jobs", None)
+        if not callable(reader):
+            raise CronError("native cron.jobs.list_jobs is unavailable")
+        try:
+            from hermes_constants import get_hermes_home
+        except Exception as exc:  # noqa: BLE001 - cannot prove the profile binding
+            raise CronError(f"native profile binding is unavailable: {exc}") from exc
+        expected = os.environ.get("HERMES_HOME")
+        if expected:
+            try:
+                bound = Path(get_hermes_home()).resolve()
+            except Exception as exc:  # noqa: BLE001 - binding cannot be verified
+                raise CronError(f"native profile binding is unavailable: {exc}") from exc
+            if bound != Path(expected).resolve():
+                raise CronError("native cron API is not bound to the active profile")
+        try:
+            try:
+                rows = reader(include_disabled=True)
+            except TypeError:
+                rows = reader()
+        except Exception as exc:  # noqa: BLE001 - recorded/unverified is honest
+            raise CronError(f"native cron listing failed: {exc}") from exc
+        if not isinstance(rows, (list, tuple)):
+            raise CronError("native cron listing returned an unexpected shape")
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item = dict(row)
+            item["id"] = str(row.get("id") or row.get("job_id") or "")
+            item["name"] = str(row.get("name") or "")
+            if not item.get("state"):
+                item["state"] = "active" if row.get("enabled", True) else "paused"
+            if not item.get("next_run"):
+                item["next_run"] = str(
+                    row.get("next") or row.get("next_run_at") or "")
+            normalized.append(item)
+        return normalized
+
     def add_job(self, spec: CronJobSpec) -> dict[str, Any]:
         argv = self._cron_argv(
             self.create_verb, spec.schedule,
@@ -493,9 +552,15 @@ class InMemoryCronBackend:
         return {"id": job_id, "removed": True}
 
 
-def build_job_specs(*, deliver: str = "local", workdir: str = "") -> list[CronJobSpec]:
-    """Build the two canonical jobs this plugin owns."""
-    return [
+def build_job_specs(*, deliver: str = "local", workdir: str = "",
+                    include_preparation: bool = False) -> list[CronJobSpec]:
+    """Build the canonical jobs this plugin owns.
+
+    Preparation is a separate explicit opt-in: ``preparation_enabled`` in the
+    user configuration never arms anything by itself. Only
+    ``hermes secretary setup --with-preparation`` passes ``True`` here.
+    """
+    specs = [
         CronJobSpec(
             name=PILOT_JOB_NAME,
             schedule="*/15 * * * *",
@@ -513,3 +578,14 @@ def build_job_specs(*, deliver: str = "local", workdir: str = "") -> list[CronJo
             description="Requested-reminder dispatcher (every 1 minute)",
         ),
     ]
+    if include_preparation:
+        specs.append(CronJobSpec(
+            name=PREPARATION_JOB_NAME,
+            schedule="*/10 * * * *",
+            script=PREPARATION_SCRIPT,
+            deliver="local",
+            workdir=workdir,
+            description=("One bounded private-preparation unit (no-agent script; "
+                         "silent unless an artifact is queued)"),
+        ))
+    return specs

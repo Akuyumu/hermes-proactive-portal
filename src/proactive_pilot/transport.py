@@ -3,7 +3,7 @@
 Owner directive: the LTA DataMall API must NOT be polled on a fixed cadence (to
 avoid API abuse and a banned key). It is fetched only when a bounded, cheap
 PRE-FILTER finds candidate travel facts AND the plugin auxiliary MODEL LANE
-judges that Kuyu may travel by MRT/LRT within about the next two hours.
+judges whether the user is likely to travel by MRT/LRT within about the next two hours.
 
 Design (all fail-closed):
 
@@ -306,7 +306,7 @@ def _model_instruction(facts: TransportFacts, now: datetime) -> str:
         "lta_disruption_standing": facts.disruption_standing,
     }
     return (
-        "You decide whether a person in Singapore is likely to travel by MRT/LRT "
+        "You decide whether this user is likely to travel by MRT/LRT "
         "within about the next 2 hours, using ONLY the bounded facts below. "
         "Answer with a strict JSON object and nothing else: "
         '{"travel_likely": <true|false>, "reason": "<short reason>"}. '

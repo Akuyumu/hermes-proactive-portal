@@ -23,17 +23,16 @@ EXCLUDED_FILES = {
     "PLUGIN_CHECKPOINT.md",
     "PLUGIN_REPORT.md",
     "test_sanitisation.py",
+    "release_export.py",
 }
 
 # Release operators may provide private forbidden terms without shipping them.
-FORBIDDEN_TERMS = ("-sama", *filter(None, os.environ.get("SECRETARY_FORBIDDEN_IDENTIFIERS", "").split(",")))
+FORBIDDEN_TERMS = ("-sama", "Kuyu",
+                   *filter(None, os.environ.get("SECRETARY_FORBIDDEN_IDENTIFIERS", "").split(",")))
 ABSOLUTE_HOME_RE = re.compile(r"/(?:home|Users)/[A-Za-z0-9._-]+")
 
-SHIPPED_DIRS = ("src", "policy", "skills", "runners")
-SHIPPED_FILES = (
-    "plugin.yaml", "__init__.py", "paths.py", "cron.py", "secretary_cli.py",
-    "runner_install.py", "runtime_gate.py", "state_import.py", "README.md", "LICENSE", ".gitignore",
-)
+SHIPPED_DIRS = ("src", "policy", "skills", "runners", "public_samples")
+SHIPPED_SUFFIXES = (".py", ".md", ".json", ".yaml", ".yml", ".html", ".txt")
 
 
 def _shipped_files():
@@ -49,10 +48,12 @@ def _shipped_files():
             if path.name in EXCLUDED_FILES:
                 continue
             yield path
-    for name in SHIPPED_FILES:
-        path = ROOT / name
-        if path.is_file():
-            yield path
+    for path in sorted(ROOT.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in SHIPPED_SUFFIXES:
+            continue
+        if path.name in EXCLUDED_FILES or path.name.startswith("."):
+            continue
+        yield path
 
 
 def _read(path: Path) -> str:

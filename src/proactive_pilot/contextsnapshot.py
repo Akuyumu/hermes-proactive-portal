@@ -513,6 +513,14 @@ def inspect_metadata(view: SnapshotView) -> dict[str, Any]:
 
 
 def _write(store: Any, data: dict[str, Any], now: datetime) -> None:
+    # The writer enforces the SAME bounds the reader validates. A legitimate
+    # operation must never persist a snapshot its own reader immediately rejects.
+    entries = data.get("entries")
+    revoked = data.get("revoked")
+    if not isinstance(entries, dict) or len(entries) > MAX_ENTRIES:
+        raise ContextSnapshotError("refusing to write an over-cap entry collection")
+    if not isinstance(revoked, dict) or len(revoked) > MAX_REVOKED:
+        raise ContextSnapshotError("refusing to write an over-cap tombstone collection")
     data["updated_at"] = _now_aware(now).isoformat()
     store.save(CONTEXT_FILE, data)
 
@@ -535,6 +543,18 @@ def update_context_entry(store: Any, fields: dict[str, Any], now: datetime,
         if str(entry["id"]) in (data.get("revoked") or {}):
             raise ContextSnapshotError("entry id was revoked and cannot be revived")
         entries = dict(data.get("entries") or {})
+        # Reclaim EXPIRED entries before enforcing the live-entry cap. Expiry is
+        # not revocation: dropping an expired record is the documented lifecycle
+        # and does not create (or need) a tombstone.
+        now_aware = _now_aware(now)
+        for expired_id, expired_entry in list(entries.items()):
+            try:
+                expiry = _now_aware(datetime.fromisoformat(
+                    str(expired_entry.get("expires_at") or "").strip()))
+            except (ValueError, TypeError):
+                continue
+            if expiry <= now_aware:
+                entries.pop(expired_id, None)
         existing = entries.get(str(entry["id"]))
         if isinstance(existing, dict) and str(existing.get("created_at") or "").strip():
             # Preserve the original creation time across updates.
@@ -569,6 +589,12 @@ def revoke_context_entry(store: Any, entry_id: str, now: datetime,
         entries.pop(target, None)
         data["entries"] = entries
         revoked = dict(data.get("revoked") or {})
+        if target not in revoked and len(revoked) >= MAX_REVOKED:
+            # Fail closed BEFORE mutating: the existing snapshot stays valid and
+            # no previously withdrawn id is ever pruned/resurrected.
+            raise ContextSnapshotError(
+                f"revocation limit reached ({MAX_REVOKED}); existing revocations "
+                "are retained so withdrawn context can never be revived")
         revoked[target] = _now_aware(now).isoformat()
         data["revoked"] = revoked
         _write(store, data, now)

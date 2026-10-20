@@ -163,6 +163,7 @@ def test_scoped_snooze_and_global_pause():
 
 def test_digest_wake_short_circuit():
     policy = json.loads(json.dumps(DEFAULT_POLICY))
+    policy["timezone"] = "Asia/Singapore"
     state = {"last_inference": {"digest": "abc", "quiet_suppressed": False, "pending": False}}
     assert should_skip_inference(state, "abc", NOW, policy) is True
     assert should_skip_inference(state, "def", NOW, policy) is False

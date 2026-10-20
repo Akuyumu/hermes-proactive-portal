@@ -54,6 +54,7 @@ class ScheduledHealthTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.policy = deepcopy(DEFAULT_POLICY)
+        self.policy["timezone"] = "Asia/Singapore"
         self.policy.update(mail_accounts=["critical", "peer"], calendar_enabled=False,
                            tasks_enabled=False, feeds_enabled=False, obligations_enabled=False,
                            productivity_secretary_enabled=False, mail_preview_items=0,

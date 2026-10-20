@@ -49,3 +49,6 @@ PLUGIN_CHECKPOINT.md
 # Parent-run finalization harness and its generated artifacts (never shipped)
 finalization/
 
+# Build-workstream context/reports are not part of the shipped plugin
+.build-context/
+/tmp*/

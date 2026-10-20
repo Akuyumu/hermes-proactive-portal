@@ -44,7 +44,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from .clock import Clock, SeededClock
+from .alertrefs import remember_alert
+from .clock import Clock, SeededClock, build_clock
 from .feedback import FeedbackError, load_preferences_file
 from .policy import active_snooze, load_policy
 from .state import CorruptStateError, StateStore
@@ -1048,6 +1049,9 @@ def main(
             print(f"proactive-followthrough: user configuration invalid, failing closed: {cfg_error}",
                   file=sys.stderr)
             return 1
+        clock = build_clock(policy.get("timezone"), args.seeded_clock)
+        now = clock.now()
+        store = StateStore(Path(args.state_dir), clock)
         with store.lock() as acquired:
             if not acquired:
                 _diag({"diagnostic": "skip-lock", "reason": "another run holds the lock"})
@@ -1137,6 +1141,9 @@ def _dispatch(store: StateStore, args: Namespace, clock: Clock, now: datetime, *
               file=sys.stderr)
         _emit("")
         return 1
+    clock = build_clock(policy.get("timezone"), getattr(args, "seeded_clock", None))
+    now = clock.now()
+    store = StateStore(store.root, clock)
     getter = getter or SecretaryEventGetter(aliases=configured_aliases, policy=policy)
     with store.lock() as acquired:
         if not acquired:
@@ -1180,11 +1187,37 @@ def _dispatch(store: StateStore, args: Namespace, clock: Clock, now: datetime, *
         save_registry(store, working, now)
         message = combine_messages(plan.messages)
         _emit(message)
+        _remember_reminder_alert(native_ctx, working, plan.emitting, policy, now)
         if plan.emitting:
             finalize_dispatch(working, plan.emitting, now=now)
         prune_registry(working, now)
         save_registry(store, working, now)
         return 0
+
+
+def _remember_reminder_alert(native_ctx: Any, registry: dict[str, Any],
+                             emitting_ids: list[str], policy: dict[str, Any],
+                             now: datetime) -> None:
+    """Persist bounded reminder refs for safe mobile follow-up context."""
+    facade = getattr(native_ctx, "state", None) if native_ctx is not None else None
+    if facade is None or not emitting_ids:
+        return
+    reminders = registry.get("reminders") if isinstance(registry.get("reminders"), dict) else {}
+    refs = []
+    for rid in emitting_ids[:3]:
+        row = reminders.get(str(rid))
+        if isinstance(row, dict):
+            refs.append({"ref": rid, "version": row.get("version", ""),
+                         "source": "reminder"})
+    try:
+        remember_alert(
+            facade, signature="reminder:" + ",".join(str(i) for i in emitting_ids[:3]),
+            kind="reminder", candidate_refs=refs,
+            destination=policy.get("deliver_target") or "",
+            emitted_at=now.isoformat(),
+        )
+    except Exception:  # noqa: BLE001
+        return
 
 
 if __name__ == "__main__":

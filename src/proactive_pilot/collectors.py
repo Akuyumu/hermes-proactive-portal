@@ -17,6 +17,10 @@ Hard rules:
   passes ``--seen`` (seen state is untouched). Only a short, redacted preview is
   retained; credential/OTP messages are never fetched and raw bodies are never
   written anywhere.
+- Source/library locations follow the host's context-local active profile. The
+  documented standalone HERMES_HOME/``~/.hermes`` fallback is used only when the
+  host profile module is genuinely absent; an explicit operator override remains
+  explicit.
 """
 from __future__ import annotations
 
@@ -33,6 +37,8 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import urlencode
+
+from . import ownerpaths as _ownerpaths
 
 
 class SecretaryLibraryUnavailable(RuntimeError):
@@ -51,16 +57,17 @@ SECRETARY_SRC_ENV_ALT = "PRODUCTIVITY_SECRETARY_SRC"
 def secretary_src_candidates() -> list[str]:
     """Ordered candidate locations for the productivity-secretary ``src`` dir.
 
-    Order: explicit env override, then ``$HERMES_HOME/productivity-secretary/src``,
-    then ``~/productivity-secretary/src``. Never a hardcoded personal path, and
-    never an assumption that the library lives under ``$HERMES_HOME``.
+    Order: explicit operator env override, then the active profile's
+    ``productivity-secretary/src``, then ``~/productivity-secretary/src``. An
+    explicit override is never rewritten to a profile path. A present host
+    profile that cannot be resolved fails closed instead of reading the launch
+    profile's home.
     """
     candidates: list[str] = []
     override = os.environ.get(SECRETARY_SRC_ENV) or os.environ.get(SECRETARY_SRC_ENV_ALT)
     if override:
         candidates.append(str(override))
-    hermes_home = os.environ.get("HERMES_HOME")
-    base = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
+    base = _ownerpaths.hermes_home()
     candidates.append(str(base / "productivity-secretary" / "src"))
     candidates.append(str(Path.home() / "productivity-secretary" / "src"))
     return candidates

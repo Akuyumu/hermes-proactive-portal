@@ -19,11 +19,23 @@ This guide uses no original owner's state, delivery address, credentials or inte
 Ask together, only when not already explicitly established:
 
 1. Delivery: which already authorised channel/chat should receive alerts? Verify its exact destination through the existing gateway. Otherwise use `local`, which saves output without messaging anyone.
-2. Timezone and quiet hours: the shipped defaults are `Asia/Singapore`, midnight to 08:00, three ordinary alerts per day and a 30-minute cooldown. These are defaults, not an inferred user location or preference.
+2. Timezone and quiet hours: the shipped defaults are neutral `UTC`, midnight to 08:00, five ordinary alerts per day and a 30-minute cooldown. These are defaults, not an inferred user location or preference.
 3. Coverage: public sources only, or supported, already authorised private connectors too? Ask for public interests/source URLs if the user wants public monitoring.
 4. Adaptive discovery: whether to enable model-driven public-interest discovery, with the paired privacy review. It is off in the generic defaults and can add model/search usage.
 
 Optional v0.4.0 routed-retrieval fallbacks (`native_render_fallback_enabled`/`native_render_consent`, `firecrawl_enabled`/`firecrawl_consent`) are **off by default** and must not be turned on speculatively. They only ever apply to a `dynamic` JavaScript shell on a public page; a challenge/interstitial/paywall page is terminal. Firecrawl goes through the supported native `ctx.call_mcp` contract — the host owns the OAuth connection and the operator's MCP allowlist; name an already-configured MCP server/tool (`firecrawl_mcp_server`/`firecrawl_mcp_tool`), never an endpoint or a key, and never sign up, copy a credential, or make a paid call on the user's behalf. Every call is a locally capped, persisted attempt (per cycle and per UTC day, with a 429 cooldown); local attempts are not provider credits, and budget exhaustion defers rather than switching to another metered service. `hermes secretary status`/`doctor` reports these capabilities candidly (unavailable with the honest reason rather than a fake success).
+
+Private preparation is **opt-in and off by default**. Enabling the setting alone
+arms nothing; to install the owned runner and one native `--no-agent` script job
+use `hermes secretary setup --with-preparation` only after the user's explicit
+decision, together with a small standing scope list (`conversation`, `public`,
+`mail`, `calendar`, `tasks`, `documents`, `memory`).
+Enabling it must not create a cron job. On a host without the explicit
+`register_auxiliary_task(..., fallback_policy="configured_only")` contract, run
+`hermes secretary prepare` only as a diagnostic: it must report the unsupported
+lane and make no model call. Do not claim a prepared artifact, a working
+fallback ladder, or a verified model-outage notice when that metadata is absent.
+Requested reminders remain deterministic and independent.
 
 Do not ask for passwords, tokens or chat authentication secrets in conversation. Use the platform's supported secure login/connection flow if the user authorises one. Missing credentials are a capability limit, not permission to create new access.
 
@@ -119,16 +131,34 @@ Read doctor/status capabilities and perform bounded authorised reads when approp
 
 ## 5. Arm the plugin's own schedules
 
-After configuration and capability review:
+After configuration and capability review, use the same foreground entry points
+the user sees. On a phone/chat the canonical start is `/secretary setup`; the
+CLI equivalent is:
 
 ```bash
-hermes secretary setup --deliver '<verified-delivery-target>'
-hermes secretary status
+hermes secretary setup --deliver local   # explicit local/no-send first
+hermes secretary status --json
 hermes secretary doctor
 hermes secretary self-test
 ```
 
-Use `--deliver local` when no messaging destination has been authorised. Never guess a chat ID or use `origin` as though a terminal command necessarily has chat context.
+The native `--deliver` grammar (from `hermes cron create --help`) is `origin`,
+`local`, `telegram`, `discord`, `signal`, `platform:chat_id`, or
+`bot-chat[:profile]`. Use a target you can actually see in the user's own
+native channel, for example `telegram:<chat_id>` only after they supply that
+exact id. Never guess a chat id, never present `origin` as if a terminal command
+had chat context, and never write `<verified-delivery-target>` as a literal
+command. If the target cannot be verified, say `delivery=unverified`, give the
+next real discovery command (`hermes cron list` or the native gateway/account
+UI), and keep `--deliver local` until an owner explicitly authorises a canary.
+An actual canary send is a parent/owner action through the existing native
+delivery adapter; this source worker never sends it.
+
+Status language is deliberately separated: **installed** (plugin present),
+**configured** (validated settings), **scheduled** (owned jobs recorded) and
+**delivery-confirmed** (a real receipt from an explicit canary). Do not collapse
+these into "enabled" or "verified". `/secretary pause|resume|disable|
+cancel-setup` are the chat-native controls; `resume` reports actual readiness.
 
 Setup creates and records ownership of:
 

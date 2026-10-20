@@ -35,6 +35,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from . import ownerpaths as _ownerpaths
+
 CAPABILITY = "gws_calendar"
 SKILL_RELATIVE = Path("skills") / "productivity" / "google-workspace" / "scripts" / "google_api.py"
 _SAFE_CALENDAR = re.compile(r"^[A-Za-z0-9._@:+/-]{1,128}$")
@@ -48,10 +50,10 @@ class GwsUnsupported(RuntimeError):
 
 
 def _hermes_home(hermes_home: str | Path | None = None) -> Path:
+    """Explicit caller pin, else the host's context-local active profile."""
     if hermes_home is not None:
         return Path(hermes_home)
-    override = os.environ.get("HERMES_HOME")
-    return Path(override) if override else Path.home() / ".hermes"
+    return _ownerpaths.hermes_home()
 
 
 def _find_spec(name: str) -> bool:

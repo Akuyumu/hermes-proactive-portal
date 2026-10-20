@@ -66,6 +66,7 @@ TOPICS = ["quantum networking", "renewable energy", "urban gardening",
 
 def _policy(**over):
     policy = json.loads(json.dumps(DEFAULT_POLICY))
+    policy["timezone"] = "Asia/Singapore"
     policy["_preferences"] = {"explicit": [], "inferred": [], "snoozes": [],
                               "paused": {"active": False}}
     policy["adaptive_inferred_goals_enabled"] = True

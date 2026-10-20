@@ -47,6 +47,7 @@ NOW = datetime(2026, 10, 3, 10, 0, tzinfo=SG)
 
 def _policy(**over):
     p = json.loads(json.dumps(DEFAULT_POLICY))
+    p["timezone"] = "Asia/Singapore"
     p["_preferences"] = {"explicit": [], "inferred": [], "snoozes": []}
     p.update(over)
     return p
@@ -285,7 +286,7 @@ class NoticeGuardTests(unittest.TestCase):
         self.assertEqual(reason, "cooldown")
 
     def test_cap_blocks(self):
-        state = {"delivered": [{"at": NOW.isoformat(), "signature": s} for s in ("a", "b", "c")]}
+        state = {"delivered": [{"at": NOW.isoformat(), "signature": s} for s in ("a", "b", "c", "d", "e")]}
         ok, reason = notice_allowed(state, _policy(), {"explicit": []}, NOW)
         self.assertFalse(ok)
         self.assertEqual(reason, "daily cap")

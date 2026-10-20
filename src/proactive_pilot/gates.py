@@ -14,7 +14,9 @@ from .policy import (
     active_snooze,
     cooldown_active,
     in_quiet_hours,
+    local_day,
     preference_blocks,
+    stored_local_day,
 )
 from .state import parse_iso
 
@@ -411,10 +413,11 @@ def _expired(prior: dict[str, Any], now: Any) -> bool:
 def _over_cap(state: dict[str, Any], policy: dict[str, Any], now: Any, urgency: str) -> bool:
     if urgency == "urgent":
         return False  # urgency bypasses the ordinary cap
-    cap = int(policy.get("daily_normal_cap", 3))
-    today = now.date().isoformat()
+    cap = max(0, int(policy.get("daily_normal_cap", 5)))
+    today = local_day(now, policy)
     count_today = sum(
-        1 for row in state.get("delivered", []) if str(row.get("at", "")).startswith(today)
+        1 for row in state.get("delivered", [])
+        if stored_local_day(row.get("at"), policy, now) == today
     )
     return count_today >= cap
 
