@@ -411,8 +411,11 @@ def _capability_truth(config: dict[str, Any], state: dict[str, Any]) -> dict[str
                            if row.get("last_success_at"))
         last = successes[-1] if successes else ""
         fresh, freshness = _freshness(last, now, stale) if configured else (False, "not-configured")
-        verified = bool(last)
+        verified = bool(last and available)
+        fresh = bool(fresh and available)
         if not available:
+            if configured:
+                freshness = "unavailable"
             label = "unavailable"
             remedy_text = remedy
         elif not enabled:
@@ -447,10 +450,10 @@ def _capability_truth(config: dict[str, Any], state: dict[str, Any]) -> dict[str
         "mail": status("mail", shutil.which("himalaya") is not None,
                        bool(sources.get("mail")), mail,
                        "Install/authorise the read-only himalaya mail connector."),
-        "calendar": status("calendar", bool(_secretary_src_dir()),
+        "calendar": status("calendar", _secretary_src_available(),
                            bool(sources.get("calendar")), cal or calendars,
                            f"Set {_secretary_env_hint()} to an authorised calendar library."),
-        "tasks": status("tasks", bool(_secretary_src_dir()),
+        "tasks": status("tasks", _secretary_src_available(),
                         bool(sources.get("tasks")), tasks or lists,
                         f"Set {_secretary_env_hint()} and an explicit task adapter/list."),
         "public": status("public", True, bool(sources.get("public_feeds")),
@@ -471,6 +474,16 @@ def _secretary_src_dir() -> Path:
         return Path("")
 
 
+def _secretary_src_available() -> bool:
+    """True only when the resolved calendar/tasks library actually exists."""
+    try:
+        src = _secretary_src_dir()
+        text = str(src)
+        return text not in {"", "."} and src.is_dir()
+    except Exception:  # noqa: BLE001 - an unknown library is unavailable
+        return False
+
+
 def detect_capabilities() -> dict[str, Any]:
     """Best-effort, read-only connector detection (never installs anything).
 
@@ -482,16 +495,20 @@ def detect_capabilities() -> dict[str, Any]:
     _ensure_src()
     himalaya = shutil.which("himalaya") is not None
     secretary_src = Path(_secretary_src())
-    secretary = bool(str(secretary_src)) and secretary_src.is_dir()
+    secretary = _secretary_src_available()
     monitoring = "full" if (secretary or himalaya) else "public-only"
     routed: dict[str, Any] = {}
     truth: dict[str, Any] = {}
     try:
-        _loaded, effective = _effective_config_and_policy()
+        loaded, effective = _effective_config_and_policy()
         from proactive_pilot import routed_retrieval
+        # The flat policy drives routed retrieval, but capability truth needs the
+        # validated nested configuration (sources/mail/calendar/tasks) from the
+        # same canonical owner. Passing the flat policy made every configured
+        # private source look disabled and monitoring falsely public-only.
         routed = routed_retrieval.capabilities(effective, ctx=get_native_context())
         state = _read_json(paths.state_dir() / "notify_state.json")
-        truth = _capability_truth(effective, state)
+        truth = _capability_truth(loaded.config, state)
         # Availability is not coverage: only an enabled AND explicitly scoped
         # private source counts as more than public-only capability.
         private_configured = any(
@@ -1789,6 +1806,22 @@ def configure_command(args: argparse.Namespace) -> int:
                       human="config project failed: no native settings writer available")
                 return 1
             changes = _native_projection_changes(loaded.config)
+            if getattr(args, "dry_run", False):
+                planned = sorted(changes)
+                _emit({"ok": True, "action": "project", "dry_run": True,
+                       "status": "planned" if planned else "unchanged",
+                       "path": str(path), "present": loaded.present,
+                       "source": loaded.source, "changed": planned,
+                       "would_write": planned,
+                       "native_projection": {"projected": True, "written": [],
+                                             "noop": not planned, "backup": None,
+                                             "dry_run": True, "changed": planned}},
+                      as_json=as_json,
+                      human=(f"config project (dry-run): {len(planned)} native "
+                             f"field(s) would change; nothing written")
+                      if planned else
+                      "config project (dry-run): native form already matches; nothing would change")
+                return 0
             if not changes:
                 _emit({"ok": True, "action": "project", "status": "unchanged",
                        "path": str(path), "present": loaded.present,
