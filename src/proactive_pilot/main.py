@@ -925,6 +925,111 @@ def _maybe_model_outage_notice(args: Any, store: Any, state: dict[str, Any],
         return None
 
 
+def _maybe_emit_tentative_notice(args: Any, store: Any, state: dict[str, Any],
+                                     policy: dict[str, Any], clock: Any,
+                                     allowed: bool, guard_reason: str) -> int | None:
+    """Emit one short tentative-ready notice through the ordinary attention path.
+
+    Tentative drafts are private, inferred opportunities. The canonical tentative
+    reader verifies the ref format, profile, owner-only regular file, size and
+    hash before anything can reach stdout. The existing daily/quiet/attention
+    gate still applies, no model runs, and a terminal claim is persisted before
+    emission so an ambiguous `_emit` can never cause a second notice.
+    """
+    if not allowed:
+        return None
+    scopes = {str(scope).strip().lower() for scope in
+              (policy.get("preparation_scopes") or [])}
+    if "conversation" not in scopes:
+        return None
+    ctx = getattr(args, "native_ctx", None)
+    facade = getattr(ctx, "state", None)
+    if facade is None:
+        return None
+    try:
+        from . import preparation as _prep
+        from . import tentative as _tentative
+        claim = _tentative.claim_notice(
+            facade, policy=policy, now=clock.now(), allowed=allowed)
+        if claim is None:
+            return None
+        artifact_ref = str(claim.get("artifact_ref") or "")
+        public_ref = _prep.public_artifact_ref(artifact_ref) or artifact_ref
+    except Exception:  # noqa: BLE001 - malformed/unavailable tentative state is silent
+        return None
+
+    alert_ref = ""
+    try:
+        with _tentative.index_lock() as acquired:
+            if acquired:
+                record = remember_alert(
+                    facade,
+                    signature="tentative-ready:" + str(public_ref),
+                    kind="preparation",
+                    candidate_refs=[{"ref": artifact_ref,
+                                     "version": "tentative",
+                                     "source": "tentative"}],
+                    destination=(policy.get("deliver_target")
+                                 or policy.get("destination") or ""),
+                    emitted_at=clock.now().isoformat(),
+                    source_version="tentative")
+                if isinstance(record, dict) and record.get("ref"):
+                    alert_ref = str(record["ref"])
+    except Exception:  # noqa: BLE001 - ref bookkeeping never blocks emission
+        alert_ref = ""
+    text = ("A private tentative secretary draft is ready for your review. "
+            "It is an inferred idea, not accepted work. Reference "
+            + public_ref + ". No external action was taken.")
+    if alert_ref:
+        text += f" Reference {alert_ref}."
+    stamp = clock.now().isoformat()
+    state["last_delivery_at"] = stamp
+    delivery_row = {
+        "at": stamp,
+        "signature": "tentative-ready:" + str(public_ref)[:80],
+        "urgent": False,
+        "delivery": "emitting",
+    }
+    state.setdefault("delivered", []).append(delivery_row)
+    try:
+        store.save("notify_state.json", state)
+    except Exception as exc:  # noqa: BLE001 - claim is already terminal
+        delivery_row["delivery"] = "unknown"
+        try:
+            _tentative.mark_notice(facade, claim, status="unknown", now=clock.now())
+        except Exception:  # noqa: BLE001 - remains terminal in the claim
+            pass
+        _diag({"diagnostic": "tentative-notice-uncertain",
+               "error": type(exc).__name__})
+        return 1
+    try:
+        _emit(text)
+    except Exception as exc:  # noqa: BLE001 - ambiguous emission is never retried
+        delivery_row["delivery"] = "unknown"
+        try:
+            store.save("notify_state.json", state)
+        except Exception:  # noqa: BLE001 - index claim remains terminal
+            pass
+        try:
+            _tentative.mark_notice(facade, claim, status="unknown", now=clock.now())
+        except Exception:  # noqa: BLE001 - unknown stays terminal
+            pass
+        _diag({"diagnostic": "tentative-notice-uncertain",
+               "error": type(exc).__name__})
+        return 1
+    delivery_row["delivery"] = "emitted-unconfirmed"
+    try:
+        store.save("notify_state.json", state)
+    except Exception:  # noqa: BLE001 - emitted once; never duplicate
+        pass
+    try:
+        _tentative.mark_notice(facade, claim, status="emitted-unconfirmed",
+                               now=clock.now())
+    except Exception:  # noqa: BLE001 - emitted once; never duplicate
+        pass
+    return 0
+
+
 def _maybe_emit_ready_notice(args: Any, store: Any, state: dict[str, Any],
                              policy: dict[str, Any], prefs: dict[str, Any],
                              clock: Any) -> int | None:
@@ -954,17 +1059,22 @@ def _maybe_emit_ready_notice(args: Any, store: Any, state: dict[str, Any],
 
         def _scope_ok(item: dict) -> bool:
             try:
-                rec = _resp.inspect(store, item["responsibility_id"])
+                rec = _resp.inspect(store, item["responsibility_id"],
+                                    include_source_snapshot=True)
             except Exception:  # noqa: BLE001 - stale/corrupt row fails closed
                 return False
-            return bool(_prep.scope_decision(policy, rec).get("allowed"))
+            if not _prep.scope_decision(policy, rec).get("allowed"):
+                return False
+            source_ok, _source_reason = _prep.source_state(rec, policy)
+            return bool(source_ok)
 
         notice = _prep.claim_ready_notice(
             store, now=clock.now(),
             attention_fn=lambda: (allowed, guard_reason),
             scope_fn=_scope_ok)
         if not notice.get("eligible"):
-            return None
+            return _maybe_emit_tentative_notice(args, store, state, policy, clock,
+                                                allowed, guard_reason)
         public_ref = _prep.public_artifact_ref(notice["artifact_ref"])
         text = ("A private secretary preparation draft is ready for your review. "
                 f"Responsibility {notice['responsibility_id']}; "

@@ -7,7 +7,10 @@ user consent.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -15,13 +18,22 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .secretary_models import (ROUTE_SETTING_KEYS, effective_route_status,
                                validate_route_settings)
+from . import secretary_consent as consent
 
 STATE_KEY = "onboarding_state"
 SCHEMA = 1
 DEFAULT_ALLOWANCE = 5
-STEP_ORDER = ("basics", "attention", "permissions", "destination", "review", "complete")
+STEP_ORDER = ("basics", "destination", "allowance", "quiet", "autonomy",
+              "preparation", "permissions", "review", "complete")
 GRANT_KEYS = ("memory", "mail", "calendar", "tasks", "public_sources", "discretionary")
 SOURCE_GRANT_KEYS = ("mail", "calendar", "tasks", "public_sources")
+AUTONOMY_MODES = ("review_only", "prepare_private", "prepare_and_approve")
+AUTONOMY_LABELS = {
+    "review_only": "Review only: no autonomous preparation",
+    "prepare_private": "Prepare privately: private reversible drafts inside chosen scopes",
+    "prepare_and_approve": "Prepare and ask: private drafts plus a quick ask before effects",
+}
+PREP_SCOPES = ("conversation", "public", "mail", "calendar", "tasks", "documents", "memory")
 
 _SAFE_TIMEZONE = re.compile(r"^[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+)*$")
 _SAFE_DELIVER = re.compile(r"^[A-Za-z0-9 _:@./+,-]{1,128}$")
@@ -31,6 +43,13 @@ _CREDENTIAL_KEYS = frozenset({
     "access_token", "refresh_token", "password", "passwd", "credential",
     "credentials", "private_key", "authorization", "cookie", "session_key",
 })
+
+
+class _ArmArgs:
+    """Minimal argparse-compatible namespace for the existing setup engine."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.__dict__.update(kwargs)
 
 
 class OnboardingError(ValueError):
@@ -62,6 +81,9 @@ def default_state() -> dict[str, Any]:
             "primary_model": "",
             "fallback_provider": "",
             "fallback_model": "",
+            "autonomy_mode": "",
+            "preparation_scopes": [],
+            "preparation_source_consent": False,
         },
         "grants": {key: False for key in GRANT_KEYS},
         "source_scope": {
@@ -76,6 +98,7 @@ def default_state() -> dict[str, Any]:
         "capabilities": {},
         "history": [],
         "decided": [],
+        "consent_review": {},
         # Last values actually written by an onboarding confirmation. This lets
         # a later read tell an applied value (safe to converge on the current
         # native form) from an unsaved in-progress edit (must be preserved).
@@ -145,7 +168,8 @@ def validate_settings(patch: Any) -> dict[str, Any]:
     if found:
         raise OnboardingError(f"credential-shaped field {found!r} is not accepted")
     allowed = {"timezone", "persona", "daily_allowance", "quiet_start_hour",
-               "quiet_end_hour", *ROUTE_SETTING_KEYS}
+               "quiet_end_hour", "autonomy_mode", "preparation_scopes",
+               "preparation_source_consent", *ROUTE_SETTING_KEYS}
     unknown = set(patch) - allowed
     if unknown:
         raise OnboardingError(f"unknown setting keys: {', '.join(sorted(map(str, unknown)))}")
@@ -163,6 +187,23 @@ def validate_settings(patch: Any) -> dict[str, Any]:
     for key in ("quiet_start_hour", "quiet_end_hour"):
         if key in patch:
             out[key] = _require_int(patch[key], key, 0, 23)
+    if "autonomy_mode" in patch:
+        mode = patch["autonomy_mode"]
+        if mode not in ("", *AUTONOMY_MODES):
+            raise OnboardingError("autonomy_mode must be review_only, prepare_private "
+                                  "or prepare_and_approve")
+        out["autonomy_mode"] = mode
+    if "preparation_scopes" in patch:
+        scopes = _safe_string_list(patch["preparation_scopes"], "preparation_scopes",
+                                   re.compile(r"^[a-z]{3,20}$"))
+        unknown = [scope for scope in scopes if scope not in PREP_SCOPES]
+        if unknown:
+            raise OnboardingError("unsupported preparation scope: " + ", ".join(unknown))
+        out["preparation_scopes"] = scopes
+    if "preparation_source_consent" in patch:
+        if not isinstance(patch["preparation_source_consent"], bool):
+            raise OnboardingError("preparation_source_consent must be true or false")
+        out["preparation_source_consent"] = patch["preparation_source_consent"]
     route_patch = {key: patch[key] for key in ROUTE_SETTING_KEYS if key in patch}
     if route_patch:
         clean, errors = validate_route_settings(route_patch)
@@ -249,6 +290,11 @@ def next_step(state: Mapping[str, Any]) -> str:
         return "allowance"
     if "setting:quiet_start_hour" not in decided or "setting:quiet_end_hour" not in decided:
         return "quiet"
+    if "setting:autonomy_mode" not in decided or not settings.get("autonomy_mode"):
+        return "autonomy"
+    if (settings.get("autonomy_mode") != "review_only"
+            and "setting:preparation_scopes" not in decided):
+        return "preparation"
     if not any(key.startswith("grant:") for key in decided):
         return "permissions"
     return "review"
@@ -259,16 +305,16 @@ def next_question(state: Mapping[str, Any]) -> str:
     if step == "delivery_verification":
         target = str((state.get("destination") or {}).get("target") or "").strip()
         if target:
-            command = f"hermes secretary setup --deliver {target}"
-            return ("Settings are saved, but delivery is NOT confirmed and jobs are NOT "
-                    "armed. In the foreground run `" + command + "` to arm the owned jobs, "
-                    "then perform an explicitly authorised native canary. "
-                    "`hermes secretary status --json` shows scheduled jobs/next run; "
-                    "delivery stays unverified until that canary.")
+            return ("Settings are saved for " + target + ", but delivery is NOT confirmed and NOT verified and "
+                    "jobs are not armed yet. If you explicitly confirm, I will run the "
+                    "existing setup engine on your behalf to arm only the plugin-owned "
+                    "no-agent jobs; no manual command is required. The foreground "
+                    "equivalent is `hermes secretary setup --deliver " + target + "`. "
+                    "Delivery remains unverified until an explicitly authorised native "
+                    "canary.")
         return ("Settings are saved, but no delivery destination is confirmed and jobs are "
-                "NOT armed. Choose a destination with /secretary setup, then run "
-                "`hermes secretary setup --deliver <target>` in the foreground to arm the "
-                "owned jobs; `hermes secretary status --json` shows what is scheduled.")
+                "NOT armed. Choose one destination, then explicitly confirm and I will arm "
+                "the plugin-owned jobs; no manual command is required.")
     if step == "basics":
         return ("Which timezone should the secretary use for quiet hours and daily limits? "
                 "Give a standard IANA name such as UTC, Europe/London or America/New_York; "
@@ -283,13 +329,26 @@ def next_question(state: Mapping[str, Any]) -> str:
     if step == "quiet":
         return ("Which local quiet hours should defer ordinary messages? Use 24-hour "
                 "start/end hours; this is not a pause.")
+    if step == "autonomy":
+        return ("How much should the secretary do on its own? Choose review_only "
+                "(no autonomous preparation), prepare_private (private reversible "
+                "drafts inside scopes you allow), or prepare_and_approve (same, plus "
+                "one quick ask before any consequential effect). It can never infer "
+                "wider permissions or perform an external action without approval.")
+    if step == "preparation":
+        return ("Which standing scopes may private preparation read? Name only the "
+                "ones you explicitly allow from conversation, public, mail, calendar, "
+                "tasks, memory (documents are off unless you name them). I will not "
+                "read a scope you have not granted, and cached facts still require "
+                "separate consent.")
     if step == "permissions":
         return ("Which standing source permissions, if any, do you explicitly grant? "
                 "Memory proposals are not grants, and no source is enabled without your "
                 "typed consent.")
     if step == "review":
         return ("Review the preview and confirm. Permissions are only saved with an explicit "
-                "typed grant; no schedule is armed by onboarding.")
+                "typed grant; setup is saved as pending verification, and I can arm the "
+                "owned jobs for you after you explicitly confirm — no manual command.")
     return "Onboarding has no further required questions."
 
 
@@ -357,6 +416,8 @@ class OnboardingService:
                 "notification.quiet_end_hour", "sources.mail", "sources.calendar",
                 "sources.tasks", "mail.accounts", "calendar.accounts",
                 "calendar.calendars", "tasks.lists", "public_interests",
+                "preparation.enabled", "preparation.scopes",
+                "preparation.source_consent", "preparation.mode",
             ) if raw_value(config, path) != raw_value(neutral, path)}
         except Exception:  # noqa: BLE001 - no provenance is simply no evidence
             return set()
@@ -442,6 +503,32 @@ class OnboardingService:
                 if _safe_to_refresh(f"grant:{grant}", "grants", grant, current):
                     state["grants"][grant] = bool(sources.get(flag))
                 decided.add(f"grant:{grant}")
+
+        preparation = config.get("preparation") or {}
+        seeded_mode = str(preparation.get("mode") or "").strip().lower()
+        if not seeded_mode and "preparation.enabled" in known:
+            seeded_mode = ("prepare_private" if preparation.get("enabled")
+                           else "review_only")
+        if seeded_mode in AUTONOMY_MODES and (
+                "preparation.mode" in known or "preparation.enabled" in known):
+            current = state["settings"].get("autonomy_mode") or ""
+            if _safe_to_refresh("setting:autonomy_mode", "settings", "autonomy_mode", current):
+                state["settings"]["autonomy_mode"] = seeded_mode
+            decided.add("setting:autonomy_mode")
+        if "preparation.scopes" in known:
+            current = list(state["settings"].get("preparation_scopes") or [])
+            if _safe_to_refresh("setting:preparation_scopes", "settings",
+                                "preparation_scopes", current):
+                state["settings"]["preparation_scopes"] = list(
+                    preparation.get("scopes") or [])
+            decided.add("setting:preparation_scopes")
+        if "preparation.source_consent" in known:
+            current = bool(state["settings"].get("preparation_source_consent"))
+            if _safe_to_refresh("setting:preparation_source_consent", "settings",
+                                "preparation_source_consent", current):
+                state["settings"]["preparation_source_consent"] = bool(
+                    preparation.get("source_consent"))
+            decided.add("setting:preparation_source_consent")
 
         scope = state["source_scope"]
         for field, section, key, path in (
@@ -659,6 +746,15 @@ class OnboardingService:
             _clean_route, route_errors = validate_route_settings(candidate)
             if route_errors:
                 raise OnboardingError("; ".join(route_errors))
+            mode = candidate.get("autonomy_mode") or ""
+            if mode in ("prepare_private", "prepare_and_approve") \
+                    and not explicit_consent:
+                raise OnboardingError(
+                    "enabling private preparation requires explicit_consent=true")
+            if any(candidate.get("preparation_scopes") or []) \
+                    and not explicit_consent:
+                raise OnboardingError(
+                    "choosing preparation scopes requires explicit_consent=true")
             state["settings"].update(clean_settings)
             decided.update(f"setting:{key}" for key in clean_settings)
             changed.append("settings")
@@ -740,6 +836,15 @@ class OnboardingService:
             "notification.destination": state["destination"].get("target") or None,
             "sources": {key: bool(state["grants"].get(key)) for key in SOURCE_GRANT_KEYS},
             "source_scope": copy.deepcopy(state["source_scope"]),
+            "autonomy": {
+                "mode": state["settings"].get("autonomy_mode") or None,
+                "label": AUTONOMY_LABELS.get(state["settings"].get("autonomy_mode") or "", ""),
+                "preparation_enabled": state["settings"].get("autonomy_mode")
+                in ("prepare_private", "prepare_and_approve"),
+                "preparation_scopes": list(state["settings"].get("preparation_scopes") or []),
+                "preparation_source_consent": bool(
+                    state["settings"].get("preparation_source_consent")),
+            },
             "model_route": {key: state["settings"].get(key, "") for key in ROUTE_SETTING_KEYS},
         }
         blockers = []
@@ -747,6 +852,25 @@ class OnboardingService:
             blockers.append("timezone")
         if not state["destination"].get("target"):
             blockers.append("destination")
+        mode = state["settings"].get("autonomy_mode") or "review_only"
+        if mode in ("prepare_private", "prepare_and_approve") \
+                and not state["settings"].get("preparation_scopes"):
+            blockers.append("preparation_scopes")
+        if "setting:autonomy_mode" not in set(state.get("decided") or []):
+            blockers.append("autonomy_mode")
+        prep_scopes = {str(item).lower() for item in
+                       (state["settings"].get("preparation_scopes") or [])}
+        granted = {key for key in SOURCE_GRANT_KEYS
+                   if bool(state["grants"].get(key))}
+        if mode in ("prepare_private", "prepare_and_approve"):
+            # A preparation scope that names a private source is only usable
+            # with that explicit source grant and current source consent.
+            ungranted = sorted(prep_scopes & {"mail", "calendar", "tasks"} - granted)
+            if ungranted:
+                blockers.append("preparation_scope_grant: " + ",".join(ungranted))
+            if (prep_scopes - {"conversation", "memory"}) and \
+                    "setting:preparation_source_consent" not in set(state.get("decided") or []):
+                blockers.append("preparation_source_consent")
         destination_status = state["destination"].get("status")
         verification = []
         if destination_status in ("pending", "unconfigured", "unverified", "user_confirmed"):
@@ -762,6 +886,53 @@ class OnboardingService:
                          "Destination verification is pending; onboarding never auto-arms jobs "
                          "or claims live delivery."),
                 "readback": {"record": STATE_KEY, "planned": planned, "blockers": blockers}}
+
+    def _config_ref(self) -> str:
+        """Fingerprint the trusted effective configuration for apply/arm binding."""
+        import hashlib
+        try:
+            loaded = self._loaded_effective()
+            if not loaded.present:
+                return ""
+            raw = json.dumps(loaded.config, ensure_ascii=False, sort_keys=True,
+                             default=str)
+            return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        except Exception:  # noqa: BLE001 - unverifiable configuration fails closed
+            return ""
+
+    @staticmethod
+    def _review_fingerprint(state: Mapping[str, Any]) -> str:
+        import hashlib
+        relevant = {key: state.get(key) for key in (
+            "settings", "grants", "source_scope", "destination", "decided")}
+        raw = json.dumps(relevant, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _issue_review(self, state: dict[str, Any], *, kind: str) -> dict[str, Any]:
+        import secrets
+        review = {
+            "ref": "sec-onb-" + secrets.token_hex(6),
+            "kind": kind,
+            "created_at": _now(),
+            "fingerprint": self._review_fingerprint(state),
+            "requested_grants": sorted(
+                key for key, value in (state.get("grants") or {}).items() if value),
+            "session_id": "",
+        }
+        state["consent_review"] = review
+        return review
+
+    def _require_review(self, state: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
+        """An explicitly supplied opaque review must match the current server state."""
+        supplied = str(payload.get("review_ref") or "").strip()
+        if not supplied:
+            return
+        review = state.get("consent_review") if isinstance(
+            state.get("consent_review"), dict) else {}
+        if (not review or supplied != str(review.get("ref") or "")
+                or str(review.get("fingerprint") or "") != self._review_fingerprint(state)):
+            raise OnboardingError(
+                "the supplied review reference is not the current server-issued review")
 
     def _current_raw_user_config(self) -> dict[str, Any]:
         if self.ctx is None or not _has_callable(self.ctx, "get_config"):
@@ -825,6 +996,9 @@ class OnboardingService:
             "setting:daily_allowance": "notification.daily_normal_cap",
             "setting:quiet_start_hour": "notification.quiet_start_hour",
             "setting:quiet_end_hour": "notification.quiet_end_hour",
+            "setting:autonomy_mode": "preparation.mode",
+            "setting:preparation_scopes": "preparation.scopes",
+            "setting:preparation_source_consent": "preparation.source_consent",
             "destination": "notification.destination",
             "scope:mail_accounts": "mail.accounts",
             "scope:calendar_accounts": "calendar.accounts",
@@ -835,6 +1009,10 @@ class OnboardingService:
         for marker, path in field_markers.items():
             if marker in decided:
                 chosen_paths.add(path)
+                if marker == "setting:autonomy_mode":
+                    # The mode is the authority; enabled is only its legacy
+                    # projection, so persist both as chosen fields.
+                    chosen_paths.add("preparation.enabled")
         source_flags = {"mail": "mail", "calendar": "calendar",
                         "tasks": "tasks", "public_sources": "public_feeds"}
         for key in SOURCE_GRANT_KEYS:
@@ -865,7 +1043,10 @@ class OnboardingService:
                                          "sources.mail", "sources.calendar",
                                          "sources.tasks", "mail.accounts",
                                          "calendar.accounts", "calendar.calendars",
-                                         "tasks.lists", "public_interests")},
+                                         "tasks.lists", "public_interests",
+                                         "preparation.enabled", "preparation.scopes",
+                                         "preparation.source_consent",
+                                         "preparation.mode")},
                     }
                 known = {str(item) for item in (marker.get("known_fields") or [])
                          if isinstance(item, str)}
@@ -882,6 +1063,25 @@ class OnboardingService:
             notification["destination"] = state["destination"]["target"]
         if "setting:timezone" in decided:
             config["timezone"] = settings["timezone"]
+        if "setting:autonomy_mode" in decided:
+            prep = config.setdefault("preparation", {})
+            if not isinstance(prep, dict):
+                raise OnboardingError("native preparation settings are malformed")
+            mode = str(settings.get("autonomy_mode") or "review_only")
+            if mode not in AUTONOMY_MODES:
+                raise OnboardingError("autonomy_mode is not a supported mode")
+            prep["mode"] = mode
+            prep["enabled"] = mode in ("prepare_private", "prepare_and_approve")
+        if "setting:preparation_scopes" in decided:
+            prep = config.setdefault("preparation", {})
+            if not isinstance(prep, dict):
+                raise OnboardingError("native preparation settings are malformed")
+            prep["scopes"] = list(settings.get("preparation_scopes") or [])
+        if "setting:preparation_source_consent" in decided:
+            prep = config.setdefault("preparation", {})
+            if not isinstance(prep, dict):
+                raise OnboardingError("native preparation settings are malformed")
+            prep["source_consent"] = bool(settings.get("preparation_source_consent"))
         sources = config.setdefault("sources", {})
         for key in SOURCE_GRANT_KEYS:
             if f"grant:{key}" in decided:
@@ -972,6 +1172,7 @@ class OnboardingService:
             "calendar_accounts": list(persisted["calendar"]["accounts"]),
             "task_lists": list(persisted["tasks"]["lists"]),
             "sources": copy.deepcopy(persisted.get("sources", {})),
+            "preparation": copy.deepcopy(persisted.get("preparation", {})),
             "projected_native_fields": projected,
             "projected_model_fields": route_written,
             "effective_source": loaded.source,
@@ -984,12 +1185,25 @@ class OnboardingService:
         if not user_confirmed:
             raise OnboardingError("onboarding confirmation requires user_confirmed=true")
         state = self._read()
+        if not state["settings"].get("autonomy_mode"):
+            # A legacy/partial interview with no autonomy answer is a safe
+            # no-op: review only. This invents no grant and enables no read.
+            state["settings"]["autonomy_mode"] = "review_only"
+            decided = set(state.get("decided") or [])
+            decided.add("setting:autonomy_mode")
+            state["decided"] = sorted(decided)[-100:]
+            self._write(state)
         blockers = self.preview()["blockers"]
         if blockers:
             raise OnboardingError(f"onboarding is incomplete: {', '.join(blockers)}")
         config_readback = None
+        config_ref = ""
         if apply_settings:
             config_readback = self._apply_settings(state)
+            config_ref = self._config_ref()
+            if not config_ref:
+                raise OnboardingError(
+                    "settings could not be read back; confirmation was not recorded")
             state["applied"] = {
                 "at": _now(),
                 "decided": sorted(state.get("decided") or []),
@@ -997,29 +1211,119 @@ class OnboardingService:
                 "grants": copy.deepcopy(state["grants"]),
                 "source_scope": copy.deepcopy(state["source_scope"]),
                 "destination": (state.get("destination") or {}).get("target", ""),
+                "config_ref": config_ref,
             }
-        state["status"] = "pending_verification"
-        state["current_step"] = "delivery_verification"
+            state["status"] = "pending_verification"
+            state["current_step"] = "delivery_verification"
+        else:
+            # A boolean alone did not persist anything. Keep the draft distinct
+            # from an applied/pending-verification setup so arming cannot follow.
+            state["applied"] = {}
+            state["status"] = "pending_settings"
+            state["current_step"] = "delivery_verification"
         state["completed_at"] = _now()
         state["history"].append({"at": _now(), "changed": ["confirmed"],
                                  "applied_settings": bool(apply_settings)})
         state["history"] = state["history"][-50:]
         self._write(state)
-        return {"ok": True, "status": "pending_verification",
+        return {"ok": True, "status": state["status"],
+                "saved": bool(apply_settings),
                 "applied_settings": bool(apply_settings),
                 "schedule_armed": False, "grants_changed_by_confirmation": False,
                 "live_destination_verified": False,
-                "note": ("Configuration is saved. Delivery verification is still pending: "
-                         "onboarding cannot verify the platform destination or arm jobs. "
-                         "Next run `hermes secretary setup --deliver "
-                         + str((state.get("destination") or {}).get("target") or "<target>")
-                         + "` in the foreground, then an explicitly authorised native "
-                         "canary; `hermes secretary status --json` shows jobs and next run."),
+                "note": ("Configuration is saved and status remains pending verification. "
+                         "After your explicit confirmation I can run the existing setup "
+                         "engine on your behalf to arm only the plugin-owned no-agent jobs; "
+                         "no manual command is needed. Delivery stays unverified until an "
+                         "explicit native canary."
+                         if apply_settings else
+                         "Nothing was saved or applied. The draft remains unapplied, so "
+                         "jobs were not armed; apply the settings before confirming."),
                 "config_readback": config_readback,
                 "readback": {"record": STATE_KEY, "status": state["status"],
                              "settings": copy.deepcopy(state["settings"]),
                              "grants": copy.deepcopy(state["grants"]),
                              "destination": copy.deepcopy(state["destination"])}}
+
+    def arm_confirmed(self, *, user_confirmed: bool = False) -> dict[str, Any]:
+        """Perform confirmed foreground setup/arming through the existing engine.
+
+        The user asked the secretary to do this on their behalf; no manual CLI
+        step is required. This is only reachable after explicit confirmation and
+        only arms the same plugin-owned, no-agent jobs the CLI setup uses.
+        """
+        if not user_confirmed:
+            raise OnboardingError("arming requires user_confirmed=true")
+        state = self._read()
+        if state.get("status") != "pending_verification":
+            raise OnboardingError(
+                "onboarding settings must be saved and confirmed before arming")
+        applied = state.get("applied") if isinstance(state.get("applied"), dict) else {}
+        stored_config_ref = str(applied.get("config_ref") or "")
+        current_config_ref = self._config_ref()
+        if not applied or not stored_config_ref or not current_config_ref:
+            raise OnboardingError("arming requires a verified saved configuration")
+        if stored_config_ref != current_config_ref:
+            raise OnboardingError(
+                "the configuration changed after confirmation; review and confirm again")
+        if (applied.get("settings") != state.get("settings")
+                or applied.get("grants") != state.get("grants")
+                or applied.get("source_scope") != state.get("source_scope")
+                or str(applied.get("destination") or "")
+                != str((state.get("destination") or {}).get("target") or "")):
+            raise OnboardingError(
+                "the onboarding draft changed after it was applied; save and confirm again")
+        target = str((state.get("destination") or {}).get("target") or "").strip()
+        if not target or (state.get("destination") or {}).get("status") == "unconfigured":
+            raise OnboardingError("a delivery destination is required before arming")
+        preparation = state.get("settings") or {}
+        args = _ArmArgs(
+            deliver=target,
+            no_cron=False,
+            force=False,
+            import_from=None,
+            import_dry_run=False,
+            fixture="healthy_empty",
+            with_preparation=bool(preparation.get("autonomy_mode") in
+                                  ("prepare_private", "prepare_and_approve")),
+            json=True,
+        )
+        from . import secretary_cli
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                rc = secretary_cli.setup_command(args)
+        except Exception as exc:  # noqa: BLE001 - keep pending, report honestly
+            return {"ok": False, "status": state.get("status"),
+                    "schedule_armed": False,
+                    "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        output = buffer.getvalue().strip()
+        try:
+            result = json.loads(output)
+        except Exception:  # noqa: BLE001 - tolerate a human/plain last line
+            try:
+                result = json.loads(output.splitlines()[-1])
+            except Exception:  # noqa: BLE001
+                result = {}
+        jobs = result.get("jobs") if isinstance(result, dict) else None
+        armed = bool(rc == 0 and isinstance(jobs, list) and jobs)
+        if armed:
+            state["status"] = "ready"
+            state["history"].append({"at": _now(), "changed": ["armed"]})
+            state["history"] = state["history"][-50:]
+            self._write(state)
+        return {"ok": armed, "status": state.get("status"),
+                "schedule_armed": armed,
+                "jobs": jobs if isinstance(jobs, list) else [],
+                "setup_rc": rc,
+                "error": ("" if armed else str(result.get("error") or "")
+                          if isinstance(result, dict) else ""),
+                "note": ("Confirmed setup ran through the existing setup engine; only "
+                         "plugin-owned jobs were ensured. No new grants or targets."
+                         if armed else
+                         "Arming did not complete; status remains pending verification."),
+                "readback": {"record": STATE_KEY, "status": state.get("status"),
+                             "destination": copy.deepcopy(state.get("destination") or {})}}
 
     def cancel(self) -> dict[str, Any]:
         state = self._read()
@@ -1033,6 +1337,44 @@ class OnboardingService:
                 "readback": {"record": STATE_KEY, "status": state["status"],
                              "settings": copy.deepcopy(state["settings"])}}
 
+    def _model_update_authority(self, payload: Mapping[str, Any],
+                                state: Mapping[str, Any]) -> None:
+        """Expanded agentic changes need a real human answer, not a model bool."""
+        settings = payload.get("settings") if isinstance(payload.get("settings"), Mapping) else {}
+        grants = payload.get("grants") if isinstance(payload.get("grants"), Mapping) else {}
+        positive_grants = {key: value for key, value in grants.items() if value is True}
+        expansion = bool(positive_grants) or any((
+            "autonomy_mode" in settings,
+            bool(settings.get("preparation_scopes")),
+            settings.get("preparation_source_consent") is True,
+        ))
+        if not expansion:
+            return
+        review = state.get("consent_review") if isinstance(
+            state.get("consent_review"), dict) else {}
+        if positive_grants:
+            consent.require_grants(self.ctx, payload, positive_grants,
+                                   state_review=review)
+            return
+        consent.positive_turn(
+            self.ctx, payload, purpose="expanding preparation/autonomy",
+            words=("autonomy", "prepare", "preparation", "private", "scope", "scopes",
+                   "consent", "permission", "permissions", "enable", "allow", "mode"))
+
+    def _model_review_authority(self, payload: Mapping[str, Any], state: Mapping[str, Any],
+                                *, purpose: str, words: tuple[str, ...],
+                                require_review: bool = False) -> None:
+        if not bool(payload.get("user_confirmed")):
+            raise OnboardingError(f"{purpose} requires user_confirmed=true")
+        review = state.get("consent_review") if isinstance(
+            state.get("consent_review"), dict) else {}
+        if require_review and not review:
+            raise OnboardingError(
+                f"{purpose} requires a current server-issued review; preview first")
+        self._require_review(state, payload)
+        consent.positive_turn(self.ctx, payload, purpose=purpose, words=words,
+                              reference=str(review.get("ref") or ""))
+
     def dispatch(self, action: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         payload = dict(payload or {})
         action = str(action or "inspect").strip().lower()
@@ -1044,21 +1386,52 @@ class OnboardingService:
         if action in ("accept", "accept_proposals"):
             return self.accept_proposals(payload.get("keys"))
         if action == "update":
-            return self.update(settings=payload.get("settings"), grants=payload.get("grants"),
-                               source_scope=payload.get("source_scope"),
-                               destination=payload.get("destination"),
-                               explicit_consent=bool(payload.get("explicit_consent")),
-                               step=payload.get("step"))
+            state = self._read()
+            self._model_update_authority(payload, state)
+            result = self.update(settings=payload.get("settings"),
+                                 grants=payload.get("grants"),
+                                 source_scope=payload.get("source_scope"),
+                                 destination=payload.get("destination"),
+                                 explicit_consent=bool(payload.get("explicit_consent")),
+                                 step=payload.get("step"))
+            state = self._read()
+            result["review_ref"] = self._issue_review(state, kind="update")["ref"]
+            self._write(state)
+            return result
         if action == "preview":
-            return self.preview()
+            result = self.preview()
+            state = self._read()
+            result["review_ref"] = self._issue_review(state, kind="review")["ref"]
+            self._write(state)
+            return result
         if action == "request_verification":
             return self.request_destination_verification()
         if action == "confirm_destination":
             return self.confirm_destination(payload.get("challenge"),
                                             user_confirmed=bool(payload.get("user_confirmed")))
         if action == "confirm":
-            return self.confirm(user_confirmed=bool(payload.get("user_confirmed")),
-                                apply_settings=bool(payload.get("apply_settings")))
+            state = self._read()
+            self._model_review_authority(
+                payload, state, purpose="confirming onboarding",
+                words=("confirm", "confirmed", "approve", "approved", "proceed",
+                       "save", "saved", "apply", "finish", "complete", "setup",
+                       "onboarding", "settings", "review", "done"),
+                require_review=True)
+            result = self.confirm(user_confirmed=True,
+                                  apply_settings=bool(payload.get("apply_settings")))
+            if result.get("status") == "pending_verification":
+                state = self._read()
+                result["review_ref"] = self._issue_review(state, kind="arm")["ref"]
+                self._write(state)
+            return result
+        if action == "arm":
+            state = self._read()
+            self._model_review_authority(
+                payload, state, purpose="arming jobs",
+                words=("arm", "schedule", "scheduled", "start", "enable", "jobs",
+                       "setup", "onboarding", "proceed", "confirm", "go ahead"),
+                require_review=True)
+            return self.arm_confirmed(user_confirmed=True)
         if action == "cancel":
             return self.cancel()
         raise OnboardingError(f"unknown onboarding action {action!r}")
@@ -1073,7 +1446,7 @@ TOOL_SCHEMA = {
     "properties": {
         "action": {"type": "string", "enum": [
             "inspect", "propose", "accept", "update", "preview",
-            "request_verification", "confirm_destination", "confirm", "cancel",
+            "request_verification", "confirm_destination", "confirm", "arm", "cancel",
         ]},
         "facts": {"type": "array", "items": {"type": "object"}},
         "keys": {"type": "array", "items": {"type": "string"}},
@@ -1098,7 +1471,7 @@ def tool_handler(service: OnboardingService):
         try:
             return json.dumps(service.dispatch(str(args.get("action") or "inspect"), args),
                               ensure_ascii=False, sort_keys=True)
-        except OnboardingError as exc:
+        except (OnboardingError, consent.ConsentError) as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, sort_keys=True)
         except Exception as exc:  # noqa: BLE001
             return json.dumps({"ok": False, "error": f"onboarding failed ({type(exc).__name__})"},

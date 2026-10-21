@@ -47,6 +47,26 @@ _NOT_COMMITMENT = re.compile(
     r"^\s*(?:thanks|thank you|ok(?:ay)?|sure|noted|got it|cool|great)\s*[.!]*\s*$",
     re.IGNORECASE)
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_QUOTED = re.compile(r'["\u201c\u201d`]|^\s*>', re.MULTILINE)
+_REPORTED = re.compile(
+    r"\b(?:said|says|say|saying|wrote|writes|write|quoted?|quoting|according)\b",
+    re.IGNORECASE)
+_NEGATION = re.compile(
+    r"\b(?:no|not|never|none|don't|dont|doesn't|does not|isn't|is not|won't|"
+    r"will not|wouldn't|shouldn't|cannot|can't|cant|stop|decline|reject|"
+    r"refuse|nope|nah|disapprove)\b", re.IGNORECASE)
+_CONDITIONAL = re.compile(
+    r"\b(?:if|unless|maybe|perhaps|possibly|might|but|however|though|although|"
+    r"except|only|wait|hold|pending|after|before|until|provided|depends?)\b",
+    re.IGNORECASE)
+_LIFECYCLE_INTENT = re.compile(
+    r"\b(?:yes|yeah|yep|yup|approve|approved|proceed|confirm|confirmed|ok|okay|"
+    r"sure|go ahead|do it|accept|accepted|cancel|remove|update|change|set|"
+    r"delete|clear|dismiss)\b", re.IGNORECASE)
+_STOP_WORDS = frozenset({
+    "the", "and", "for", "with", "that", "this", "from", "into", "please", "about",
+    "your", "their", "will", "have", "ready", "complete", "completed", "table",
+})
 
 
 def _text(value: Any) -> str:
@@ -121,7 +141,8 @@ def _turn_ref(session_id: str, text: str, at: float) -> str:
 
 
 def remember_human_turn(ctx: Any, *, session_id: Any, user_message: Any,
-                        platform: Any = "", at: float | None = None) -> dict[str, Any] | None:
+                        platform: Any = "", chat_type: Any = "",
+                        at: float | None = None) -> dict[str, Any] | None:
     """Store the actual eligible human turn for later exact-quote capture."""
     text = _clean(user_message)
     sid = _clean(session_id, 200)
@@ -132,6 +153,7 @@ def remember_human_turn(ctx: Any, *, session_id: Any, user_message: Any,
         "session_id": sid,
         "text": text,
         "platform": _clean(platform, 40),
+        "chat_type": _clean(chat_type, 40),
         "at": stamp,
         "ref": _turn_ref(sid, text, stamp),
     }
@@ -177,6 +199,7 @@ def _provenance(turn: Mapping[str, Any]) -> dict[str, str]:
         "source_ref": str(turn["ref"]),
         "conversation_ref": str(turn["ref"]),
         "at": _iso(float(turn["at"])),
+        "quote": _clean(turn.get("text"), 2000),
     }
 
 
@@ -216,6 +239,8 @@ def capture(args: Mapping[str, Any], *, ctx: Any = None,
         if action_kind == "commitment" and not is_commitment(turn.get("text")):
             raise ValueError("the current human turn is not a clear commitment")
         provenance = _provenance(turn)
+        if action_kind != "commitment":
+            provenance["kind"] = "opportunity"
         accepted = action_kind == "commitment"
     else:
         source_ref = _clean(args.get("source_ref"), 240)
@@ -228,7 +253,8 @@ def capture(args: Mapping[str, Any], *, ctx: Any = None,
                       else "opportunity",
                       "source_ref": source_ref,
                       "conversation_ref": conversation_ref,
-                      "at": _iso(time.time())}
+                      "at": _iso(time.time()),
+                      "quote": _clean(evidence, 2000)}
         accepted = action_kind == "commitment"
 
     store = _store()
@@ -250,10 +276,34 @@ def capture(args: Mapping[str, Any], *, ctx: Any = None,
         external_refs=args.get("external_refs"),
         now=now,
     )
+    prepared = _prepare_after_capture(ctx, rec, desired, evidence, accepted,
+                                      session_id=session_id)
     return {"ok": True, "deduplicated": False, "responsibility": rec,
+            "prepared": prepared,
             "note": ("Accepted from the current human commitment; no external action was taken."
                      if accepted else
                      "Recorded as a tentative opportunity only; it is not adopted work.")}
+
+
+def _prepare_after_capture(ctx: Any, rec: Mapping[str, Any], desired: str,
+                           evidence: Any, accepted: bool,
+                           session_id: str = "") -> dict[str, Any]:
+    """Prepare inside existing consent; never widen it and never send anything."""
+    if ctx is None:
+        return {"attempted": False, "reason": "no foreground context"}
+    try:
+        from . import secretary_autonomy as autonomy
+        if accepted:
+            return {"attempted": True, **autonomy.prepare_accepted(ctx, rec["id"])}
+        provenance = rec.get("provenance") or {}
+        return {"attempted": True, **autonomy.prepare_tentative(
+            ctx, desired_outcome=desired, evidence_quote=evidence,
+            reasons="inferred from the current conversation",
+            session_id=session_id,
+            source_ref=str(provenance.get("source_ref") or ""))}
+    except Exception as exc:  # noqa: BLE001 - consent/gate failure leaves the capture intact
+        return {"attempted": True, "prepared": False,
+                "reason": f"{type(exc).__name__}: {str(exc)[:240]}"}
 
 
 def _cli_confirmation_provenance(args: Mapping[str, Any], *, now: Any = None) -> dict[str, str]:
@@ -274,14 +324,31 @@ def _cli_confirmation_provenance(args: Mapping[str, Any], *, now: Any = None) ->
     raw = f"{scope}|{rid_token(args)}|{evidence}|{invocation}"
     ref = "cli-confirmation:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
     return {"kind": "user_commitment", "source_ref": ref,
-            "conversation_ref": "", "at": invocation}
+            "conversation_ref": "", "at": invocation, "quote": evidence}
 
 
 def rid_token(args: Mapping[str, Any]) -> str:
     return _clean(args.get("responsibility_id"), 96)
 
 
-def _require_current_human(args: Mapping[str, Any], ctx: Any | None) -> None:
+def _target_binding(text: str, rid: str, record: Mapping[str, Any] | None) -> bool:
+    """True when the human reply actually names the record being changed."""
+    lowered = text.lower()
+    if rid and rid.lower() in lowered:
+        return True
+    if not isinstance(record, Mapping):
+        return False
+    candidate = " ".join(str(record.get(key) or "") for key in (
+        "desired_outcome", "acceptance_criterion"))
+    words = {word for word in re.findall(r"[a-z0-9]{4,}", candidate.lower())
+             if word not in _STOP_WORDS}
+    return any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in words)
+
+
+def _require_current_human(args: Mapping[str, Any], ctx: Any | None, *,
+                           purpose: str = "lifecycle change",
+                           rid: str = "",
+                           record: Mapping[str, Any] | None = None) -> None:
     if ctx is None:
         if not _clean(args.get("evidence_quote"), 2000):
             raise ValueError("foreground CLI lifecycle change requires evidence_quote")
@@ -289,6 +356,58 @@ def _require_current_human(args: Mapping[str, Any], ctx: Any | None) -> None:
     turn = latest_turn(ctx, session_id=args.get("session_id"))
     if turn is None or not _quote_matches(args.get("evidence_quote"), turn):
         raise ValueError("lifecycle change requires the current human turn as evidence")
+    text = _clean(turn.get("text"), 2000)
+    if _QUOTED.search(text) or _REPORTED.search(text):
+        raise ValueError("quoted or reported text cannot authorise this change")
+    if _NEGATION.search(text) or _CONDITIONAL.search(text):
+        raise ValueError("a negated, conditional or conflicting reply cannot authorise this change")
+    if not _LIFECYCLE_INTENT.search(text):
+        raise ValueError(f"{purpose} requires explicit human intent in the current turn")
+    if rid and not _target_binding(text, rid, record):
+        raise ValueError(
+            "which responsibility do you mean? Name the exact current record or its "
+            "title before I change it")
+
+
+def _revocation_check(ctx: Any):
+    """Fail closed when a proposal names a source scope the user has revoked."""
+    def check(row: Mapping[str, Any]) -> str:
+        scope = str(row.get("scope") or "").strip().lower()
+        if not scope:
+            return "proposal has no verifiable scope"
+        if ctx is None:
+            return "approval requires a foreground conversation context"
+        try:
+            import sys
+            from pathlib import Path as _Path
+            src = str(_Path(__file__).resolve().parent / "src")
+            if src not in sys.path:
+                sys.path.insert(0, src)
+            from proactive_pilot.feedback import load_preferences_file
+            from proactive_pilot.userconfig import load_user_config
+            prefs = load_preferences_file(paths.preferences_path(), strict=True)
+            if bool((prefs.get("paused") or {}).get("active")):
+                return "the secretary is paused; this approval cannot proceed"
+            loaded = load_user_config(native=ctx)
+        except Exception:  # noqa: BLE001 - unverifiable current consent fails closed
+            return "paused/preference or current consent could not be verified"
+        if not loaded.present:
+            return "current consent could not be verified"
+        config = loaded.config
+        flags = {"mail": "mail", "calendar": "calendar", "tasks": "tasks",
+                 "public": "public_feeds", "documents": None}
+        for token, flag in flags.items():
+            if token not in scope.split():
+                continue
+            if flag is None:
+                return "documents are not granted"
+            if not bool((config.get("sources") or {}).get(flag)):
+                return f"{token} scope is not granted"
+        if "external" in scope.split() and not str(
+                (config.get("notification") or {}).get("destination") or "").strip():
+            return "no confirmed external destination"
+        return ""
+    return check
 
 
 def dispatch(args: Mapping[str, Any], *, ctx: Any = None, now: Any = None) -> dict[str, Any]:
@@ -300,11 +419,47 @@ def dispatch(args: Mapping[str, Any], *, ctx: Any = None, now: Any = None) -> di
     if action == "inspect":
         rid = _clean(args.get("responsibility_id"), 96)
         return {"ok": True, "responsibility": R.inspect(store, rid, include_claim=False)}
+    if action == "request_approval":
+        from . import secretary_approvals as approvals
+        if ctx is None:
+            raise ValueError("approval questions require a foreground conversation context")
+        return approvals.request(
+            ctx, kind=args.get("proposal_kind"), effect=args.get("proposal_effect"),
+            scope=args.get("proposal_scope"), cost=args.get("proposal_cost"),
+            ttl_minutes=args.get("ttl_minutes"),
+            session_id=args.get("session_id"),
+            responsibility_id=args.get("responsibility_id"))
+    if action == "approvals":
+        from . import secretary_approvals as approvals
+        if ctx is None:
+            raise ValueError("approvals require a foreground conversation context")
+        return approvals.pending(ctx)
+    if action in {"approve", "approve_approval"}:
+        from . import secretary_approvals as approvals
+        if ctx is None:
+            raise ValueError("approval requires a foreground conversation context")
+        return approvals.approve(
+            ctx, reference=args.get("approval_ref"),
+            evidence_quote=args.get("evidence_quote"),
+            session_id=args.get("session_id"),
+            revoked=_revocation_check(ctx))
+    if action in {"cancel_approval", "reject_approval"}:
+        from . import secretary_approvals as approvals
+        if ctx is None:
+            raise ValueError("approval requires a foreground conversation context")
+        return approvals.cancel(ctx, reference=args.get("approval_ref"))
     if action in {"capture", "create"}:
         return capture(args, ctx=ctx, now=now)
     if action == "accept":
-        _require_current_human(args, ctx)
         rid = _clean(args.get("responsibility_id"), 96)
+        record = None
+        if ctx is not None and rid:
+            try:
+                record = R.inspect(store, rid, include_claim=False)
+            except Exception:  # noqa: BLE001 - unknown target cannot be accepted
+                record = None
+        _require_current_human(args, ctx, purpose="accepting a responsibility",
+                               rid=rid, record=record)
         provenance = None
         if ctx is not None:
             turn = latest_turn(ctx, session_id=args.get("session_id"))
@@ -319,8 +474,15 @@ def dispatch(args: Mapping[str, Any], *, ctx: Any = None, now: Any = None) -> di
         return {"ok": True, "responsibility": R.accept(
             store, rid, provenance=provenance, now=now)}
     if action == "update":
-        _require_current_human(args, ctx)
         rid = _clean(args.get("responsibility_id"), 96)
+        record = None
+        if ctx is not None and rid:
+            try:
+                record = R.inspect(store, rid, include_claim=False)
+            except Exception:  # noqa: BLE001 - unknown target cannot be updated
+                record = None
+        _require_current_human(args, ctx, purpose="updating a responsibility",
+                               rid=rid, record=record)
         fields = {key: args.get(key) for key in (
             "desired_outcome", "acceptance_criterion", "due_at", "next_check_at",
             "source_version", "evidence_refs", "completion_evidence_refs", "facts",
@@ -329,8 +491,15 @@ def dispatch(args: Mapping[str, Any], *, ctx: Any = None, now: Any = None) -> di
             raise ValueError("update requires at least one changed field")
         return {"ok": True, "responsibility": R.update(store, rid, now=now, **fields)}
     if action == "cancel":
-        _require_current_human(args, ctx)
         rid = _clean(args.get("responsibility_id"), 96)
+        record = None
+        if ctx is not None and rid:
+            try:
+                record = R.inspect(store, rid, include_claim=False)
+            except Exception:  # noqa: BLE001 - unknown target cannot be cancelled
+                record = None
+        _require_current_human(args, ctx, purpose="cancelling a responsibility",
+                               rid=rid, record=record)
         return {"ok": True, "responsibility": R.cancel(
             store, rid, reason=_clean(args.get("reason"), 400), now=now)}
     if action in {"handoff", "inspect_handoff"}:
@@ -358,7 +527,8 @@ TOOL_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "action": {"type": "string", "enum": [
-            "list", "inspect", "capture", "accept", "update", "cancel", "handoff"]},
+            "list", "inspect", "capture", "accept", "update", "cancel", "handoff",
+            "request_approval", "approvals", "approve", "cancel_approval"]},
         "responsibility_id": {"type": "string"},
         "session_id": {"type": "string"},
         "evidence_quote": {"type": "string"},
@@ -375,6 +545,15 @@ TOOL_SCHEMA: dict[str, Any] = {
         "completion_evidence_refs": {"type": "array", "items": {"type": "string"}},
         "facts": {"type": "array", "items": {"type": "object"}},
         "external_refs": {"type": "array", "items": {"type": "object"}},
+        "approval_ref": {"type": "string"},
+        "proposal_kind": {"type": "string",
+                          "enum": ["send", "publish", "purchase", "book",
+                                   "calendar", "task", "external", "other"]},
+        "proposal_effect": {"type": "string"},
+        "proposal_scope": {"type": "string"},
+        "proposal_cost": {"type": "string"},
+        "ttl_minutes": {"type": "integer"},
+        "generation": {"type": "integer"},
     },
     "required": ["action"],
     "additionalProperties": False,
@@ -417,6 +596,11 @@ def _eligible_human_turn(platform: Any, user_message: Any, *, chat_type: str = "
     if is_shared or str(chat_type or "").strip().lower() in {"group", "channel", "supergroup"}:
         return False
     text = _text(user_message).strip()
+    # Runtime completions are delivered as user-role turns on the same surface.
+    # Their tool output is not a new human instruction or consent evidence.
+    if text.startswith(("[IMPORTANT: Background process ", "[System:",
+                        "[System note:", "<memory-context>")):
+        return False
     return bool(text) and not text.startswith("/")
 
 
@@ -431,19 +615,48 @@ def responsibility_context(ctx: Any, *, platform: Any, user_message: Any,
     if not sid:
         return None
     turn = remember_human_turn(ctx, session_id=sid, user_message=user_message,
-                               platform=platform)
-    if turn is None or not is_commitment(turn.get("text")):
+                               platform=platform, chat_type=chat_type)
+    if turn is None:
         return None
-    return (
-        "[Proactive Secretary responsibility]\n"
-        "The user's current turn appears to contain a clear personal commitment. "
-        "Use the secretary_responsibility tool with action=capture only if it really is a "
-        "commitment the user made. Pass this exact session_id and quote the exact user "
-        f"words in evidence_quote. Current session id: {sid}. "
-        "If it is merely an inferred opportunity, use kind=opportunity (tentative) or say "
-        "nothing. Do not capture thanks, silence, questions or assistant suggestions. "
-        "Capture each human turn at most once; no external action is taken."
-    )
+    pending_lines = ""
+    try:
+        from .secretary_approvals import pending as pending_approvals
+        rows = pending_approvals(ctx).get("approvals") or []
+        if rows:
+            pending_lines = (
+                "\nPending exact approval questions (one current proposal each; no effect "
+                "has happened):\n"
+                + "\n".join(
+                    f"- {row.get('ref')}: {row.get('kind')} effect={row.get('effect')!r} "
+                    f"scope={row.get('scope')!r} expires_at={row.get('expires_at')}"
+                    for row in rows[:4])
+                + "\nA reply only approves when it names that exact reference and the "
+                  "current human turn explicitly says yes/approve/proceed. Silence, an "
+                  "unrelated yes, a stale reference or a revoked scope approves nothing.")
+    except Exception:  # noqa: BLE001 - approvals are optional context
+        pending_lines = ""
+    commitment = is_commitment(turn.get("text"))
+    if not commitment and not pending_lines:
+        return None
+    lines = ["[Proactive Secretary responsibility]"]
+    if commitment:
+        lines.extend([
+            "The user's current turn appears to contain a clear personal commitment. "
+            "Use the secretary_responsibility tool with action=capture only if it really is "
+            "a commitment the user made. Pass this exact session_id and quote the exact "
+            f"user words in evidence_quote. Current session id: {sid}. "
+            "If it is merely an inferred opportunity, use kind=opportunity (tentative) or "
+            "say nothing. Do not capture thanks, silence, questions or assistant "
+            "suggestions. Capture each human turn at most once; no external action is "
+            "taken.",
+        ])
+    if pending_lines:
+        lines.append(pending_lines.strip())
+    lines.append(
+        "A consequential, uncertain or over-budget effect must use "
+        "action=request_approval with the exact effect and scope; silence or an unrelated "
+        "yes never approves it.")
+    return "\n".join(lines)
 
 
 __all__ = [

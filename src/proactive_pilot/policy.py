@@ -192,6 +192,7 @@ DEFAULT_POLICY: dict[str, Any] = {
     "preparation_enabled": False,
     "preparation_scopes": [],
     "preparation_source_consent": False,
+    "preparation_mode": "",
     # -- local-only phone context (STAGE-ONLY, opt-in) ------------------------
     # Disabled by default. When enabled, the phone is consulted ONLY around an
     # upcoming meaningful in-person calendar event, on the fixed local origin,

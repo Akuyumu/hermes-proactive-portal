@@ -208,6 +208,15 @@ config_schema:
       default. Turning it on does not create a scheduled job, grant a source
       scope or make a model available; those remain separate explicit steps.
     default: false
+  preparation_mode:
+    type: str
+    title: Autonomy mode
+    description: >-
+      review_only blocks autonomous preparation even if older preparation was
+      enabled. prepare_private allows private reversible drafts inside the
+      chosen scopes; prepare_and_approve also asks before consequential work.
+      An empty value is legacy configuration and grants nothing new.
+    default: ""
   preparation_scopes:
     type: array
     title: What preparation may read

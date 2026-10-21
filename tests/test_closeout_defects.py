@@ -412,7 +412,7 @@ class OnboardingProvenanceTests(unittest.TestCase):
         ctx = Ctx({**ROUTES, "user_config": payload})
         svc = onboarding.OnboardingService(ctx)
         info = svc.inspect()
-        self.assertEqual(info["next_step"], "review")
+        self.assertEqual(info["next_step"], "autonomy")
         self.assertEqual(info["state"]["settings"]["primary_model"], "model-a")
         self.assertTrue(info["state"]["grants"]["mail"])
         self.assertEqual(info["state"]["source_scope"]["mail_accounts"], ["work"])

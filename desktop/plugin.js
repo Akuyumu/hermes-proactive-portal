@@ -646,6 +646,7 @@ function SettingsEditor({ ctx, statusQuery }) {
           textField('feed_max_sources_per_run', 'Public sources read per run', '0 reads none while keeping the list.', 'number'),
           switchField('preparation_enabled', 'Draft private preparation', 'Opt-in drafting for responsibilities you accepted.'),
           switchField('preparation_source_consent', 'Let preparation use already-checked facts', 'Only fresh facts from sources you enabled; no new connector.'),
+          textField('preparation_mode', 'Autonomy mode', 'review_only, prepare_private or prepare_and_approve. Review-only blocks autonomous preparation.', 'text'),
           textField('preparation_scopes', 'What preparation may read', 'Comma-separated scopes such as conversation, public, mail, calendar, tasks.', 'list'),
           jsx(ListRow, {
             key: 'public_sources',

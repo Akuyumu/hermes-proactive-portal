@@ -15,10 +15,12 @@ import secrets
 from types import SimpleNamespace
 from typing import Any, Mapping
 
-from .secretary_onboarding import OnboardingError, OnboardingService, next_step
+from .secretary_onboarding import (OnboardingError, OnboardingService, next_question,
+                                   next_step)
 from . import secretary_status
 
 INVITATION_KEY = "onboarding_invitation"
+INTERVIEW_KEY = "onboarding_interview"
 PENDING_KEY = "onboarding_pending"
 PENDING_TTL_SECONDS = 15 * 60
 _NON_HUMAN = frozenset({
@@ -143,6 +145,17 @@ def _invitation_record(ctx: Any) -> dict[str, Any] | None:
     return dict(raw) if isinstance(raw, Mapping) else None
 
 
+def _interview_record(ctx: Any) -> dict[str, Any] | None:
+    raw = _get(ctx, INTERVIEW_KEY)
+    return dict(raw) if isinstance(raw, Mapping) else None
+
+
+def _start_interview(ctx: Any, *, session_id: str = "") -> dict[str, Any] | None:
+    record = {"started_at": time.time(), "session_id": str(session_id or ""),
+              "version": 1}
+    return record if _set(ctx, INTERVIEW_KEY, record) else None
+
+
 def _invitation_context(service: OnboardingService, *, resuming: bool = False) -> str:
     state = service._read()
     status = state.get("status", "not_started")
@@ -155,19 +168,64 @@ def _invitation_context(service: OnboardingService, *, resuming: bool = False) -
     return (
         "[Proactive Secretary onboarding]\n"
         f"{lead} Current status: {status}; next step: {step}.\n"
-        "If (and only if) the user's message makes a setup offer or question natural, briefly "
-        "invite them to run /secretary setup. Do not derail an unrelated request, do not claim "
-        "the secretary is installed/active beyond what the tool reports, do not ask for "
-        "credentials, and do not create sources, grants or schedules. Use the "
-        "secretary_onboarding tool for any onboarding action; existing memory may be proposed "
-        "as tentative facts but is never consent to expand access."
+        "Start the interview in this conversation now, conversationally. Ask exactly the next "
+        "genuine question below, one question at a time. Handle setup through conversation "
+        "rather than requiring settings edits or commands. Preserve anything already known. "
+        "Ask only for missing or "
+        "conflicting facts and genuine permissions; existing memory may be proposed as "
+        "tentative facts but is never consent to expand access. Do not ask for credentials, "
+        "do not claim the secretary is installed/active beyond what the tool reports, and do "
+        "not create sources, grants or schedules. Use the secretary_onboarding tool for every "
+        "answer. Never invent a grant from silence, thanks or an unrelated message. If the "
+        "user's first message is an unrelated request, answer it first; do not hijack or "
+        "replace it with onboarding.\n"
+        f"Next question: {next_question(state)}"
+    )
+
+
+def _interview_context(ctx: Any, service: OnboardingService, *,
+                       session_id: str = "") -> str | None:
+    """Continue the active interview in its own session without a command.
+
+    The profile sees at most one first-use invitation. A later ordinary turn in
+    the same conversation still gets bounded steering until the interview is
+    complete or cancelled; an unrelated session is never injected.
+    """
+    record = _interview_record(ctx)
+    if record is None:
+        return None
+    bound = str(record.get("session_id") or "")
+    if not bound and not session_id:
+        # A slash handler without a real session key has no continuation
+        # boundary; never inject the interview into an unrelated later turn.
+        return None
+    if bound and session_id and bound != session_id:
+        return None
+    state = service._read()
+    if state.get("status") in ("ready", "pending_verification", "cancelled"):
+        _set(ctx, INTERVIEW_KEY, None)
+        return None
+    step = next_step(state)
+    return (
+        "[Proactive Secretary onboarding continuation]\n"
+        f"An onboarding interview is active for this conversation (status "
+        f"{state.get('status', 'not_started')}; next step: {step}). Continue it naturally and "
+        "ask exactly the next missing question. If the user asks something unrelated, answer "
+        "it briefly first, then continue the interview without dropping it. Record the "
+        "user's answer with the secretary_onboarding tool, preserving known fields. Never "
+        "turn thanks, silence, an "
+        "unrelated request or an assistant suggestion into a permission, commitment or "
+        "destination confirmation. No external action, source read or schedule is allowed "
+        "from this context alone.\n"
+        f"Next question: {next_question(state)}"
     )
 
 
 def invitation_context(ctx: Any, service: OnboardingService, *, platform: Any,
                        user_message: Any, task_id: str = "",
                        parent_session_id: str = "", chat_type: str = "",
-                       sender_id: str = "", is_shared: bool = False) -> str | None:
+                       sender_id: str = "", is_shared: bool = False,
+                       session_id: str = "") -> str | None:
     if not eligible_human_turn(platform, user_message, task_id=task_id,
                                parent_session_id=parent_session_id,
                                chat_type=chat_type, sender_id=sender_id,
@@ -176,13 +234,14 @@ def invitation_context(ctx: Any, service: OnboardingService, *, platform: Any,
     state = service._read()
     if state.get("status") in ("ready", "pending_verification"):
         return None
-    if _invitation_record(ctx) is not None:
-        return None
     if _facade(ctx) is None:
         return None
+    if _invitation_record(ctx) is not None:
+        return _interview_context(ctx, service, session_id=session_id)
     if not _set(ctx, INVITATION_KEY, {"version": 1, "invited_at": time.time(),
                                       "status_at_invite": state.get("status", "not_started")}):
         return None
+    _start_interview(ctx, session_id=session_id)
     return _invitation_context(service)
 
 
@@ -270,6 +329,16 @@ def make_pre_llm_hook(ctx: Any, service: OnboardingService | None = None):
         session_id = str(kwargs.get("session_id") or "")
         chat_type = str(kwargs.get("chat_type") or "")
         is_shared = bool(kwargs.get("is_shared", False))
+        # Always remember an eligible human turn, even when relevance or
+        # onboarding context has higher display priority. Consent checks read
+        # this trusted turn; they never rely on model reply metadata.
+        try:
+            from .secretary_responsibilities import responsibility_context
+            responsibility = responsibility_context(
+                ctx, platform=platform, user_message=user_message,
+                session_id=session_id, chat_type=chat_type, is_shared=is_shared)
+        except Exception:  # noqa: BLE001 - a capture hint never breaks a turn
+            responsibility = None
         pending = pending_context(ctx, service, platform=platform, user_message=user_message,
                                   session_id=session_id, chat_type=chat_type,
                                   is_shared=is_shared)
@@ -279,13 +348,6 @@ def make_pre_llm_hook(ctx: Any, service: OnboardingService | None = None):
                                      chat_type=chat_type, is_shared=is_shared)
         if relevant is not None:
             return {"context": relevant}
-        try:
-            from .secretary_responsibilities import responsibility_context
-            responsibility = responsibility_context(
-                ctx, platform=platform, user_message=user_message,
-                session_id=session_id, chat_type=chat_type, is_shared=is_shared)
-        except Exception:  # noqa: BLE001 - a capture hint never breaks a turn
-            responsibility = None
         if responsibility is not None:
             return {"context": responsibility}
         invited = invitation_context(
@@ -293,7 +355,7 @@ def make_pre_llm_hook(ctx: Any, service: OnboardingService | None = None):
             task_id=str(kwargs.get("task_id") or ""),
             parent_session_id=str(kwargs.get("parent_session_id") or ""),
             chat_type=chat_type, sender_id=str(kwargs.get("sender_id") or ""),
-            is_shared=is_shared)
+            is_shared=is_shared, session_id=session_id)
         if invited is not None:
             return {"context": invited}
         return None

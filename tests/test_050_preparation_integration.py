@@ -271,6 +271,14 @@ class PrepareCommandTests(unittest.TestCase):
         from proactive_pilot.policy import DEFAULT_POLICY
 
         claim = R.claim_due(self.store, now=T0)
+        # A source-scoped ready notice requires the current authorised source
+        # generation, not only a historical evidence ref.
+        R.attach_source_snapshot(
+            self.store, self.rec["id"], claim_token=claim["claim_token"],
+            generation=claim["generation"], source_version=claim["source_version"],
+            facts=[{"ref": "mail:msg-1", "text": "Requirement A.",
+                    "provenance": "authorized mail", "observed_at": T0.isoformat()}],
+            now=T0)
         prep.write_artifact(
             self.store, responsibility_id=self.rec["id"],
             claim_token=claim["claim_token"], generation=claim["generation"],

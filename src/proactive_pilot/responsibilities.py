@@ -28,6 +28,7 @@ Hard rules:
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 import secrets
@@ -221,6 +222,8 @@ def _provenance(value: Any, *, accepted: bool) -> dict[str, str]:
         "conversation_ref": _text(value.get("conversation_ref"),
                                   "provenance.conversation_ref", MAX_REF),
         "at": _aware(value.get("at"), "provenance.at"),
+        "quote": _text(value.get("quote"), "provenance.quote", 2000,
+                      required=False),
     }
 
 
@@ -297,6 +300,7 @@ def _validate_record(rid: Any, rec: Any) -> None:
         raise _corrupt("provenance kind is invalid")
     _stored_text(provenance, "source_ref", MAX_REF)
     _stored_text(provenance, "conversation_ref", MAX_REF, required=False)
+    _stored_text(provenance, "quote", 2000, required=False)
     _stored_iso(provenance, "at", required=False)
 
     _stored_text(rec, "desired_outcome", MAX_DESIRED)
@@ -454,7 +458,8 @@ def _invalidate_ready(rec: dict[str, Any], stamp: datetime, reason: str) -> None
         }
 
 
-def _readback(rec: dict[str, Any], *, include_claim: bool = False) -> dict[str, Any]:
+def _readback(rec: dict[str, Any], *, include_claim: bool = False,
+              include_source_snapshot: bool = False) -> dict[str, Any]:
     out = {
         "id": rec["id"],
         "status": rec["status"],
@@ -480,6 +485,8 @@ def _readback(rec: dict[str, Any], *, include_claim: bool = False) -> dict[str, 
     }
     if include_claim:
         out["claim"] = dict(rec.get("claim") or {})
+    if include_source_snapshot and rec.get("source_snapshot") is not None:
+        out["source_snapshot"] = copy.deepcopy(rec.get("source_snapshot"))
     return out
 
 
@@ -557,7 +564,8 @@ def create(
 
 
 def inspect(store: StateStore, responsibility_id: str, *,
-            include_claim: bool = False) -> dict[str, Any]:
+            include_claim: bool = False,
+            include_source_snapshot: bool = False) -> dict[str, Any]:
     rid = str(responsibility_id or "")
     if not _ID_RE.fullmatch(rid):
         raise ResponsibilityError("responsibility_id is invalid")
@@ -565,7 +573,8 @@ def inspect(store: StateStore, responsibility_id: str, *,
     rec = data["records"].get(rid)
     if rec is None:
         raise ResponsibilityError(f"no responsibility with id {rid!r}")
-    return _readback(rec, include_claim=include_claim)
+    return _readback(rec, include_claim=include_claim,
+                     include_source_snapshot=include_source_snapshot)
 
 
 def list_records(store: StateStore) -> list[dict[str, Any]]:

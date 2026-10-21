@@ -98,6 +98,7 @@
   "preparation_enabled": false,
   "preparation_scopes": [],
   "preparation_source_consent": false,
+  "preparation_mode": "",
   "public_budget_seconds": 10,
   "public_findings_retention_days": 30,
   "quiet_end_hour": 8,

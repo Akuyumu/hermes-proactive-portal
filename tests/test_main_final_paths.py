@@ -409,6 +409,9 @@ class OnboardingAndDiscoveryTests(Workspace):
         state["decided"] = ["setting:daily_allowance"]
         self.assertEqual(onboarding.next_step(state), "quiet")
         state["decided"] += ["setting:quiet_start_hour", "setting:quiet_end_hour"]
+        self.assertEqual(onboarding.next_step(state), "autonomy")
+        state["settings"]["autonomy_mode"] = "review_only"
+        state["decided"].append("setting:autonomy_mode")
         self.assertEqual(onboarding.next_step(state), "permissions")
 
         svc = onboarding.OnboardingService(Ctx())
@@ -685,7 +688,7 @@ class LastMileOnboardingControlTests(Workspace):
         loaded = LoadedConfig(config=validate_config(cfg), present=True, source="native")
         svc = onboarding.OnboardingService(Ctx(), config_resolver=lambda: loaded)
         info = svc.inspect()
-        self.assertEqual(info["next_step"], "review")
+        self.assertEqual(info["next_step"], "autonomy")
         self.assertEqual(info["state"]["settings"]["timezone"], "Europe/Berlin")
         self.assertIn("grant:mail", info["state"]["decided"])
 

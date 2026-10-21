@@ -66,9 +66,41 @@ Settings, grants and memory facts are separate. Settings are the validated confi
 
 The unified package ships a custom Settings ▸ Plugins page (`desktop/plugin.js`) backed by fixed, host-authenticated routes in `dashboard/plugin_api.py`. It shows the setup status, humanised source status (Off, Not configured, Unavailable, Not verified, Stale, Fresh), and grouped ordinary controls for setup, notification preferences, sources and advanced bounds. Editing uses the same validated `userconfig` owner as the native Agent settings form and onboarding: values are read from the effective configuration, a save is explicit and foreground-only, unknown keys are rejected, an optimistic revision check refuses stale writes, and the page reads values back after writing. Permission-widening changes are returned as a prospective list that must be reviewed and explicitly confirmed before the write; the server refuses the save without that acknowledgement. There is no second settings store, no arbitrary config path, model or secret write, and no raw JSON as the primary basic experience.
 
-“Trigger onboarding” only places `/secretary setup` in the live composer for review; it does not clear anything or start an interview. “Reset and onboard” is a two-step, typed confirmation. A reset clears onboarding progress and everyday preferences and turns reading permissions off; it preserves account connections, custom public source definitions, model routes, reminders/jobs and unrelated runtime state. A private owner-only backup with a SHA-256 manifest is written before any reset write. If a reset is needed, the backup makes the previous settings recoverable by the owner; deleting or losing that backup is what makes the change irrecoverable. The page does not offer a restore button. A read-only status/trigger request never resets settings or arms jobs.
+“Trigger onboarding” remains a repair/review door: it only places `/secretary setup` in the live composer. A fresh profile does not need it, because the first eligible conversation starts the interview itself. “Reset and onboard” is a two-step, typed confirmation. A reset clears onboarding progress and everyday preferences and turns reading permissions off; it preserves account connections, custom public source definitions, model routes, reminders/jobs and unrelated runtime state. A private owner-only backup with a SHA-256 manifest is written before any reset write. If a reset is needed, the backup makes the previous settings recoverable by the owner; deleting or losing that backup is what makes the change irrecoverable. The page does not offer a restore button. A read-only status/trigger request never resets settings or arms jobs.
 
 The custom page and backend appear only after the package is installed in the active profile’s `plugins/` root, `hermes-proactive-secretary` is added to `plugins.enabled`, the desktop half is enabled in Capabilities ▸ Plugins, and the gateway is restarted (backend routes mount at startup). Reload or rescan desktop plugins so the app copies and loads the `desktop/` half. These are host/app activation steps and are not performed by packaging.
+
+### Missing “Proactive Secretary” button
+
+The normal flow installs both halves of the package:
+
+```bash
+hermes plugins install Akuyumu/hermes-proactive-secretary
+hermes plugins enable hermes-proactive-secretary
+```
+
+There is no native `--desktop` plugin-install flag and no desktop SHA pin. The
+current Desktop plugin form also has no Desktop-target checkbox, despite a stale
+tooltip that mentions one. A Desktop-only install is supported by the code as a
+compatibility URI:
+
+```
+hermes://plugin-desktop/install?repo=Akuyumu/hermes-proactive-secretary&enable=1
+```
+
+That URI opens the Desktop install path (`plugin-install-run.ts` maps its Desktop
+hint to `agent:false, desktop:probe.desktop`). The download happens on the
+**client** computer and therefore needs working private Git access there; a
+backend or remote service cannot fetch the private repository on the user's
+behalf. If the current host's repository form cannot inject an action/link, use
+the normal plugin install above (both components) or the package's local Desktop
+half; adding an action button requires a local Desktop half or an upstream form
+enhancement. No internal marker file, manual scanner bypass or weakened security
+check is part of this path.
+
+The conversational setup interview works without the Desktop half. If the button
+is absent, setup is still available from any eligible one-to-one chat; the page
+is an optional review/edit surface, not a prerequisite for onboarding.
 
 On a phone, prefer the Telegram DM workflow below. The CLI `setup` command is not a substitute for the conversational onboarding interview.
 
@@ -76,10 +108,10 @@ On a phone, prefer the Telegram DM workflow below. The CLI `setup` command is no
 
 Use a one-to-one DM with the bot. Onboarding deliberately ignores groups, channels, shared chats, cron, a2a, subagent and internal turns.
 
-1. Send `/secretary setup`.
-2. The reply shows the real next question and a short-lived continuation code such as `sec-cont-ab12cd34ef56`.
-3. Reply with your answer **and the code together** in the same message. The code is required when the host does not expose a verified session id to slash commands; it is a routing token, not a credential.
-4. Repeat `/secretary setup` to resume. Only genuine gaps or conflicts are asked; existing explicit settings are not asked again.
+1. Send any ordinary message in a one-to-one DM. On a fresh profile the interview starts there; no settings edit or command is required. `/secretary setup` remains a fallback that also shows a short-lived continuation code such as `sec-cont-ab12cd34ef56`.
+2. Answer one natural question at a time: timezone, one messaging route, daily ceiling and quiet hours, autonomy, private-preparation scopes, then explicit source grants.
+3. The autonomy choice is plain language: review only, prepare private reversible drafts, or prepare plus a quick ask before consequential work. In every mode an external send, publication, purchase, booking or calendar/task mutation needs one exact approval naming its opaque reference.
+4. If a slash command is used where the host exposes no session id, reply with the answer **and** the code together. The code is a routing token, not a credential.
 5. Use `/secretary status` to inspect progress, jobs, the effective model route and limits.
 
 Supported chat controls:
@@ -145,6 +177,8 @@ With explicitly configured and authorised connectors it can read mail metadata t
 With no private connector it is public-source monitoring only. It does not send mail, mutate calendars or tasks, book, purchase, publish, or perform any external action; guarantee complete coverage (blocked, failed, deferred and truncated sources are recorded separately); cover undated tasks; confirm delivery; or fabricate urgency, personal fit, location or a deadline.
 
 ## Onboarding, memory and consent
+
+Conversational onboarding is the primary setup path. The first eligible foreground turn asks the next genuine question, and later turns in that same conversation resume it without a command. Existing configuration and memory are evidence for suggestions, never invented grants. A completed or cancelled interview is not silently reopened; the first-use invitation is emitted at most once per profile. See `docs/agentic-onboarding-design.md` for the product contract.
 
 Onboarding asks only for missing or conflicting facts. It can seed known values from an existing effective configuration, but does not treat generated neutral defaults as user decisions. Foreground memory may be proposed through the `secretary_onboarding` tool. This is deliberately **not** a new memory-provider API and not a background scrape. For context, the scheduled pipeline never scrapes USER/MEMORY/Hindsight/Library, credentials or connectors, and never creates a new allowlist. Conflicting facts require explicit resolution.
 

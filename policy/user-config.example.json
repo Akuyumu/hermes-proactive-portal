@@ -32,7 +32,9 @@
   },
   "preparation": {
     "enabled": false,
-    "scopes": []
+    "mode": "",
+    "scopes": [],
+    "source_consent": false
   },
   "public_interests": [],
   "public_sources": [],

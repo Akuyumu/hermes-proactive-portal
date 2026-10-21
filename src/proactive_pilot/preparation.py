@@ -185,6 +185,45 @@ def scope_decision(policy: dict[str, Any], rec: dict[str, Any]) -> dict[str, Any
             "approved": sorted(approved)}
 
 
+def source_state(rec: dict[str, Any], policy: dict[str, Any], *,
+                 require_snapshot: bool = True) -> tuple[bool, str]:
+    """Return whether current source consent/generation covers this record.
+
+    A conversation/memory-only record needs no private source read. Any
+    source-derived fact needs current consent *and* a source snapshot bound to
+    the record's current source version; missing/revoked/stale data denies
+    before model/write/notice rather than falling back to cached facts.
+    """
+    required, reason = required_scopes(rec)
+    if required is None:
+        return False, reason
+    needed = {scope for scope in required if scope not in {"conversation", "memory"}}
+    snapshot = rec.get("source_snapshot") or {}
+    snapshot_facts = [f for f in (snapshot.get("facts") or []) if isinstance(f, dict)]
+    for item in snapshot_facts:
+        scope = ref_scope(item.get("ref"))
+        if scope and scope not in {"conversation", "memory"}:
+            needed.add(scope)
+    if not needed:
+        return True, "ok"
+    if not bool(policy.get("preparation_source_consent", False)):
+        return False, "source consent missing"
+    if not require_snapshot:
+        return True, "ok"
+    if not snapshot_facts:
+        return False, "current source generation missing"
+    source_version = str(rec.get("source_version") or "")
+    snap_version = str(snapshot.get("source_version") or "")
+    if source_version and snap_version and snap_version != source_version:
+        return False, "source generation is stale"
+    supplied = {ref_scope(f.get("ref")) for f in snapshot_facts}
+    supplied.discard(None)
+    missing = sorted(needed - supplied)
+    if missing:
+        return False, "current source generation is missing: " + ",".join(missing)
+    return True, "ok"
+
+
 # --------------------------------------------------------------------------- #
 # Gates
 # --------------------------------------------------------------------------- #
@@ -223,6 +262,11 @@ def gate_status(
     """Fail-closed preparation gates. No source/store content is read here."""
     if not config_present:
         return {"allowed": False, "reason": "configuration missing"}
+    mode = str(policy.get("preparation_mode") or "").strip().lower()
+    if mode and mode not in ("prepare_private", "prepare_and_approve"):
+        # Review-only is an explicit current decision and overrides a legacy
+        # preparation_enabled=true. An unknown mode also fails closed.
+        return {"allowed": False, "reason": "preparation is review-only"}
     if not bool(policy.get("preparation_enabled", False)):
         return {"allowed": False, "reason": "preparation disabled"}
     scopes, scope_reason = approved_scopes(policy)
@@ -321,6 +365,7 @@ def preflight(
     now: datetime | None = None,
     lease_minutes: int = R.DEFAULT_LEASE_MINUTES,
     source_loader: Callable[[dict[str, Any]], Any] | None = None,
+    responsibility_id: str | None = None,
 ) -> dict[str, Any]:
     """Select/claim at most one due unit and return the host-agent context."""
     stamp = _now(store, now)
@@ -332,7 +377,11 @@ def preflight(
     if not gate["allowed"]:
         return {"wake": False, "reason": gate["reason"], "gate": gate, "claim": None}
 
+    only_id = str(responsibility_id or "").strip()
+
     def _scope_ok(rec: dict[str, Any]) -> bool:
+        if only_id and str(rec.get("id")) != only_id:
+            return False
         return scope_decision(policy, rec)["allowed"]
 
     claim = R.claim_due(store, now=stamp, lease_minutes=lease_minutes,
@@ -551,6 +600,8 @@ def public_artifact_ref(artifact_ref: Any) -> str:
     ref = str(artifact_ref or "")
     if not ref:
         return ""
+    if re.fullmatch(r"tentative:[0-9a-f]{24}", ref):
+        return ref
     rid = ref.rsplit(":", 1)[0]
     if rid.startswith("artifact:"):
         rid = rid[len("artifact:"):]
@@ -1159,7 +1210,7 @@ def foreground_handoff(
 
 __all__ = [
     "PREP_STATE", "PREP_SCHEMA", "MAX_ARTIFACT_BYTES", "SCOPE_KINDS",
-    "ref_scope", "required_scopes", "approved_scopes", "scope_decision",
+    "ref_scope", "required_scopes", "approved_scopes", "scope_decision", "source_state",
     "check_gate", "gate_status", "preflight",
     "build_context", "public_context", "default_artifact_root", "artifact_path",
     "load_prep", "list_ready", "claim_ready_notice",

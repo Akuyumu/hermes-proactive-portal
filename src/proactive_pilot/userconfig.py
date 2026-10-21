@@ -131,7 +131,8 @@ def default_config() -> dict[str, Any]:
         "health": {"critical_sources": []},
         # Private preparation is opt-in and OFF by default. Enabling it does
         # not arm a job or grant any source scope.
-        "preparation": {"enabled": False, "scopes": [], "source_consent": False},
+        "preparation": {"enabled": False, "scopes": [], "source_consent": False,
+                        "mode": ""},
         "bounds": {
             "collector_budget_seconds": 60,
             "max_candidates_per_kind": 60,
@@ -461,6 +462,16 @@ def validate_config(raw: Any) -> dict[str, Any]:
             remedy="use conversation/public/mail/calendar/tasks/documents/memory")
     config["preparation"]["source_consent"] = _bounded_bool(
         preparation.get("source_consent"), "preparation.source_consent", False)
+    mode = preparation.get("mode", "")
+    if mode is None:
+        mode = ""
+    if not isinstance(mode, str) or mode.strip().lower() not in (
+            "", "review_only", "prepare_private", "prepare_and_approve"):
+        raise ConfigError(
+            "preparation.mode must be empty, review_only, prepare_private or "
+            "prepare_and_approve",
+            remedy="choose an autonomy mode in setup; an invalid mode never grants preparation")
+    config["preparation"]["mode"] = mode.strip().lower()
     config["preparation"]["scopes"] = list(dict.fromkeys(
         item.strip().lower() for item in scopes))
 
@@ -520,6 +531,10 @@ SEEDED_PATHS = (
     "calendar.calendars",
     "tasks.lists",
     "public_interests",
+    "preparation.enabled",
+    "preparation.scopes",
+    "preparation.source_consent",
+    "preparation.mode",
 )
 
 # Values used by the shipped neutral example. A full payload equal to these is
@@ -540,6 +555,10 @@ _NEUTRAL_EXAMPLE_VALUES = {
     "calendar.calendars": [],
     "tasks.lists": [],
     "public_interests": [],
+    "preparation.enabled": False,
+    "preparation.scopes": [],
+    "preparation.source_consent": False,
+    "preparation.mode": "",
 }
 
 _FULL_NEUTRAL_KEYS = frozenset({
@@ -687,6 +706,7 @@ def policy_overrides(config: dict[str, Any]) -> dict[str, Any]:
         "preparation_enabled": config["preparation"]["enabled"],
         "preparation_scopes": list(config["preparation"]["scopes"]),
         "preparation_source_consent": config["preparation"]["source_consent"],
+        "preparation_mode": config["preparation"]["mode"],
         "collector_budget_seconds": config["bounds"]["collector_budget_seconds"],
         "max_candidates_per_kind": config["bounds"]["max_candidates_per_kind"],
         "feed_max_sources_per_run": config["bounds"]["feed_max_sources_per_run"],
@@ -812,6 +832,7 @@ NATIVE_FLAT_FIELDS = {
     "preparation_enabled": ("preparation", "enabled"),
     "preparation_scopes": ("preparation", "scopes"),
     "preparation_source_consent": ("preparation", "source_consent"),
+    "preparation_mode": ("preparation", "mode"),
 }
 
 
@@ -935,6 +956,7 @@ def native_flat_values(config: Mapping[str, Any]) -> dict[str, Any]:
         "preparation_enabled": validated["preparation"]["enabled"],
         "preparation_scopes": copy.deepcopy(validated["preparation"]["scopes"]),
         "preparation_source_consent": validated["preparation"]["source_consent"],
+        "preparation_mode": validated["preparation"]["mode"],
     }
 
 
