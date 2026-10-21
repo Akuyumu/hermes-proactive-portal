@@ -1124,7 +1124,7 @@ def doctor_command(args: argparse.Namespace) -> int:
         "host ctx available" if get_native_context() is not None else "offline (subprocess route)",
         critical=False)
     try:
-        from secretary_models import effective_route_status
+        from .secretary_models import effective_route_status
         from proactive_pilot.native_runtime import bound_model_lane_status
         _ctx = get_native_context()
         _route = bound_model_lane_status(_ctx) or effective_route_status(_ctx, strict_active=False)
