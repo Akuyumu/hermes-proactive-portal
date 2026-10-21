@@ -26,7 +26,7 @@ It is **read-only over the user's sources** and makes no calendar/mail/task
 writes, no purchases, and no bookings. The evaluator runs with a resolved
 zero-tool toolset, so it can only judge the supplied evidence packet.
 
-## Onboarding and model routes (0.5.0 seam)
+## Onboarding and model routes (0.5.1 seam)
 
 - Start or resume with `/secretary setup`; `/secretary status` inspects and
   `/secretary cancel` cancels while retaining progress.

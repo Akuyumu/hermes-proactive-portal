@@ -2,7 +2,7 @@
 
 A conservative, opt-in proactive secretary for [Hermes](https://hermes-agent.nousresearch.com). It reads only the sources you explicitly authorise, judges whether anything is genuinely worth interrupting you for, and stays silent otherwise. It never sends mail, changes calendars or tasks, books, purchases, publishes, or expands its own access.
 
-Version **0.5.0** is a pre-1.0 release. The default posture is user-agnostic: no accounts, no public seeds, no personal interests, and no assumed location. Every source and permission is opt-in. See the compatibility and qualification limits below.
+Version **0.5.1** is a pre-1.0 release. The default posture is user-agnostic: no accounts, no public seeds, no personal interests, and no assumed location. Every source and permission is opt-in. See the compatibility and qualification limits below.
 
 ## How it works
 
@@ -53,11 +53,22 @@ hermes secretary setup --no-cron
 hermes secretary configure show
 hermes secretary configure validate
 hermes secretary configure preview
+hermes secretary configure project
 ```
 
 `setup --no-cron` writes a neutral policy/preferences baseline and, on a new install, a neutral `user_config.json`. It creates no cron jobs. `configure preview` shows which policy keys would change. A nonempty configuration is never overwritten without `--force`.
 
+`configure project` is the explicit, idempotent repair for an older deployment whose native plugin form is empty or stale: it validates the *effective* configuration (native settings first, then the local file) and copies only the ordinary form fields into the native form. It never writes or reseeds `user_config.json`, never replaces accounts/scopes/custom source URLs/interests, preserves an explicit empty list, and performs no write or backup when the form already matches. An explicit `setup` (including the existing-policy "kept" path) performs the same safe backfill. Ordinary loads never mutate configuration. Before any migration or projection that would change settings, the plugin writes an owner-only, hash-verified backup of its own `user_config.json`, policy copy, preferences, declared native settings and onboarding record; if that backup cannot be written, no settings write occurs.
+
 Settings, grants and memory facts are separate. Settings are the validated configuration and native form fields. Grants are explicit typed permissions (`mail`, `calendar`, `tasks`, `public_sources`, `memory`, `discretionary`). Foreground-memory facts may be proposed as tentative facts; a proposal is not a fact, and accepting a fact is not a grant.
+
+## Custom settings page and confirmed reset
+
+The unified package ships a custom Settings ▸ Plugins page (`desktop/plugin.js`) backed by fixed, host-authenticated routes in `dashboard/plugin_api.py`. It shows the setup status, humanised source status (Off, Not configured, Unavailable, Not verified, Stale, Fresh), and grouped ordinary controls for setup, notification preferences, sources and advanced bounds. Editing uses the same validated `userconfig` owner as the native Agent settings form and onboarding: values are read from the effective configuration, a save is explicit and foreground-only, unknown keys are rejected, an optimistic revision check refuses stale writes, and the page reads values back after writing. Permission-widening changes are returned as a prospective list that must be reviewed and explicitly confirmed before the write; the server refuses the save without that acknowledgement. There is no second settings store, no arbitrary config path, model or secret write, and no raw JSON as the primary basic experience.
+
+“Trigger onboarding” only places `/secretary setup` in the live composer for review; it does not clear anything or start an interview. “Reset and onboard” is a two-step, typed confirmation. A reset clears onboarding progress and everyday preferences and turns reading permissions off; it preserves account connections, custom public source definitions, model routes, reminders/jobs and unrelated runtime state. A private owner-only backup with a SHA-256 manifest is written before any reset write. If a reset is needed, the backup makes the previous settings recoverable by the owner; deleting or losing that backup is what makes the change irrecoverable. The page does not offer a restore button. A read-only status/trigger request never resets settings or arms jobs.
+
+The custom page and backend appear only after the package is installed in the active profile’s `plugins/` root, `hermes-proactive-secretary` is added to `plugins.enabled`, the desktop half is enabled in Capabilities ▸ Plugins, and the gateway is restarted (backend routes mount at startup). Reload or rescan desktop plugins so the app copies and loads the `desktop/` half. These are host/app activation steps and are not performed by packaging.
 
 On a phone, prefer the Telegram DM workflow below. The CLI `setup` command is not a substitute for the conversational onboarding interview.
 
@@ -112,7 +123,7 @@ Keep these states distinct: **installed** (plugin present), **configured** (sett
 
 The ordinary settings surface is the **native plugin form** (Settings -> Plugins -> Proactive Secretary), projected from the `config_schema` in `plugin.yaml`. It includes timezone, destination, daily ceiling, quiet hours, cooldown, source toggles, public interests/sources, discovery, budgets, preparation and the four model-route fields. The validated `user_config` remains the single owner; the form is not a second store.
 
-Configuration precedence: native `plugins.entries.hermes-proactive-secretary.settings.user_config` and ordinary flat form fields, then local `user_config.json` beside `policy.json`, then neutral defaults. A present-but-malformed native setting fails closed; it never silently falls back. See `policy/user-config.example.json` for the neutral shape.
+Configuration precedence: native `plugins.entries.hermes-proactive-secretary.settings.user_config` and ordinary flat form fields, then local `user_config.json` beside `policy.json`, then neutral defaults. A present-but-malformed native setting fails closed; it never silently falls back. See `policy/user-config.example.json` for the neutral shape. The plugin form and onboarding write the same validated owner, so a later form edit and a resumed onboarding review converge on the current effective values rather than an old snapshot.
 
 Model routing: operator native `auxiliary.proactive_secretary` pin **>** plugin primary/fallback fields **>** initial chat-model inheritance only when no secretary primary is configured. `primary_provider`/`primary_model` are both-or-none; `fallback_provider`/`fallback_model` are both-or-none and require an assigned primary. After the assigned fallback fails there is no extra main/global/chat escalation; on a host without the strict contract, nothing is dispatched. Route changes are read by the next secretary process or a native plugin reload; instant in-process reload is not promised.
 
@@ -195,6 +206,7 @@ Preview and import an existing deployment's own durable state; never import anot
 hermes secretary setup --import-from '<legacy-tree>' --import-dry-run
 hermes secretary setup --import-from '<legacy-tree>'
 hermes secretary configure migrate --from-policy '<legacy-policy.json>' --dry-run
+hermes secretary configure project
 ```
 
 Import refuses conflicting targets, rejects symlinks and path traversal, copies owner-only, and never deletes or adopts legacy cron jobs. Migration preserves explicit scope, aliases, interests and adapters; it never moves the global pause into settings.
@@ -227,7 +239,7 @@ Maintainer commands from the source tree, using a Python environment with the He
 PYTHONPATH=src python3 -m unittest discover -s tests
 PYTHONPATH=src python3 -m proactive_pilot.selftest
 python3 release_export.py scan
-python3 release_export.py build --output ./dist/hermes-proactive-secretary-0.5.0.tar.gz
+python3 release_export.py build --output ./dist/hermes-proactive-secretary-0.5.1.tar.gz
 python3 release_export.py doctor --installed /path/to/extracted-package
 ```
 
@@ -235,9 +247,9 @@ python3 release_export.py doctor --installed /path/to/extracted-package
 
 ## Qualification and limitations
 
-The 0.5.0 candidate has automated isolated test evidence. Live host/device qualification is still pending: real Telegram delivery, Desktop form interaction, real connector reads, real model calls, the strict host patch and mobile canaries are not claimed here.
+The 0.5.1 candidate has automated isolated test evidence. Live host/device qualification is still pending: real Telegram delivery, Desktop form interaction, real connector reads, real model calls and mobile/device canaries are not claimed here. The reviewed strict auxiliary-host patch remains a separate change that must be applied and verified on the host before model-dependent work can run.
 
-0.5.0 remains limited: delivery is unconfirmed, source coverage is bounded, quiet/attention behavior is deterministic but not omniscient, and model-dependent features require a compatible host. Validate the exact connectors and messaging route you intend to use.
+0.5.1 remains limited: delivery is unconfirmed, source coverage is bounded, quiet/attention behavior is deterministic but not omniscient, and model-dependent features require a compatible host. Validate the exact connectors and messaging route you intend to use. The custom settings page, grouped editable controls and confirmed reset are included in this candidate, but they were verified with synthetic host/API/Node tests, not a live Desktop visual, accessibility or device session. The reviewed strict auxiliary-host patch is still a separate host activation prerequisite for model-dependent work.
 
 For agent-assisted installation, give your agent [AGENT_SETUP.md](AGENT_SETUP.md). The operational skill is [skills/proactive-secretary/SKILL.md](skills/proactive-secretary/SKILL.md).
 

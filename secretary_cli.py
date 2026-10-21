@@ -92,7 +92,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
              ("run-once", "Dry, no-model run (never sends)"),
              ("watch", "Manage public watches (add | list | remove)"),
              ("feedback", "Record or inspect notification preferences"),
-             ("configure", "Validated per-user configuration (show | validate | preview | init | migrate)"),
+             ("configure", "Validated per-user configuration (show | validate | preview | project | init | migrate)"),
              ("pipeline", "Internal: scheduled ordinary pipeline via the native context bridge"),
              ("prepare", "Internal: one bounded private-preparation draft (opt-in; no agent job)"),
              ("responsibilities", "Capture/list/inspect/update/cancel accepted responsibilities and inspect handoff"),
@@ -167,9 +167,11 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p["feedback"].add_argument("feedback_args", nargs=argparse.REMAINDER,
                                help="arguments forwarded to the validated feedback CLI")
     p["configure"].add_argument("action",
-                                choices=("show", "validate", "preview", "init", "migrate"),
-                                help="show/validate/preview the config, init a neutral "
-                                     "example, or migrate a legacy policy")
+                                choices=("show", "validate", "preview", "project", "init",
+                                         "migrate"),
+                                help="show/validate/preview the config, project the "
+                                     "validated effective config into the native form, "
+                                     "init a neutral example, or migrate a legacy policy")
     p["configure"].add_argument("--file", default=None,
                                 help="user configuration path (default: <data>/user_config.json)")
     p["configure"].add_argument("--from-policy", default=None, metavar="POLICY",
@@ -256,23 +258,70 @@ def _write_policy(force: bool) -> dict[str, Any]:
     return {"policy": str(target), "action": "written"}
 
 
-def _project_native_settings(config: dict[str, Any]) -> dict[str, Any]:
+def _backup_before_change(reason: str) -> dict[str, Any]:
+    """Snapshot this plugin's own settings records before a settings write.
+
+    Raises on failure so a caller can stop before changing anything. Only the
+    plugin's declared records are included (never credentials, .env, host
+    memories or unrelated configuration).
+    """
+    _ensure_src()
+    from proactive_pilot import config_backup
+    ctx = get_native_context()
+    return config_backup.create_backup(
+        paths.data_root(), native=ctx, state=getattr(ctx, "state", None), reason=reason)
+
+
+def _project_native_settings(config: dict[str, Any], *, reason: str = "configure project",
+                             backup: bool = True) -> dict[str, Any]:
     """Project validated ordinary controls onto the native settings form.
 
     Uses only the host-provided context writer. Offline processes (and the
     scheduled subprocess lane) have no writer, so they report that fact and
-    write nothing; they never construct a host context themselves.
+    write nothing; they never construct a host context themselves. A true no-op
+    creates no backup and performs no write; a real change is backed up first
+    and a backup failure prevents every projection write.
     """
     _ensure_src()
+    from collections.abc import MutableMapping
     from proactive_pilot import userconfig
     ctx = get_native_context()
-    if ctx is None or not callable(getattr(ctx, "set_config", None)):
+    if ctx is None or (not callable(getattr(ctx, "set_config", None))
+                       and not isinstance(ctx, MutableMapping)):
         return {"projected": False, "reason": "no native settings writer"}
     try:
+        changes = userconfig.native_flat_changes(ctx, config)
+        if not changes:
+            return {"projected": True, "written": [], "noop": True, "backup": None}
+        snapshot = _backup_before_change(reason) if backup else None
         written = userconfig.project_native_settings(ctx, config)
     except Exception as exc:  # noqa: BLE001 - report, never half-claim success
         return {"projected": False, "error": f"{type(exc).__name__}: {exc}"}
-    return {"projected": True, "written": written}
+    return {"projected": True, "written": written, "noop": False,
+            "changed": sorted(changes), "backup": snapshot}
+
+
+def _same_config_file(path: Path, payload: dict[str, Any]) -> bool:
+    """True when the target already contains exactly this logical config."""
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    clean = {key: value for key, value in payload.items()
+             if not str(key).startswith("_")}
+    return existing == clean
+
+
+def _native_projection_changes(config: dict[str, Any]) -> dict[str, Any]:
+    """Preview ordinary native-form changes without writing anything."""
+    from collections.abc import MutableMapping
+    _ensure_src()
+    from proactive_pilot import userconfig
+    ctx = get_native_context()
+    if ctx is None or (not callable(getattr(ctx, "set_config", None))
+                       and not isinstance(ctx, MutableMapping)):
+        return {}
+    return userconfig.native_flat_changes(ctx, config)
 
 
 def _ensure_user_config() -> dict[str, Any]:
@@ -295,10 +344,7 @@ def _ensure_user_config() -> dict[str, Any]:
     payload.setdefault("advanced", {})["onboarding_provenance"] = (
         userconfig.neutral_init_marker(payload))
     status = _write_user_config(target, payload, force=False)
-    result = {"user_config": str(target), "action": status}
-    if status == "written":
-        result["native_projection"] = _project_native_settings(payload)
-    return result
+    return {"user_config": str(target), "action": status}
 
 
 def _ensure_preferences() -> dict[str, Any]:
@@ -598,6 +644,15 @@ def setup_command(args: argparse.Namespace, *, backend: cron_mod.CronBackend | N
             "source": loaded_cfg.source,
             "destination": loaded_cfg.config["notification"]["destination"],
         }
+        # An explicit setup (new or existing policy) backfills the same safe
+        # projection. It never rewrites the config file and creates no grants
+        # or jobs; a true no-op writes and backs up nothing.
+        result["native_projection"] = _project_native_settings(
+            loaded_cfg.config, reason="setup explicit projection")
+        if result["native_projection"].get("error"):
+            result["warnings"].append(
+                "native settings projection did not complete: "
+                + str(result["native_projection"]["error"]))
         # Effective notification destination: explicit --deliver wins, else a
         # real configured destination. 'local' is the safe fallback (record but
         # do not deliver), so it is not treated as a configured target; only when
@@ -1721,6 +1776,41 @@ def configure_command(args: argparse.Namespace) -> int:
             _emit(payload, as_json=as_json, human=human)
             return 0
 
+        if action == "project":
+            loaded = userconfig.load_user_config(path, native=get_native_context())
+            ctx = get_native_context()
+            if ctx is None or not callable(getattr(ctx, "set_config", None)):
+                _emit({"ok": False, "action": "project", "status": "failed",
+                       "path": str(path), "present": loaded.present,
+                       "source": loaded.source,
+                       "native_projection": {"projected": False,
+                                             "reason": "no native settings writer"}},
+                      as_json=as_json,
+                      human="config project failed: no native settings writer available")
+                return 1
+            changes = _native_projection_changes(loaded.config)
+            if not changes:
+                _emit({"ok": True, "action": "project", "status": "unchanged",
+                       "path": str(path), "present": loaded.present,
+                       "source": loaded.source, "changed": [],
+                       "native_projection": {"projected": True, "written": [],
+                                             "noop": True, "backup": None}},
+                      as_json=as_json,
+                      human="config project: native form already matches; nothing changed")
+                return 0
+            projection = _project_native_settings(
+                loaded.config, reason="configure project")
+            ok = bool(projection.get("projected"))
+            _emit({"ok": ok, "action": "project",
+                   "status": "projected" if ok else "failed", "path": str(path),
+                   "present": loaded.present, "source": loaded.source,
+                   "changed": sorted(changes), "native_projection": projection},
+                  as_json=as_json,
+                  human=(f"config project: {len(projection.get('written') or [])} native "
+                         f"field(s) updated") if ok else
+                        f"config project FAILED: {projection.get('error') or projection.get('reason')}")
+            return 0 if ok else 1
+
         if action == "init":
             example = paths.user_config_example_path()
             if not example.is_file():
@@ -1732,11 +1822,28 @@ def configure_command(args: argparse.Namespace) -> int:
                 _emit({"ok": True, "action": "init", "dry_run": True, "path": str(path)},
                       as_json=as_json, human=f"config init (dry-run): nothing written to {path}")
                 return 0
-            status = _write_user_config(path, payload, bool(getattr(args, "force", False)))
-            projection = ({"projected": False, "reason": "existing config kept"}
-                          if status == "kept" else _project_native_settings(payload))
+            force = bool(getattr(args, "force", False))
+            nonempty = path.exists() and bool(path.read_text(encoding="utf-8").strip())
+            if nonempty and not force:
+                status = "kept"
+                projection = {"projected": False, "reason": "existing config kept"}
+                backup = None
+            else:
+                same_file = _same_config_file(path, payload)
+                changes = _native_projection_changes(payload)
+                if same_file and not changes:
+                    status = "unchanged"
+                    projection = {"projected": True, "written": [], "noop": True,
+                                  "backup": None}
+                    backup = None
+                else:
+                    backup = _backup_before_change("configure init")
+                    status = "unchanged" if same_file else _write_user_config(
+                        path, payload, force=True)
+                    projection = _project_native_settings(
+                        payload, reason="configure init", backup=False)
             _emit({"ok": True, "action": "init", "status": status, "path": str(path),
-                   "native_projection": projection},
+                   "backup": backup, "native_projection": projection},
                   as_json=as_json,
                   human=f"config init: {status} {path}")
             return 0
@@ -1803,12 +1910,28 @@ def configure_command(args: argparse.Namespace) -> int:
                       as_json=as_json, human=f"config migrate (dry-run): reviewed {src}")
                 return 0
             force_write = bool(getattr(args, "force", False)) or source_is_config
-            status = _write_user_config(path, migrated, force_write)
-            projection = ({"projected": False, "reason": "existing config kept"}
-                          if status == "kept" else _project_native_settings(migrated))
+            nonempty = path.exists() and bool(path.read_text(encoding="utf-8").strip())
+            if nonempty and not force_write:
+                status = "kept"
+                projection = {"projected": False, "reason": "existing config kept"}
+                backup = None
+            else:
+                same_file = _same_config_file(path, migrated)
+                changes = _native_projection_changes(migrated)
+                if same_file and not changes:
+                    status = "unchanged"
+                    projection = {"projected": True, "written": [], "noop": True,
+                                  "backup": None}
+                    backup = None
+                else:
+                    backup = _backup_before_change("configure migrate")
+                    status = "written" if same_file else _write_user_config(
+                        path, migrated, force=True)
+                    projection = _project_native_settings(
+                        migrated, reason="configure migrate", backup=False)
             _emit({"ok": True, "action": "migrate", "status": status,
                    "path": str(path), **source_label, "report": report,
-                   "native_projection": projection},
+                   "backup": backup, "native_projection": projection},
                   as_json=as_json,
                   human=f"config migrate: {status} {path} (from {src})")
             return 0
@@ -1817,7 +1940,7 @@ def configure_command(args: argparse.Namespace) -> int:
                "remedy": getattr(exc, "remedy", "")},
               as_json=as_json, human=f"configure {action} FAILED: {exc}")
         return 1
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         _emit({"ok": False, "action": action, "error": f"{type(exc).__name__}: {exc}"},
               as_json=as_json, human=f"configure {action} FAILED: {exc}")
         return 1

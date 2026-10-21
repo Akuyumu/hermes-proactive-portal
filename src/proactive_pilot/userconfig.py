@@ -943,6 +943,25 @@ def _same_form_value(left: Any, right: Any) -> bool:
     return type(left) is type(right) and left == right
 
 
+def native_flat_changes(native: Any, config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only the ordinary form values that would actually change.
+
+    The caller uses this before taking a backup: an empty result is a true
+    no-op, so no backup and no write are needed. Values are validated once here
+    and again by :func:`project_native_settings` before any write.
+    """
+    values = native_flat_values(config)
+    getter = _native_getter(native)
+    changes: dict[str, Any] = {}
+    for key, value in values.items():
+        if getter is not None:
+            current = getter(key, _UNSET)
+            if current is not _UNSET and _same_form_value(current, value):
+                continue
+        changes[key] = value
+    return changes
+
+
 def project_native_settings(native: Any, config: Mapping[str, Any]) -> list[str]:
     """Mirror validated ordinary controls into the native settings form.
 
@@ -1342,6 +1361,6 @@ __all__ = [
     "CONFIG_SCHEMA", "CONFIG_VERSION", "DEFAULT_TIMEZONE", "NATIVE_SETTINGS_KEY",
     "ConfigError", "LoadedConfig", "default_config", "validate_config",
     "load_user_config", "migrate_legacy", "migrate_config", "policy_overrides",
-    "apply_user_config", "native_flat_values", "project_native_settings",
-    "schema_summary",
+    "apply_user_config", "native_flat_values", "native_flat_changes",
+    "project_native_settings", "schema_summary",
 ]

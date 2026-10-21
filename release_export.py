@@ -1,4 +1,4 @@
-"""Reproducible code-only 0.5.0 export builder and installed-candidate doctor.
+"""Reproducible code-only 0.5.1 export builder and installed-candidate doctor.
 
 This is not a new package manager. It uses the plugin's existing manifest and
 Python modules, applies the same export rules the release review requires, and
@@ -10,7 +10,7 @@ Rules enforced by :func:`build_package`:
 * every shipped file comes from an explicit allowlist of code/docs/policy/skill/
   runner trees (no ``.build-context``, tests, git metadata, caches, private
   runtime state or scratch files);
-* the manifest and ``src/proactive_pilot/__init__.py`` both say 0.5.0;
+* the manifest and ``src/proactive_pilot/__init__.py`` both say 0.5.1;
 * sanitisation terms and absolute personal home paths are rejected;
 * file order, timestamps and hashes are deterministic.
 """
@@ -32,9 +32,14 @@ from pathlib import Path
 from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.5.0"
-SHIPPED_DIRS = ("src", "policy", "skills", "runners", "public_samples", "fixtures")
+VERSION = "0.5.1"
+SHIPPED_DIRS = ("src", "policy", "skills", "runners", "public_samples", "fixtures",
+                "desktop", "dashboard")
+# Nested trees contain executable/assets as well as docs. Keep the same
+# conservative extension allowlist as root files so an editor backup, source map
+# or unrelated binary cannot be swept into a release by accident.
 ROOT_SUFFIXES = (".py", ".md", ".json", ".yaml", ".yml", ".html", ".txt")
+SHIPPED_SUFFIXES = frozenset(ROOT_SUFFIXES + (".js", ".mjs", ".css"))
 # Extensionless root files that are part of the redistribution contract. The
 # README links LICENSE, so omitting it would ship a broken/incomplete package.
 ROOT_NAMES = ("LICENSE", "NOTICE")
@@ -44,7 +49,7 @@ EXCLUDED_NAMES = {
     ".mypy_cache", ".pytest_cache", "references",
 }
 # Obsolete 0.4.0 finalization notes stay in the source tree for history but are
-# NOT shipped as 0.5.0 documentation.
+# NOT shipped as 0.5.1 documentation.
 EXCLUDED_ROOT_FILES = {"FINALIZATION_PREPARATION.md"}
 FORBIDDEN = ("Kuyu", "-sama")
 HOME_RE = re.compile(r"/(?:home|Users)/[A-Za-z0-9._-]+")
@@ -67,6 +72,8 @@ def _shipped_files(root: Path = ROOT) -> list[Path]:
                 continue
             parts = set(path.relative_to(root).parts)
             if parts & EXCLUDED_NAMES or "__pycache__" in parts:
+                continue
+            if name in ("desktop", "dashboard") and path.suffix.lower() not in SHIPPED_SUFFIXES:
                 continue
             files.append(path)
     return sorted(set(files), key=lambda p: p.relative_to(root).as_posix())
@@ -171,6 +178,13 @@ cli = importlib.import_module(pkg + ".secretary_cli")
 runners = importlib.import_module(pkg + ".runner_install")
 assert callable(getattr(prep, "preflight", None))
 assert (root / "runners" / "proactive_secretary_prepare_runner.py").is_file()
+api_spec = importlib.util.spec_from_file_location(
+    "hermes_proactive_secretary_dashboard_api", root / "dashboard" / "plugin_api.py")
+api = importlib.util.module_from_spec(api_spec)
+sys.modules[api_spec.name] = api
+api_spec.loader.exec_module(api)
+assert getattr(api, "router", None) is not None, "dashboard router missing"
+assert getattr(api, "PLUGIN_ID", "") == "hermes-proactive-secretary"
 print("ok")
 """
         try:
@@ -217,7 +231,9 @@ def doctor(installed: Path) -> dict[str, Any]:
     installed = Path(installed)
     required = ("plugin.yaml", "__init__.py", "secretary_cli.py", "paths.py",
                 "LICENSE", "src/proactive_pilot/__init__.py",
-                "runners/proactive_secretary_prepare_runner.py")
+                "runners/proactive_secretary_prepare_runner.py",
+                "desktop/plugin.js", "dashboard/plugin_api.py",
+                "dashboard/manifest.json")
     missing = [name for name in required if not (installed / name).is_file()]
     manifest_version, module_version = _version(installed)
     shipped = scan(installed)

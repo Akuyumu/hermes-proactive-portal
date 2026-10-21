@@ -76,6 +76,10 @@ def default_state() -> dict[str, Any]:
         "capabilities": {},
         "history": [],
         "decided": [],
+        # Last values actually written by an onboarding confirmation. This lets
+        # a later read tell an applied value (safe to converge on the current
+        # native form) from an unsaved in-progress edit (must be preserved).
+        "applied": {},
     }
 
 
@@ -358,12 +362,15 @@ class OnboardingService:
             return set()
 
     def _seed_from_effective_config(self, state: dict[str, Any]) -> None:
-        """Seed only settings the user explicitly chose, never factories.
+        """Converge onboarding fields on the CURRENT effective configuration.
 
-        Raw/flat presence is evaluated before validation fills neutral defaults.
-        A generated neutral setup records a baseline marker, so UTC/5/0/8 are
-        not presented as decisions. Existing accounts/grants/operator pins keep
-        precedence; memory facts remain proposals and false grants stay false.
+        The native/file configuration is the one runtime owner; onboarding state
+        is a resumable snapshot, never a shadow preference store. An applied
+        value can therefore be refreshed when a native form edit changes the
+        effective configuration, while an unsaved in-progress edit is preserved.
+        Fields the configuration does not mention (proposed facts, un-applied
+        choices and separately granted scopes) are never invented, and
+        generated-neutral factories are never mistaken for user decisions.
         """
         try:
             loaded = self._loaded_effective()
@@ -374,56 +381,106 @@ class OnboardingService:
         config = loaded.config
         known = self._known_fields(loaded)
         decided = set(state.get("decided") or [])
+        applied = state.get("applied") if isinstance(state.get("applied"), dict) else {}
+        applied_decided = set(applied.get("decided") or [])
+        complete = state.get("status") in ("pending_verification", "ready")
+
+        def _safe_to_refresh(marker: str, bucket: str, key: str, current: Any) -> bool:
+            """True when state does not hold an unsaved edit for this field."""
+            if marker not in decided:
+                return True  # never presented as a choice: seed from config
+            if not current and current != 0:
+                return True  # blank state always accepts an explicit config value
+            if not applied:
+                # Legacy state has no applied snapshot: a completed setup is a
+                # stale snapshot; an in-progress one may still be edited.
+                return complete
+            snapshot = applied.get(bucket) if isinstance(applied.get(bucket), dict) else {}
+            return marker in applied_decided and snapshot.get(key) == current
+
         timezone_name = str(config.get("timezone") or "").strip()
-        if timezone_name and "timezone" in known and not state["settings"].get("timezone"):
-            state["settings"]["timezone"] = timezone_name
-            decided.add("setting:timezone")
+        if timezone_name and "timezone" in known:
+            current = state["settings"].get("timezone") or ""
+            if _safe_to_refresh("setting:timezone", "settings", "timezone", current):
+                state["settings"]["timezone"] = timezone_name
+                decided.add("setting:timezone")
+
         notif = config.get("notification") or {}
-        destination = str(notif.get("destination") or "").strip()
-        if destination and "notification.destination" in known \
-                and not state["destination"].get("target"):
-            state["destination"]["target"] = destination
-            state["destination"]["status"] = "unverified"
-            decided.add("destination")
-        if notif.get("daily_normal_cap") is not None \
-                and "notification.daily_normal_cap" in known \
-                and "setting:daily_allowance" not in decided:
-            state["settings"]["daily_allowance"] = int(notif["daily_normal_cap"])
-            decided.add("setting:daily_allowance")
-        for key in ("quiet_start_hour", "quiet_end_hour"):
-            marker = f"setting:{key}"
-            if notif.get(key) is not None \
-                    and f"notification.{key}" in known and marker not in decided:
-                state["settings"][key] = int(notif[key])
-                decided.add(marker)
+        if "notification.destination" in known:
+            target = str(notif.get("destination") or "").strip()
+            destination = state.setdefault("destination", {})
+            current = str(destination.get("target") or "")
+            if _safe_to_refresh("destination", "destination", "target", current):
+                if target != current:
+                    destination.update({"target": target,
+                                        "status": "unverified" if target else "unconfigured",
+                                        "challenge": "", "confirmed_at": ""})
+                elif not target:
+                    destination["status"] = "unconfigured"
+                elif destination.get("status") == "unconfigured":
+                    destination["status"] = "unverified"
+                decided.add("destination")
+
+        for marker, field, key in (
+                ("setting:daily_allowance", "daily_normal_cap", "daily_allowance"),
+                ("setting:quiet_start_hour", "quiet_start_hour", "quiet_start_hour"),
+                ("setting:quiet_end_hour", "quiet_end_hour", "quiet_end_hour")):
+            if notif.get(field) is not None and f"notification.{field}" in known:
+                current = state["settings"].get(key)
+                if _safe_to_refresh(marker, "settings", key, current):
+                    state["settings"][key] = int(notif[field])
+                    decided.add(marker)
+
         sources = config.get("sources") or {}
-        for key in SOURCE_GRANT_KEYS:
-            if f"sources.{key}" in known:
-                state["grants"][key] = bool(sources.get(key))
-                decided.add(f"grant:{key}")
+        # Onboarding's public grant is the typed public-feeds switch. The two
+        # names are intentionally mapped here instead of being written as an
+        # unknown ``sources.public_sources`` key that validation would ignore.
+        for grant, flag in (("mail", "mail"), ("calendar", "calendar"),
+                            ("tasks", "tasks"), ("public_sources", "public_feeds")):
+            if f"sources.{flag}" in known:
+                current = bool(state["grants"].get(grant))
+                if _safe_to_refresh(f"grant:{grant}", "grants", grant, current):
+                    state["grants"][grant] = bool(sources.get(flag))
+                decided.add(f"grant:{grant}")
+
         scope = state["source_scope"]
-        for field, section, path in (
-                ("mail_accounts", "mail", "mail.accounts"),
-                ("calendar_accounts", "calendar", "calendar.accounts"),
-                ("calendars", "calendar", "calendar.calendars"),
-                ("task_lists", "tasks", "tasks.lists")):
-            values = (config.get(section) or {}).get(
-                {"mail_accounts": "accounts", "calendar_accounts": "accounts",
-                 "calendars": "calendars", "task_lists": "lists"}[field]) or []
-            if values and path in known:
-                scope[field] = list(values)
+        for field, section, key, path in (
+                ("mail_accounts", "mail", "accounts", "mail.accounts"),
+                ("calendar_accounts", "calendar", "accounts", "calendar.accounts"),
+                ("calendars", "calendar", "calendars", "calendar.calendars"),
+                ("task_lists", "tasks", "lists", "tasks.lists")):
+            if path in known:
+                current = list(scope.get(field) or [])
+                if _safe_to_refresh(f"scope:{field}", "source_scope", field, current):
+                    # Explicit-empty scope is a decision and must stay empty.
+                    scope[field] = list((config.get(section) or {}).get(key) or [])
                 decided.add(f"scope:{field}")
-        if config.get("public_interests") and "public_interests" in known:
-            scope["public_interests"] = list(config["public_interests"])
+        if "public_interests" in known:
+            current = list(scope.get("public_interests") or [])
+            if _safe_to_refresh("scope:public_interests", "source_scope",
+                                "public_interests", current):
+                scope["public_interests"] = list(config.get("public_interests") or [])
             decided.add("scope:public_interests")
-        # Existing native route controls are operator/user choices; seeding them
-        # only fills a blank onboarding field and never mutates the native pin.
+
+        # Existing native route controls are operator/user choices. Read only
+        # this plugin's four declared route keys; absent keys are not guessed.
         try:
-            from .secretary_models import read_route_settings
-            for key, value in read_route_settings(self.ctx).items():
-                if value and not state["settings"].get(key):
-                    state["settings"][key] = value
-                    decided.add(f"setting:{key}")
+            getter = getattr(self.ctx, "get_config", None)
+            if callable(getter):
+                missing = object()
+                for key in ROUTE_SETTING_KEYS:
+                    value = getter(key, missing)
+                    if value is not missing and isinstance(value, str):
+                        current = state["settings"].get(key) or ""
+                        if _safe_to_refresh(f"setting:{key}", "settings", key, current):
+                            state["settings"][key] = value.strip()
+                        decided.add(f"setting:{key}")
+            else:
+                from .secretary_models import read_route_settings
+                for key, value in read_route_settings(self.ctx).items():
+                    if value and not state["settings"].get(key):
+                        state["settings"][key] = value
+                        decided.add(f"setting:{key}")
         except Exception:  # noqa: BLE001 - routes remain unseeded, not guessed
             pass
         state["decided"] = sorted(decided)[-100:]
@@ -751,7 +808,8 @@ class OnboardingService:
         src = str(Path(__file__).resolve().parent / "src")
         if src not in sys.path:
             sys.path.insert(0, src)
-        from proactive_pilot.userconfig import (project_native_settings,
+        from proactive_pilot.userconfig import (native_flat_changes,
+                                                project_native_settings,
                                                 validate_config)
 
         loaded = self._loaded_effective()
@@ -777,9 +835,11 @@ class OnboardingService:
         for marker, path in field_markers.items():
             if marker in decided:
                 chosen_paths.add(path)
+        source_flags = {"mail": "mail", "calendar": "calendar",
+                        "tasks": "tasks", "public_sources": "public_feeds"}
         for key in SOURCE_GRANT_KEYS:
             if f"grant:{key}" in decided:
-                chosen_paths.add(f"sources.{key}")
+                chosen_paths.add(f"sources.{source_flags[key]}")
         if chosen_paths:
             advanced = config.setdefault("advanced", {})
             if isinstance(advanced, dict):
@@ -825,7 +885,7 @@ class OnboardingService:
         sources = config.setdefault("sources", {})
         for key in SOURCE_GRANT_KEYS:
             if f"grant:{key}" in decided:
-                sources[key] = bool(state["grants"].get(key))
+                sources[source_flags[key]] = bool(state["grants"].get(key))
         scope = state["source_scope"]
         for section, field, decided_key, scope_key in (
                 ("mail", "accounts", "scope:mail_accounts", "mail_accounts"),
@@ -844,21 +904,63 @@ class OnboardingService:
         persisted = {key: value for key, value in validated.items()
                      if not str(key).startswith("_")}
         writer = self._settings_writer
-        if writer is not None:
-            writer(copy.deepcopy(persisted))
-        elif _has_callable(self.ctx, "set_config"):
-            self.ctx.set_config("user_config", persisted)
-        else:
+        if writer is None and not _has_callable(self.ctx, "set_config"):
             raise OnboardingError("native settings writer is unavailable")
+
+        def _same_user_config(value: Any) -> bool:
+            if isinstance(value, Mapping):
+                return dict(value) == persisted
+            if isinstance(value, str) and value.strip():
+                try:
+                    return json.loads(value) == persisted
+                except ValueError:
+                    return False
+            return False
+
+        getter = getattr(self.ctx, "get_config", None)
+        missing = object()
+        current_user_config = getter("user_config", missing) if callable(getter) else missing
+        user_config_changed = not (current_user_config is not missing
+                                   and _same_user_config(current_user_config))
+        projection_changes = (native_flat_changes(self.ctx, validated)
+                              if _has_callable(self.ctx, "set_config") else {})
+        route_writes: dict[str, str] = {}
+        if callable(getter) and any(f"setting:{key}" in decided
+                                    for key in ROUTE_SETTING_KEYS):
+            for key in ROUTE_SETTING_KEYS:
+                desired = str(settings.get(key) or "")
+                current = getter(key, missing)
+                if current is missing and not desired:
+                    continue
+                if current is not missing and isinstance(current, str) \
+                        and current.strip() == desired:
+                    continue
+                route_writes[key] = desired
 
         projected: list[str] = []
         route_written: list[str] = []
-        if _has_callable(self.ctx, "set_config"):
-            projected = project_native_settings(self.ctx, validated)
-            if any(f"setting:{key}" in decided for key in ROUTE_SETTING_KEYS):
-                for key in ROUTE_SETTING_KEYS:
-                    self.ctx.set_config(key, str(settings.get(key) or ""))
-                    route_written.append(key)
+        backup = None
+        if user_config_changed or projection_changes or route_writes:
+            try:
+                from proactive_pilot import config_backup
+                from . import paths as plugin_paths
+                backup = config_backup.create_backup(
+                    plugin_paths.data_root(), native=self.ctx,
+                    state=self._state_facade, reason="onboarding apply settings")
+            except Exception as exc:  # noqa: BLE001 - never write without backup
+                raise OnboardingError(
+                    "settings backup failed; nothing was changed "
+                    f"({type(exc).__name__})") from exc
+            if user_config_changed:
+                if writer is not None:
+                    writer(copy.deepcopy(persisted))
+                else:
+                    self.ctx.set_config("user_config", persisted)
+            if projection_changes:
+                projected = project_native_settings(self.ctx, validated)
+            for key, value in route_writes.items():
+                self.ctx.set_config(key, value)
+                route_written.append(key)
 
         after = {
             "record": (f"plugins.entries.{getattr(self.ctx, 'plugin_id', 'hermes-proactive-secretary')}"
@@ -873,6 +975,8 @@ class OnboardingService:
             "projected_native_fields": projected,
             "projected_model_fields": route_written,
             "effective_source": loaded.source,
+            "backup": backup,
+            "changed": bool(user_config_changed or projection_changes or route_writes),
         }
         return after
 
@@ -886,6 +990,14 @@ class OnboardingService:
         config_readback = None
         if apply_settings:
             config_readback = self._apply_settings(state)
+            state["applied"] = {
+                "at": _now(),
+                "decided": sorted(state.get("decided") or []),
+                "settings": copy.deepcopy(state["settings"]),
+                "grants": copy.deepcopy(state["grants"]),
+                "source_scope": copy.deepcopy(state["source_scope"]),
+                "destination": (state.get("destination") or {}).get("target", ""),
+            }
         state["status"] = "pending_verification"
         state["current_step"] = "delivery_verification"
         state["completed_at"] = _now()

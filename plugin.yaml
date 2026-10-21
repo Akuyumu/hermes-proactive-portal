@@ -1,5 +1,5 @@
 name: hermes-proactive-secretary
-version: 0.5.0
+version: 0.5.1
 kind: standalone
 platforms:
   - linux
@@ -23,6 +23,11 @@ provides_skills:
   - proactive-secretary
 provides_cli_commands:
   - secretary
+provides_tools:
+  - secretary_onboarding
+  - secretary_responsibility
+provides_hooks:
+  - pre_llm_call
 
 # Ordinary native Desktop controls (Settings -> Plugins). Hermes reads this as a
 # mapping of setting key -> field spec and writes edits under
@@ -34,80 +39,120 @@ provides_cli_commands:
 config_schema:
   timezone:
     type: str
-    title: Timezone
-    description: IANA timezone used for quiet hours and the local-day allowance.
+    title: Your timezone
+    description: >-
+      The city/region timezone used for quiet hours and the daily message
+      allowance (for example UTC, Europe/London or America/New_York). This is
+      a setting only; it does not connect any source.
     default: UTC
   destination:
     type: str
-    title: Delivery target
-    description: Local or a configured chat target. Leave empty for local recording.
+    title: Where messages are sent
+    description: >-
+      Leave empty to record messages locally without sending them. A chat
+      target can be entered later, but delivery is only confirmed by an
+      explicit canary; entering a target here does not verify it.
     default: ""
   daily_normal_cap:
     type: int
-    title: Daily discretionary message ceiling
-    description: Any nonnegative integer. Zero suppresses ordinary discretionary messages only.
+    title: Most ordinary messages per day
+    description: >-
+      A daily ceiling, never a target. Use 0 to stop ordinary discretionary
+      messages. Important reminders you asked for are still tracked separately.
     default: 5
     minimum: 0
   quiet_start_hour:
     type: int
-    title: Quiet hours start (local hour)
-    description: Inclusive local hour when ordinary messages are deferred (0-23).
+    title: Quiet hours begin (local hour)
+    description: >-
+      Ordinary messages wait from this hour (0-23). This is a quiet period,
+      not a pause; urgent requested reminders are not silently discarded.
     default: 0
     minimum: 0
     maximum: 23
   quiet_end_hour:
     type: int
     title: Quiet hours end (local hour)
-    description: Exclusive local hour when ordinary messages may resume (0-23).
+    description: >-
+      Ordinary messages may resume from this hour (0-23). Set both quiet-hour
+      fields together for the period you want.
     default: 8
     minimum: 0
     maximum: 23
   cooldown_minutes:
     type: int
-    title: Minimum spacing between messages (minutes)
+    title: Minimum gap between messages (minutes)
+    description: >-
+      A short breathing space between ordinary messages so a busy day is not
+      flooded with separate alerts.
     default: 30
     minimum: 0
     maximum: 1440
   public_feeds:
     type: bool
-    title: Enable public feeds
+    title: Allow public-source checks
     description: >-
-      Enables explicitly configured public feeds. Requires at least one entry in
-      "Public source definitions"; enabling this alone yields no coverage.
+      This only switches on reading the public sources listed below. It adds
+      no sources by itself: with an empty source list, public coverage is
+      still none. Private mail, calendar and tasks need their own switches
+      and authorised accounts.
     default: false
   obligations:
     type: bool
-    title: Mail obligations
-    description: Read configured mail accounts for due payments/orders.
+    title: Check mail for due payments and orders
+    description: >-
+      Reads accounts you have already connected and scoped to look for due
+      payments, orders and similar commitments. Off means no mail is read for
+      this purpose, even if mail is connected elsewhere.
     default: false
   mail_enabled:
     type: bool
-    title: Mail monitoring
+    title: Check mail
+    description: >-
+      On means mail may be checked after a mail account is separately
+      connected and authorised. It does not connect an account, grant access
+      or make an unavailable connector work. Off keeps mail unread.
     default: false
   calendar_enabled:
     type: bool
-    title: Calendar monitoring
+    title: Check calendar
+    description: >-
+      On means the calendar may be checked after a calendar account is
+      separately connected and scoped. It does not connect an account or
+      grant access. Off keeps the calendar unread.
     default: false
   tasks_enabled:
     type: bool
-    title: Task monitoring
+    title: Check tasks
+    description: >-
+      On means tasks may be checked after a task account/list is separately
+      connected and scoped. It does not connect an account or grant access.
+      Off keeps tasks unread.
     default: false
   public_interests:
     type: array
-    title: Public interests
-    description: Explicit interests for public discovery; empty means none.
+    title: Public topics you care about
+    description: >-
+      Plain topic names used for public discovery. An empty list means none.
+      These are not permissions and never open a private account. Clearing
+      the list stays cleared.
     default: []
   public_sources:
     type: array
-    title: Public source definitions
+    title: Public pages or feeds to read
     description: >-
-      Explicit source objects. An empty list clears inherited seeds. Pair with
-      "Enable public feeds"; both are required for any public coverage.
+      Exact public source entries (kind and URL). An empty list means no
+      public sources, even when public-source checks are on. Adding a source
+      does not authorise any private account. Explicitly clearing this list
+      is preserved.
     default: []
   discovery_mode:
     type: str
-    title: Discovery mode
-    description: Adaptive discovery remains disabled unless explicitly selected.
+    title: Public discovery
+    description: >-
+      Choose disabled, shadow (prepare but do not act) or active. It stays
+      disabled unless you choose otherwise. Discovery only uses the public
+      sources and topics above; it does not widen private access.
     choices:
       - disabled
       - shadow
@@ -115,79 +160,98 @@ config_schema:
     default: disabled
   discovery_privacy_review:
     type: bool
-    title: Semantic privacy review for discovery
+    title: Extra privacy review for discovery
+    description: >-
+      Adds an optional semantic check before a public discovery result is
+      used. It is not a permission and does not read private accounts.
     default: false
   discovery_inferred_goals:
     type: bool
-    title: Allow inferred public goals
+    title: Allow guessed public goals
+    description: >-
+      When on, discovery may infer public goals from your stated interests.
+      Inferred goals stay separate from facts you approved and never become a
+      standing permission. Off by default.
     default: false
   collector_budget_seconds:
     type: int
-    title: Collection time budget (seconds)
-    description: Bounded per-run wall-clock allowance for source collection.
+    title: Time limit for one collection run (seconds)
+    description: >-
+      The most time one run may spend collecting. A smaller limit is gentler
+      on a slow connection; a larger limit may cover more sources.
     default: 60
     minimum: 5
     maximum: 600
   max_candidates_per_kind:
     type: int
-    title: Maximum candidates per kind
-    description: Bounded packet size per source kind.
+    title: Most candidates kept per source kind
+    description: >-
+      A packet-size limit, not a promise of that many results. Fewer
+      candidates means less noise; more means a broader look.
     default: 60
     minimum: 1
     maximum: 500
   feed_max_sources_per_run:
     type: int
-    title: Public feeds per run
-    description: Bounded public-feed reads per scheduled run.
+    title: Public sources read per run
+    description: >-
+      A bound on how many public sources are read in one scheduled run. Use 0
+      to read none while keeping the source list intact.
     default: 2
     minimum: 0
     maximum: 20
   preparation_enabled:
     type: bool
-    title: Private preparation
+    title: Draft private preparation
     description: >-
-      Opt-in bounded private drafts for explicitly accepted responsibilities.
-      Off by default. Enabling never creates a scheduled job or grants a source
-      scope; model work also requires a host with explicit configured-only routing.
+      Opt-in drafting for responsibilities you explicitly accepted. Off by
+      default. Turning it on does not create a scheduled job, grant a source
+      scope or make a model available; those remain separate explicit steps.
     default: false
   preparation_scopes:
     type: array
-    title: Approved preparation scopes
+    title: What preparation may read
     description: >-
-      Explicit standing scopes for private preparation: conversation, public,
-      mail, calendar, tasks, documents, memory. Broad public consent does not
-      imply private scopes.
+      Standing scopes you explicitly allow, such as conversation, public,
+      mail, calendar, tasks, documents or memory. Empty means none. A public
+      scope never implies access to private mail, calendar, tasks, documents
+      or memory.
     default: []
   preparation_source_consent:
     type: bool
-    title: Allow reading already-authorised cached source facts
+    title: Let preparation use already-checked facts
     description: >-
-      Off by default. When enabled together with preparation scopes, preparation
-      may read only fresh bounded facts already cached from sources you enabled.
-      It never opens a new connector/account or performs a fresh fetch.
+      When on with preparation scopes, preparation may read only fresh,
+      bounded facts already cached from sources you enabled. It never opens a
+      new account or connector and never fetches a source for the first time.
     default: false
   primary_provider:
     type: str
-    title: Secretary primary provider
+    title: Secretary model provider (optional)
     description: >-
-      Provider id for the secretary's own auxiliary task (set provider AND model,
-      or leave both empty). Leave both empty to inherit the active chat model
-      initially. Explicit native auxiliary pins win and are never modified.
+      The provider for the secretary's own small task. Set both provider and
+      model, or leave both empty to inherit the active chat model at first.
+      An explicit native auxiliary pin always wins and is never changed here.
     default: ""
   primary_model:
     type: str
-    title: Secretary primary model
-    description: Model id paired with the primary provider (both or neither).
+    title: Secretary model name (optional)
+    description: >-
+      The model name paired with the provider above. Both fields must be set
+      together or both left empty.
     default: ""
   fallback_provider:
     type: str
-    title: Secretary fallback provider
+    title: Backup model provider (optional)
     description: >-
-      Optional single configured fallback (set provider AND model, or neither).
-      No main/global/discovery escalation is allowed after this route fails.
+      One configured backup provider to try if the primary route fails. Set
+      both backup provider and model, or leave both empty. There is no
+      escalation to the main/global model after this route fails.
     default: ""
   fallback_model:
     type: str
-    title: Secretary fallback model
-    description: Model id paired with the fallback provider (both or neither).
+    title: Backup model name (optional)
+    description: >-
+      The model name paired with the backup provider. Both backup fields must
+      be set together or both left empty.
     default: ""
