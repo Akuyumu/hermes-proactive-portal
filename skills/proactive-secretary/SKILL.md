@@ -132,7 +132,7 @@ hermes secretary setup                             # idempotent; safe to re-run
 5. runs the offline self-test and an offline no-model dry-run **before** arming
    anything;
 6. only after those checks pass, installs the launchers and creates the two
-   native cron jobs — pilot every 15 minutes, requested-reminder dispatcher every
+   native cron jobs — monitoring every 15 minutes, requested-reminder dispatcher every
    1 minute — verifying each exists;
 7. prints a short summary: what is enabled, what is monitored, what is **not**
    covered, and how to pause.
@@ -163,8 +163,8 @@ hermes secretary self-test     # full offline deterministic suite
 ```
 
 Confirm:
-- `status` reports `enabled` and lists `hermes-proactive-secretary-pilot` and
-  `hermes-proactive-secretary-reminders`;
+- `status` reports `enabled` and lists `hermes-proactive-secretary-monitoring` and
+  `hermes-proactive-secretary-reminders` (plus the optional preparation job when recorded);
 - `doctor` exits 0 (cron backend available; launchers present);
 - `self-test` reports all checks passed.
 

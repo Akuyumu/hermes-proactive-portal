@@ -645,7 +645,7 @@ def context_command(args: Any) -> int:
         if action == "context-update":
             text = str(getattr(args, "note", "") or "")
             if not text:
-                print("proactive-pilot context update rejected: --note <text> is required",
+                print("proactive-secretary context update rejected: --note <text> is required",
                       file=__import__("sys").stderr)
                 return 2
             fields = {
@@ -668,13 +668,13 @@ def context_command(args: Any) -> int:
             return 0
     except ContextSnapshotError as exc:
         import sys as _sys
-        print(f"proactive-pilot context rejected: {exc}", file=_sys.stderr)
+        print(f"proactive-secretary context rejected: {exc}", file=_sys.stderr)
         return 2
     except CorruptStateError as exc:
         import sys as _sys
-        print(f"proactive-pilot context state corrupt, failing closed: {exc}",
+        print(f"proactive-secretary context state corrupt, failing closed: {exc}",
               file=_sys.stderr)
         return 1
     import sys as _sys
-    print(f"proactive-pilot context rejected: unknown action", file=_sys.stderr)
+    print(f"proactive-secretary context rejected: unknown action", file=_sys.stderr)
     return 2

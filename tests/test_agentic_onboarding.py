@@ -426,7 +426,7 @@ class FinalIntegrationBoundaryTests(unittest.TestCase):
 
         def fake_setup(args):
             print(json.dumps({"ok": True, "jobs": [
-                {"name": "proactive-secretary-pilot", "action": "kept"},
+                {"name": "proactive-secretary-monitoring", "action": "kept"},
                 {"name": "proactive-secretary-reminders", "action": "kept"}],
                 "deliver": args.deliver, "preparation": args.with_preparation}))
             return 0

@@ -145,9 +145,18 @@ hermes secretary self-test
 hermes cron list
 ```
 
+An existing profile that recorded the old `hermes-proactive-secretary-pilot` job can rename it in place, preserving its id, schedule, delivery, enabled/paused state, next run, run history and unrelated fields:
+
+```bash
+hermes secretary migrate-jobs          # dry-run: show the exact recorded plan
+hermes secretary migrate-jobs --apply  # idempotent in-place rename via native update_job
+```
+
+The migration refuses a name-only/foreign row, a mismatched ownership id, or an occupied monitoring name. If the host has no safe native update API it reports a blocker and recreates nothing. Run it before `setup`; setup refuses to create a duplicate while a recorded legacy job is still live.
+
 `telegram` is the native Telegram delivery target. Use `telegram:<chat_id>` only when you already know the exact native chat id and your host's `hermes cron create --help` shows that form. Never guess a chat id. Use `origin` only when the command truly runs with chat context; a terminal command does not.
 
-A successful `setup` creates and records ownership of two native `--no-agent` script jobs: `hermes-proactive-secretary-pilot` (every 15 minutes; may use a host-owned model lane for judgment) and `hermes-proactive-secretary-reminders` (every minute; deterministic, zero model calls).
+A successful `setup` creates and records ownership of two native `--no-agent` script jobs: `hermes-proactive-secretary-monitoring` (every 15 minutes; may use a host-owned model lane for judgment) and `hermes-proactive-secretary-reminders` (every minute; deterministic, zero model calls). An explicit `--with-preparation` adds the optional `hermes-proactive-secretary-preparation` job; it is never hidden from status or setup summaries once recorded.
 
 Keep these states distinct: **installed** (plugin present), **configured** (settings validate), **scheduled** (owned jobs recorded), **delivery-confirmed** (a real receipt from an explicit native canary; not a state this plugin can set). This plugin has no send or canary command; a canary is your own foreground action through your existing native channel. If you cannot verify a destination, keep `--deliver local`; the honest state is `unverified`.
 

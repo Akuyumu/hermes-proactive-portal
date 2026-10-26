@@ -93,7 +93,7 @@ class _DataDirMixin(unittest.TestCase):
 class NamespacedSpecTests(unittest.TestCase):
     def test_build_job_specs_are_namespaced(self):
         names = {s.name for s in cron_mod.build_job_specs()}
-        self.assertEqual(names, {"hermes-proactive-secretary-pilot",
+        self.assertEqual(names, {"hermes-proactive-secretary-monitoring",
                                  "hermes-proactive-secretary-reminders"})
         for name in names:
             self.assertTrue(name.startswith("hermes-proactive-secretary-"))

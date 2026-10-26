@@ -278,7 +278,7 @@ class OnboardingConsentTests(_ProfileTestCase):
         self.assertTrue(armed["schedule_armed"])
         self.assertEqual(armed["status"], "ready")
         names = {job["name"] for job in backend.list_jobs()}
-        self.assertTrue(any(name.endswith("secretary-pilot") for name in names), names)
+        self.assertTrue(any(name.endswith("secretary-monitoring") for name in names), names)
         self.assertTrue(any(name.endswith("secretary-reminders") for name in names), names)
         self.assertTrue(any(name.endswith("secretary-preparation") for name in names), names)
 

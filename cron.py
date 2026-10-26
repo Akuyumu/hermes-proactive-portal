@@ -1,10 +1,10 @@
 """Thin, testable wrapper over the Hermes native cron surface.
 
-The plugin owns two default jobs (a 15-minute pilot and a 1-minute requested
-reminder dispatcher) plus an explicit opt-in preparation script job that is
-never armed merely by enabling preparation. This module speaks to the installed ``hermes cron`` CLI
-through a small :class:`CronBackend` protocol so the CLI logic can be unit
-tested without a live scheduler.
+The plugin owns two default jobs (a 15-minute monitoring job and a 1-minute
+requested-reminder dispatcher) plus an explicit opt-in preparation script job
+that is never armed merely by enabling preparation. This module speaks to the
+installed ``hermes cron`` CLI through a small :class:`CronBackend` protocol so
+the CLI logic can be unit tested without a live scheduler.
 
 Real surface (parent-verified on the target host; overridable per verb via env
 for a differently spelled release)::
@@ -37,16 +37,25 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 PILOT_SCRIPT = "proactive_secretary_runner.py"
+MONITORING_SCRIPT = PILOT_SCRIPT
 REMINDER_SCRIPT = "proactive_secretary_reminder_runner.py"
 PREPARATION_SCRIPT = "proactive_secretary_prepare_runner.py"
 
 # Namespaced to this plugin so a pre-existing unrelated job of a generic name can
 # never be matched (and therefore never removed) by accident.
-PILOT_JOB_NAME = "hermes-proactive-secretary-pilot"
+MONITORING_JOB_NAME = "hermes-proactive-secretary-monitoring"
+LEGACY_PILOT_JOB_NAME = "hermes-proactive-secretary-pilot"
+# Backwards-compatible source symbol only: no new owner-facing job uses it.
+PILOT_JOB_NAME = MONITORING_JOB_NAME
 REMINDER_JOB_NAME = "hermes-proactive-secretary-reminders"
 PREPARATION_JOB_NAME = "hermes-proactive-secretary-preparation"
-OWNED_JOB_NAMES: tuple[str, ...] = (PILOT_JOB_NAME, REMINDER_JOB_NAME)
+OWNED_JOB_NAMES: tuple[str, ...] = (MONITORING_JOB_NAME, REMINDER_JOB_NAME)
+LEGACY_OWNED_JOB_NAMES: tuple[str, ...] = (LEGACY_PILOT_JOB_NAME,)
 OPTIONAL_JOB_NAMES: tuple[str, ...] = (PREPARATION_JOB_NAME,)
+KNOWN_JOB_NAMES: tuple[str, ...] = (
+    MONITORING_JOB_NAME, REMINDER_JOB_NAME, PREPARATION_JOB_NAME,
+    LEGACY_PILOT_JOB_NAME,
+)
 OWNED_PLUGIN = "hermes-proactive-secretary"
 JOB_OWNERSHIP_SCHEMA = 1
 
@@ -87,6 +96,7 @@ class CronBackend(Protocol):
     def list_jobs(self) -> list[dict[str, Any]]: ...
     def add_job(self, spec: CronJobSpec) -> dict[str, Any]: ...
     def remove_job(self, job_id: str) -> dict[str, Any]: ...
+    def rename_job(self, job_id: str, name: str) -> dict[str, Any]: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -329,6 +339,60 @@ class HermesCronBackend:
             normalized.append(item)
         return normalized
 
+    def rename_job(self, job_id: str, name: str) -> dict[str, Any]:
+        """Rename one job in place through the native update API.
+
+        ``hermes cron`` has no rename verb. The supported host seam is the
+        in-process ``cron.jobs.update_job(id, {"name": ...})`` call, which
+        preserves the job id and every other stored field. If that seam is not
+        present, fail with an explicit blocker rather than recreating the job.
+        """
+        try:
+            from cron import jobs as native_jobs
+        except Exception as exc:  # noqa: BLE001 - absent/shadowed SDK is a blocker
+            raise CronError(
+                f"native cron update API is unavailable; no safe in-place rename: {exc}"
+            ) from exc
+        updater = getattr(native_jobs, "update_job", None)
+        if not callable(updater):
+            raise CronError(
+                "native cron.jobs.update_job is unavailable; no safe in-place rename"
+            )
+        # The native jobs API is already bound to the active profile by the
+        # host. Do not compare it to the ambient HERMES_HOME: a host serving
+        # profile B from a process launched with profile A is legitimate.
+        getter = getattr(native_jobs, "get_job", None)
+        before = None
+        if callable(getter):
+            try:
+                before = getter(str(job_id))
+            except Exception as exc:  # noqa: BLE001 - cannot prove the row
+                raise CronError(f"cannot read cron job {job_id!r} before rename: {exc}") from exc
+            if not isinstance(before, dict):
+                raise CronError(f"cron job {job_id!r} is not present")
+        try:
+            updated = updater(str(job_id), {"name": str(name)})
+        except Exception as exc:  # noqa: BLE001 - host rejected the update
+            raise CronError(f"native cron rename of {job_id!r} failed: {exc}") from exc
+        if not isinstance(updated, dict) or str(updated.get("name") or "") != str(name):
+            raise CronError(f"native cron rename of {job_id!r} was not confirmed")
+        if not callable(getter):
+            return dict(updated)
+        after = getter(str(job_id))
+        if not isinstance(after, dict) or str(after.get("name") or "") != str(name):
+            raise CronError(f"native cron rename of {job_id!r} was not read back")
+        expected = {**before, "name": str(name)}
+        if after != expected:
+            changed = sorted(
+                key for key in set(before) | set(after)
+                if before.get(key) != after.get(key)
+            )
+            raise CronError(
+                "native rename changed fields beyond name ("
+                + ", ".join(changed) + "); refusing to claim preservation"
+            )
+        return dict(after)
+
     def add_job(self, spec: CronJobSpec) -> dict[str, Any]:
         argv = self._cron_argv(
             self.create_verb, spec.schedule,
@@ -475,7 +539,12 @@ def remove_job(backend: CronBackend, name: str, *,
 
 
 def classify_jobs(jobs: list[dict[str, Any]], ownership: dict[str, Any] | None) -> dict[str, Any]:
-    """Split the plugin's job names into owned / foreign / missing.
+    """Split the plugin's known job names into owned / foreign / missing.
+
+    Ownership is proven by the exact recorded id AND name; a same-named row is
+    foreign and is never adopted. The optional preparation job is included so a
+    recorded-and-present preparation job is counted instead of hidden. A legacy
+    ``-pilot`` row is recognised only through its own exact ownership record.
 
     "No jobs of ours" (``state == "none"``) is distinct from "a foreign job
     happens to share a name" (``state`` in ``{"foreign", "mixed"}``).
@@ -483,7 +552,11 @@ def classify_jobs(jobs: list[dict[str, Any]], ownership: dict[str, Any] | None) 
     owned: list[dict[str, Any]] = []
     foreign: list[dict[str, Any]] = []
     missing: list[str] = []
-    for name in OWNED_JOB_NAMES:
+    seen: set[str] = set()
+    for name in KNOWN_JOB_NAMES:
+        if name in seen:
+            continue
+        seen.add(name)
         record = owned_job_record(ownership, name)
         by_id: dict[str, Any] | None = None
         if record:
@@ -500,6 +573,8 @@ def classify_jobs(jobs: list[dict[str, Any]], ownership: dict[str, Any] | None) 
                             "state": str(by_name.get("state") or "")})
         elif record:
             missing.append(name)
+    optional = [row for row in owned if row["name"] in OPTIONAL_JOB_NAMES]
+    legacy = [row for row in owned if row["name"] in LEGACY_OWNED_JOB_NAMES]
     if owned and foreign:
         state = "mixed"
     elif foreign:
@@ -511,7 +586,231 @@ def classify_jobs(jobs: list[dict[str, Any]], ownership: dict[str, Any] | None) 
     else:
         state = "none"
     return {"state": state, "owned": owned, "foreign": foreign, "missing": missing,
-            "jobs": owned}
+            "optional": optional, "legacy": legacy, "jobs": owned}
+
+
+def _owned_row(jobs: list[dict[str, Any]], record: dict[str, Any] | None,
+               name: str) -> dict[str, Any] | None:
+    """Return the live row matching a ledger record by exact id and name."""
+    if not isinstance(record, dict):
+        return None
+    recorded_id = str(record.get("id") or "")
+    if not recorded_id:
+        return None
+    return next(
+        (j for j in jobs
+         if _job_id(j) == recorded_id and str(j.get("name") or "") == name),
+        None,
+    )
+
+
+def legacy_monitoring_job(jobs: list[dict[str, Any]],
+                          ownership: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the exact recorded legacy monitoring row, never a name-only match."""
+    record = owned_job_record(ownership, LEGACY_PILOT_JOB_NAME)
+    return _owned_row(jobs, record, LEGACY_PILOT_JOB_NAME)
+
+
+def migrate_legacy_monitoring_job(
+    backend: CronBackend,
+    *,
+    ownership: dict[str, Any] | None = None,
+    ownership_path: str | os.PathLike[str] | None = None,
+    apply: bool = True,
+) -> CronJobResult:
+    """Idempotently rename only the recorded legacy ``-pilot`` job in place.
+
+    The host update API changes only ``name``: job id, schedule, delivery,
+    enabled/paused state, next run, run history, unrelated fields and the
+    plugin's ownership metadata are preserved. A foreign or mismatched row is
+    never adopted, and an occupied monitoring name is never overwritten.
+    ``apply=False`` is a read-only plan. A host without the safe update seam is
+    reported as a blocker and nothing is recreated or removed.
+    """
+    if ownership is None:
+        ownership = load_job_ownership(ownership_path)
+    jobs = backend.list_jobs()
+    legacy_record = owned_job_record(ownership, LEGACY_PILOT_JOB_NAME)
+    monitoring_record = owned_job_record(ownership, MONITORING_JOB_NAME)
+    legacy_rows = [j for j in jobs if str(j.get("name") or "") == LEGACY_PILOT_JOB_NAME]
+    monitoring_rows = [j for j in jobs if str(j.get("name") or "") == MONITORING_JOB_NAME]
+    legacy_owned = _owned_row(jobs, legacy_record, LEGACY_PILOT_JOB_NAME)
+    monitoring_owned = _owned_row(jobs, monitoring_record, MONITORING_JOB_NAME)
+
+    if monitoring_owned is not None:
+        if legacy_owned is not None:
+            raise CronError(
+                "both the legacy and monitoring jobs are recorded and present; "
+                "refusing to guess which one should survive"
+            )
+        legacy_id = str((legacy_record or {}).get("id") or "")
+        monitoring_id = _job_id(monitoring_owned)
+        if legacy_record and legacy_id == monitoring_id:
+            # A rename completed but the old ledger key survived. Drop only the
+            # duplicate alias; the canonical record and live row are untouched.
+            if apply:
+                ownership["jobs"].pop(LEGACY_PILOT_JOB_NAME, None)
+                save_job_ownership(ownership_path, ownership)
+                return CronJobResult(
+                    MONITORING_JOB_NAME, "ledger-reconciled",
+                    f"id={monitoring_id}; stale legacy ownership alias removed",
+                )
+            return CronJobResult(
+                MONITORING_JOB_NAME, "would-reconcile",
+                f"id={monitoring_id}; stale legacy ownership alias would be removed",
+            )
+        if legacy_record:
+            raise CronError(
+                "legacy and monitoring ownership records disagree while the "
+                "monitoring job is present; refusing to adopt or overwrite"
+            )
+        return CronJobResult(MONITORING_JOB_NAME, "already-migrated",
+                             f"id={monitoring_id}; monitoring job already owned")
+
+    if monitoring_rows:
+        if legacy_record is not None and legacy_owned is None and not legacy_rows:
+            legacy_id = str(legacy_record.get("id") or "")
+            if not legacy_id:
+                raise CronError("the legacy ownership record has no job id; refusing to rename")
+            if len(monitoring_rows) != 1:
+                raise CronError(
+                    "multiple monitoring-named rows are present; refusing to guess "
+                    "which one the recorded legacy id refers to"
+                )
+            row = monitoring_rows[0]
+            if _job_id(row) != legacy_id:
+                raise CronError(
+                    "ownership mismatch: the monitoring-named row id "
+                    f"{_job_id(row) or '?'} is not the recorded legacy id "
+                    f"{legacy_id!r}; refusing to reconcile"
+                )
+            if monitoring_record and str(monitoring_record.get("id") or "") != legacy_id:
+                raise CronError(
+                    "monitoring ownership record has a different id; refusing to overwrite"
+                )
+            # The host rename landed before the ledger save. Reconcile only the
+            # canonical ownership key; never issue a second host mutation.
+            new_record = dict(legacy_record)
+            new_record["name"] = MONITORING_JOB_NAME
+            if apply:
+                ownership["jobs"].pop(LEGACY_PILOT_JOB_NAME, None)
+                ownership["jobs"][MONITORING_JOB_NAME] = new_record
+                save_job_ownership(ownership_path, ownership)
+                return CronJobResult(
+                    MONITORING_JOB_NAME, "ledger-reconciled",
+                    f"id={legacy_id}; interrupted host rename reconciled without mutation",
+                )
+            return CronJobResult(
+                MONITORING_JOB_NAME, "would-reconcile",
+                f"id={legacy_id}; interrupted host rename would be reconciled",
+            )
+        raise CronError(
+            f"refusing to adopt foreign monitoring job {MONITORING_JOB_NAME!r} "
+            f"(id={_job_id(monitoring_rows[0]) or '?'}): this plugin did not create it"
+        )
+
+    if legacy_record is None:
+        if legacy_rows:
+            raise CronError(
+                f"refusing to adopt foreign legacy job {LEGACY_PILOT_JOB_NAME!r} "
+                f"(id={_job_id(legacy_rows[0]) or '?'}): no exact ownership record"
+            )
+        return CronJobResult(MONITORING_JOB_NAME, "not-needed",
+                             "no recorded legacy monitoring job")
+
+    legacy_id = str(legacy_record.get("id") or "")
+    if not legacy_id:
+        raise CronError("the legacy ownership record has no job id; refusing to rename")
+
+    if legacy_owned is None:
+        if legacy_rows:
+            raise CronError(
+                f"ownership mismatch for {LEGACY_PILOT_JOB_NAME!r}: recorded id "
+                f"{legacy_id!r} does not match live id "
+                f"{_job_id(legacy_rows[0])!r}; refusing to adopt"
+            )
+        same_id = next((j for j in jobs if _job_id(j) == legacy_id), None)
+        if same_id is not None:
+            if str(same_id.get("name") or "") == MONITORING_JOB_NAME:
+                # The host rename landed but the ledger did not. Reconcile the
+                # canonical key without touching the live job.
+                new_record = dict(legacy_record)
+                new_record["name"] = MONITORING_JOB_NAME
+                if monitoring_record and str(monitoring_record.get("id") or "") != legacy_id:
+                    raise CronError(
+                        "monitoring ownership record has a different id; refusing to overwrite"
+                    )
+                if apply:
+                    ownership["jobs"].pop(LEGACY_PILOT_JOB_NAME, None)
+                    ownership["jobs"][MONITORING_JOB_NAME] = new_record
+                    save_job_ownership(ownership_path, ownership)
+                    return CronJobResult(
+                        MONITORING_JOB_NAME, "ledger-reconciled",
+                        f"id={legacy_id}; live rename already present",
+                    )
+                return CronJobResult(
+                    MONITORING_JOB_NAME, "would-reconcile",
+                    f"id={legacy_id}; live rename already present",
+                )
+            raise CronError(
+                f"recorded legacy job id {legacy_id!r} now has unexpected name "
+                f"{same_id.get('name')!r}; refusing to rename"
+            )
+        return CronJobResult(
+            LEGACY_PILOT_JOB_NAME, "missing",
+            f"recorded legacy job id={legacy_id} is no longer present",
+        )
+
+    if monitoring_record and str(monitoring_record.get("id") or "") != legacy_id:
+        raise CronError(
+            "monitoring ownership record has a different id; refusing to overwrite it"
+        )
+    before_ids = [_job_id(j) for j in jobs]
+    if not apply:
+        return CronJobResult(
+            MONITORING_JOB_NAME, "would-migrate",
+            f"id={legacy_id}; {LEGACY_PILOT_JOB_NAME} -> {MONITORING_JOB_NAME}",
+        )
+    rename = getattr(backend, "rename_job", None)
+    if not callable(rename):
+        raise CronError(
+            "this host cron backend has no safe in-place rename (native "
+            "cron.jobs.update_job); refusing to recreate or remove the job"
+        )
+    renamed = rename(legacy_id, MONITORING_JOB_NAME)
+    if isinstance(renamed, dict) and (
+        _job_id(renamed) != legacy_id
+        or str(renamed.get("name") or "") != MONITORING_JOB_NAME
+    ):
+        raise CronError(
+            "the host rename did not preserve the recorded job id and target name; "
+            "ownership ledger was not updated"
+        )
+    after_jobs = backend.list_jobs()
+    after = _owned_row(after_jobs, {"id": legacy_id}, MONITORING_JOB_NAME)
+    if after is None:
+        raise CronError(
+            f"rename of {LEGACY_PILOT_JOB_NAME!r} to {MONITORING_JOB_NAME!r} "
+            "was not confirmed; nothing was recreated"
+        )
+    if any(_job_id(j) == legacy_id and str(j.get("name") or "") == LEGACY_PILOT_JOB_NAME
+           for j in after_jobs):
+        raise CronError("legacy job name is still present after rename")
+    if sorted(_job_id(j) for j in after_jobs if _job_id(j)) != sorted(before_ids):
+        raise CronError("rename changed the set of job ids; refusing to continue")
+    # Full-field equality is enforced by HermesCronBackend.rename_job against the
+    # native getter (before/after). This method intentionally does not infer
+    # preservation from the CLI's lossy listing.
+    new_record = dict(legacy_record)
+    new_record["name"] = MONITORING_JOB_NAME
+    ownership["jobs"].pop(LEGACY_PILOT_JOB_NAME, None)
+    ownership["jobs"][MONITORING_JOB_NAME] = new_record
+    save_job_ownership(ownership_path, ownership)
+    return CronJobResult(
+        MONITORING_JOB_NAME, "migrated",
+        f"id={legacy_id}; renamed {LEGACY_PILOT_JOB_NAME} -> {MONITORING_JOB_NAME} "
+        "in place via the host update API; no job was recreated or removed",
+    )
 
 
 
@@ -551,6 +850,13 @@ class InMemoryCronBackend:
         self.jobs = [j for j in self.jobs if _job_id(j) != str(job_id)]
         return {"id": job_id, "removed": True}
 
+    def rename_job(self, job_id: str, name: str) -> dict[str, Any]:
+        for job in self.jobs:
+            if _job_id(job) == str(job_id):
+                job["name"] = str(name)
+                return dict(job)
+        raise CronError(f"cron job {job_id!r} is not present to rename")
+
 
 def build_job_specs(*, deliver: str = "local", workdir: str = "",
                     include_preparation: bool = False) -> list[CronJobSpec]:
@@ -562,9 +868,9 @@ def build_job_specs(*, deliver: str = "local", workdir: str = "",
     """
     specs = [
         CronJobSpec(
-            name=PILOT_JOB_NAME,
+            name=MONITORING_JOB_NAME,
             schedule="*/15 * * * *",
-            script=PILOT_SCRIPT,
+            script=MONITORING_SCRIPT,
             deliver=deliver,
             workdir=workdir,
             description="Proactive secretary collector + evaluator (every 15 minutes)",

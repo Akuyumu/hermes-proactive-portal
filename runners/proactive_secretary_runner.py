@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native-cron runner: the proactive-secretary pilot pipeline.
+"""Native-cron runner: the proactive-secretary monitoring pipeline.
 
 Installed by ``hermes secretary setup`` into the profile's scripts directory and
 run by the native scheduler with ``--no-agent``: its stdout is the single

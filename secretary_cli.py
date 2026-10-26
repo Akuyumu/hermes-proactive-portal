@@ -11,6 +11,7 @@ Commands
     resume     clear the global pause
     disable    pause + remove this plugin's own cron jobs
     uninstall  alias of disable (data is preserved, never deleted)
+    migrate-jobs  rename only the recorded legacy monitoring job in place
     self-test  offline deterministic self-test
     run-once   dry, no-model run that never sends
     watch      add | list | remove a public watch
@@ -88,6 +89,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
              ("resume", "Clear the global pause"),
              ("disable", "Pause and remove this plugin's own cron jobs"),
              ("uninstall", "Alias of disable (runtime data is preserved)"),
+             ("migrate-jobs", "In-place rename of only the recorded legacy monitoring job"),
              ("self-test", "Run the offline deterministic self-test"),
              ("run-once", "Dry, no-model run (never sends)"),
              ("watch", "Manage public watches (add | list | remove)"),
@@ -159,6 +161,8 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     for _name in ("disable", "uninstall"):
         p[_name].add_argument("--purge", action="store_true",
                               help="also delete the owner-only runtime data directory")
+    p["migrate-jobs"].add_argument("--apply", action="store_true",
+                                   help="apply the verified in-place rename (default: dry-run)")
     p["watch"].add_argument("action", choices=("add", "list", "remove"))
     p["watch"].add_argument("value", nargs="?", default="",
                             help="topic for add, watch id for remove")
@@ -731,6 +735,15 @@ def setup_command(args: argparse.Namespace, *, backend: cron_mod.CronBackend | N
                 )
             specs = _job_specs(deliver, include_preparation=want_preparation)
             ownership = cron_mod.load_job_ownership(paths.job_ownership_path())
+            legacy_live = cron_mod.legacy_monitoring_job(
+                cron_backend.list_jobs(), ownership)
+            if legacy_live is not None:
+                raise cron_mod.CronError(
+                    "the recorded legacy monitoring job is still present "
+                    f"(id={legacy_live.get('id') or '?'}); run `hermes secretary "
+                    "migrate-jobs --apply` first. Setup refuses to create a duplicate "
+                    "or recreate the existing schedule."
+                )
             for spec in specs:
                 res = cron_mod.ensure_job(
                     cron_backend, spec,
@@ -864,7 +877,15 @@ def _setup_human(result: dict[str, Any]) -> str:
         "delivery confirmation is owned by the native scheduler",
         "  jobs           :",
     ]
-    for name in OWNED_JOB_NAMES:
+    display_names = list(OWNED_JOB_NAMES)
+    try:
+        recorded = cron_mod.load_job_ownership(paths.job_ownership_path()).get("jobs") or {}
+    except Exception:  # noqa: BLE001 - display must never hide the rest of setup
+        recorded = {}
+    for name in cron_mod.OPTIONAL_JOB_NAMES:
+        if name in jobs or name in recorded or (result.get("preparation") or {}).get("opt_in"):
+            display_names.append(name)
+    for name in display_names:
         job = jobs.get(name)
         lines.append(f"    - {name}: {job['action'] if job else 'MISSING'} "
                      f"[{job['schedule'] if job else '?'}]")
@@ -985,6 +1006,8 @@ def status_command(args: argparse.Namespace) -> int:
         "config": config_summary,
         "config_error": config_error,
         "deliver": destination or "local (default)",
+        "last_monitoring_run": (state.get("last_inference") or {}).get("at", ""),
+        # Compatibility alias retained for existing machine-readable callers.
         "last_pilot_run": (state.get("last_inference") or {}).get("at", ""),
         "coverage": state.get("health", {}),
         "models": model_routes,
@@ -1028,7 +1051,7 @@ def status_command(args: argparse.Namespace) -> int:
         f"  monitoring    : {monitoring}",
         f"  cron backend  : {'available' if payload['jobs'].get('available') else 'unavailable'}",
         f"  jobs          : {_jobs_human(payload['jobs'])}",
-        f"  last pilot run: {payload['last_pilot_run'] or 'never recorded'}",
+        f"  last monitoring run: {payload['last_monitoring_run'] or 'never recorded'}",
         f"  active reminders: {active_reminders}",
         f"  model route   : strict_active={payload['strict_active']}"
         + (f" blockers={'; '.join(payload['model_blockers'])}" if payload['model_blockers'] else ""),
@@ -1061,6 +1084,13 @@ def doctor_command(args: argparse.Namespace) -> int:
     add("data_dir_writable", _writable(paths.data_root()), str(paths.data_root()))
     jobs = _job_states()
     add("cron_backend", bool(jobs.get("available")), json.dumps(jobs.get("error", "available") or "available"))
+    if jobs.get("available"):
+        job_names = [str(j.get("name") or "") for j in jobs.get("jobs") or []
+                     if isinstance(j, dict)]
+        job_names += [str(name) for name in jobs.get("missing") or []]
+        add("owned_jobs", bool(jobs.get("state") not in {"foreign", "mixed"}),
+            f"state={jobs.get('state', 'none')}; names={', '.join(job_names) or 'none'}",
+            critical=False)
     caps = detect_capabilities()
     add("himalaya_mail", caps["himalaya_mail"],
         "read-only mail connector" if caps["himalaya_mail"]
@@ -1209,13 +1239,56 @@ def resume_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def migrate_jobs_command(args: argparse.Namespace) -> int:
+    """Dry-run or apply the explicit in-place legacy monitoring rename.
+
+    This command never recreates a job. It only calls a host-supported update
+    seam on the exact recorded id; without that seam it fails and changes
+    nothing.
+    """
+    as_json = bool(getattr(args, "json", False))
+    apply = bool(getattr(args, "apply", False))
+    try:
+        backend = _backend()
+        if not backend.is_available():
+            raise cron_mod.CronError("the Hermes cron surface is unavailable")
+        ownership = cron_mod.load_job_ownership(paths.job_ownership_path())
+        result = cron_mod.migrate_legacy_monitoring_job(
+            backend,
+            ownership=ownership,
+            ownership_path=paths.job_ownership_path(),
+            apply=apply,
+        )
+    except Exception as exc:  # noqa: BLE001 - a blocker is reported, never guessed
+        _emit({"ok": False, "applied": apply,
+               "error": f"{type(exc).__name__}: {exc}"},
+              as_json=as_json, human=f"migrate-jobs FAILED: {exc}")
+        return 1
+    payload = {
+        "ok": True,
+        "applied": apply,
+        "action": result.action,
+        "name": result.name,
+        "detail": result.detail,
+        "legacy_name": cron_mod.LEGACY_PILOT_JOB_NAME,
+        "monitoring_name": cron_mod.MONITORING_JOB_NAME,
+    }
+    if not apply:
+        payload["note"] = "dry-run; no job or ownership record was changed"
+    _emit(payload, as_json=as_json,
+          human=(f"migrate-jobs: {result.action} ({result.detail})"
+                 + ("" if apply else " [dry-run; re-run with --apply]")))
+    return 0
+
+
 def _remove_own_jobs() -> list[dict[str, Any]]:
     backend = _backend()
     removed: list[dict[str, Any]] = []
     if not backend.is_available():
         raise cron_mod.CronError("the Hermes cron surface is unavailable; cannot remove jobs")
     ownership = cron_mod.load_job_ownership(paths.job_ownership_path())
-    for name in OWNED_JOB_NAMES + cron_mod.OPTIONAL_JOB_NAMES:
+    for name in (OWNED_JOB_NAMES + cron_mod.OPTIONAL_JOB_NAMES
+                 + cron_mod.LEGACY_OWNED_JOB_NAMES):
         res = cron_mod.remove_job(
             backend, name,
             ownership=ownership, ownership_path=paths.job_ownership_path(),
@@ -1864,6 +1937,7 @@ _DISPATCH = {
     "resume": resume_command,
     "disable": disable_command,
     "uninstall": uninstall_command,
+    "migrate-jobs": migrate_jobs_command,
     "self-test": selftest_command,
     "run-once": run_once_command,
     "pipeline": pipeline_command,
@@ -1883,7 +1957,8 @@ def secretary_command(args: argparse.Namespace) -> int:
     sub = getattr(args, "secretary_command", None)
     if not sub:
         print("usage: hermes secretary {setup,status,pause,resume,disable,uninstall,"
-              "self-test,run-once,prepare,responsibilities,watch,feedback,configure,doctor}")
+              "migrate-jobs,self-test,run-once,prepare,responsibilities,watch,feedback,"
+              "configure,doctor}")
         return 2
     handler = _DISPATCH.get(sub)
     if handler is None:
