@@ -2,7 +2,13 @@
 
 A conservative, opt-in proactive secretary for [Hermes](https://hermes-agent.nousresearch.com). It reads only the sources you explicitly authorise, judges whether anything is genuinely worth interrupting you for, and stays silent otherwise. It never sends mail, changes calendars or tasks, books, purchases, publishes, or expands its own access.
 
-Version **0.5.1** is a pre-1.0 release. The default posture is user-agnostic: no accounts, no public seeds, no personal interests, and no assumed location. Every source and permission is opt-in. See the compatibility and qualification limits below.
+Version **0.5.2** is a pre-1.0 release. The default posture is user-agnostic: no accounts, no public seeds, no personal interests, and no assumed location. Every source and permission is opt-in. See the compatibility and qualification limits below.
+
+## Changes in 0.5.2
+
+- Retires owner-facing pilot terminology in favor of monitoring.
+- Counts the optional preparation job in owned-job status.
+- Adds an explicit, idempotent migration for the recorded legacy monitoring job, preserving its ID, schedule, delivery, history and ownership metadata without recreation. Compatibility package and state identifiers remain unchanged.
 
 ## How it works
 
@@ -282,7 +288,7 @@ Maintainer commands from the source tree, using a Python environment with the He
 PYTHONPATH=src python3 -m unittest discover -s tests
 PYTHONPATH=src python3 -m proactive_pilot.selftest
 python3 release_export.py scan
-python3 release_export.py build --output ./dist/hermes-proactive-secretary-0.5.1.tar.gz
+python3 release_export.py build --output ./dist/hermes-proactive-secretary-0.5.2.tar.gz
 python3 release_export.py doctor --installed /path/to/extracted-package
 ```
 
@@ -290,9 +296,9 @@ python3 release_export.py doctor --installed /path/to/extracted-package
 
 ## Qualification and limitations
 
-The 0.5.1 candidate has automated isolated test evidence. Live host/device qualification is still pending: real Telegram delivery, Desktop form interaction, real connector reads, real model calls and mobile/device canaries are not claimed here. The reviewed strict auxiliary-host patch remains a separate change that must be applied and verified on the host before model-dependent work can run.
+The 0.5.2 candidate has automated isolated test evidence. Live host/device qualification is still pending: real Telegram delivery, Desktop form interaction, real connector reads, real model calls and mobile/device canaries are not claimed here. The reviewed strict auxiliary-host patch remains a separate change that must be applied and verified on the host before model-dependent work can run.
 
-0.5.1 remains limited: delivery is unconfirmed, source coverage is bounded, quiet/attention behavior is deterministic but not omniscient, and model-dependent features require a compatible host. Validate the exact connectors and messaging route you intend to use. The custom settings page, grouped editable controls and confirmed reset are included in this candidate, but they were verified with synthetic host/API/Node tests, not a live Desktop visual, accessibility or device session. The reviewed strict auxiliary-host patch is still a separate host activation prerequisite for model-dependent work.
+0.5.2 remains limited: delivery is unconfirmed, source coverage is bounded, quiet/attention behavior is deterministic but not omniscient, and model-dependent features require a compatible host. Validate the exact connectors and messaging route you intend to use. The custom settings page, grouped editable controls and confirmed reset are included in this candidate, but they were verified with synthetic host/API/Node tests, not a live Desktop visual, accessibility or device session. The reviewed strict auxiliary-host patch is still a separate host activation prerequisite for model-dependent work.
 
 For agent-assisted installation, give your agent [AGENT_SETUP.md](AGENT_SETUP.md). The operational skill is [skills/proactive-secretary/SKILL.md](skills/proactive-secretary/SKILL.md).
 
