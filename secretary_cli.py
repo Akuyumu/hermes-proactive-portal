@@ -981,6 +981,10 @@ def status_command(args: argparse.Namespace) -> int:
                       "owned_jobs": [], "next_schedule": "",
                       "onboarding": {"status": "not_started", "next_step": "basics"}}
     model_routes: dict[str, Any] = dict(projection.get("model_status") or {})
+    model_capability = dict(projection.get("model_capability") or {})
+    if not model_capability:
+        model_capability = secretary_status.model_capability_health(
+            model_routes, paused=_is_paused())
     onboarding = dict(projection.get("onboarding") or {})
     onboarding.pop("next_question", None)
     onboarding = onboarding or {"status": "not_started", "next_step": "basics"}
@@ -1011,6 +1015,7 @@ def status_command(args: argparse.Namespace) -> int:
         "last_pilot_run": (state.get("last_inference") or {}).get("at", ""),
         "coverage": state.get("health", {}),
         "models": model_routes,
+        "model_capability": model_capability,
         "strict_active": bool(model_routes.get("strict_active", False)),
         "model_blockers": list(model_routes.get("blockers") or []),
         "onboarding": onboarding or {"status": "not_started", "next_step": "basics"},
@@ -1055,6 +1060,9 @@ def status_command(args: argparse.Namespace) -> int:
         f"  active reminders: {active_reminders}",
         f"  model route   : strict_active={payload['strict_active']}"
         + (f" blockers={'; '.join(payload['model_blockers'])}" if payload['model_blockers'] else ""),
+        f"  model capability: {model_capability.get('status', 'unknown')}"
+        + (f" - {model_capability.get('detail')}"
+           if model_capability.get("status") == "blocked" else ""),
         f"  prepare queue : {payload['prepare_queue'].get('ready', 0)} ready"
         + (f" (error {payload['prepare_queue'].get('error')})" if payload['prepare_queue'].get('error') else ""),
         f"  next schedule : {payload['next_schedule'] or 'none recorded'}",
@@ -1157,7 +1165,16 @@ def doctor_command(args: argparse.Namespace) -> int:
         from .secretary_models import effective_route_status
         from proactive_pilot.native_runtime import bound_model_lane_status
         _ctx = get_native_context()
-        _route = bound_model_lane_status(_ctx) or effective_route_status(_ctx, strict_active=False)
+        _bound = bound_model_lane_status(_ctx)
+        _route = effective_route_status(
+            _ctx, strict_active=bool((_bound or {}).get("strict_active")))
+        if _bound:
+            _route.update(_bound)
+        _capability = secretary_status.model_capability_health(
+            _route, paused=_is_paused())
+        add("model_capability", bool(_capability.get("healthy", True)),
+            str(_capability.get("detail") or ""),
+            critical=not bool(_capability.get("healthy", True)))
         add("model_strict_capability", bool(_route.get("strict_active")),
             ("strict configured-only capability available"
              if _route.get("strict_active") else
@@ -1167,6 +1184,9 @@ def doctor_command(args: argparse.Namespace) -> int:
                if _route.get("blockers") else ""),
             critical=False)
     except Exception as exc:  # noqa: BLE001
+        add("model_capability", False,
+            f"model capability check unavailable ({type(exc).__name__})",
+            critical=True)
         add("model_strict_capability", False,
             f"route capability check unavailable ({type(exc).__name__})", critical=False)
     failed = [c for c in checks if c["critical"] and not c["ok"]]

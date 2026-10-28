@@ -30,7 +30,7 @@ The secretary collects bounded, read-only evidence; applies quiet hours, a daily
 
 Model-dependent work requires an explicit host contract: `register_auxiliary_task(..., fallback_policy="configured_only")`. The plugin detects that keyword on the host signature; a wrapper that merely accepts `**kwargs` is not proof. On a host without the contract, model work is blocked **before dispatch** while deterministic controls and requested reminders continue. Optional route-outcome metadata is consumed only when the host supplies its documented `aux_route_outcome` shape; otherwise the plugin reports "metadata unavailable" rather than guessing which route failed.
 
-The plugin does **not** patch Hermes or install this host contract for you. Verify your installed host with `hermes secretary status` and `doctor`; installation alone is not proof of compatibility. A host without the contract needs a compatible Hermes implementation before model-dependent features can run. Do not bypass the gate or assume an arbitrary upstream version supports it.
+The plugin does **not** patch Hermes or install this host contract for you. Verify your installed host with `hermes secretary status` and `doctor`; installation alone is not proof of compatibility. A host without the contract needs a compatible Hermes implementation before model-dependent features can run. When a model route is configured, `status` and `doctor` report model capability as non-healthy with the missing-contract reason; an unconfigured or disabled route stays neutral rather than falsely broken. This plugin-side visibility does not restore inference: the separate native host patch supplies the contract. Do not bypass the gate or assume an arbitrary upstream version supports it.
 
 ## Requirements
 

@@ -85,9 +85,16 @@ def _route_summary(ctx: Any, service: Any = None,
             if not route:
                 from .secretary_models import effective_route_status
                 route = effective_route_status(ctx, strict_active=False)
+            elif "route_configured" not in route:
+                from .secretary_models import effective_route_status
+                effective = effective_route_status(
+                    ctx, strict_active=bool(route.get("strict_active")))
+                for key, value in effective.items():
+                    route.setdefault(key, value)
     except Exception as exc:  # noqa: BLE001 - route truth degrades, never guessed
         route = {"strict_active": False, "blockers": [type(exc).__name__],
-                 "configured_model_calls_allowed": False}
+                 "configured_model_calls_allowed": False,
+                 "route_lookup_error": type(exc).__name__}
     primary = route.get("primary") if isinstance(route.get("primary"), dict) else {}
     fallback = route.get("fallback") if isinstance(route.get("fallback"), dict) else None
     return {
@@ -102,12 +109,99 @@ def _route_summary(ctx: Any, service: Any = None,
             "model": _text(fallback.get("model"), 80),
             "source": _text(fallback.get("source"), 40),
         } if isinstance(fallback, dict) else None),
+        "route_configured": (bool(route["route_configured"])
+                             if route.get("route_configured") is not None
+                             else None),
+        "route_lookup_error": _text(route.get("route_lookup_error"), 160),
         "strict_active": bool(route.get("strict_active", False)),
         "strict_state": "active" if route.get("strict_active") else "unsupported",
+        "strict_supported": route.get("strict_supported"),
+        "registration_error": _text(route.get("registration_error"), 160),
         "configured_model_calls_allowed": bool(
             route.get("configured_model_calls_allowed", False)),
         "blockers": _bounded_list(route.get("blockers")),
     }
+
+
+def model_capability_health(route: Any, *, paused: bool = False) -> dict[str, Any]:
+    """Project whether configured model work is actually usable on this host.
+
+    A disabled or unconfigured route is neutral, not broken. An assigned route on
+    a host without the explicit strict contract is a real non-healthy state even
+    though deterministic controls and reminders keep working. This never calls a
+    model: it only reads the already-resolved route status.
+    """
+    current = route if isinstance(route, dict) else {}
+    strict = bool(current.get("strict_active", False))
+    blockers = _bounded_list(current.get("blockers"))
+    configured = current.get("route_configured")
+    known = configured is not None
+    requested = known and bool(configured) and not paused
+    outcome: dict[str, Any] = {
+        "known": known,
+        "requested": requested,
+        "healthy": True,
+        "strict_active": strict,
+        "configured_model_calls_allowed": bool(
+            current.get("configured_model_calls_allowed", False)),
+        "blockers": blockers,
+        "reason": "",
+        "remedy": "",
+        "detail": "",
+    }
+    if paused:
+        outcome.update({
+            "status": "neutral",
+            "detail": "model-dependent work is disabled by the global pause",
+        })
+        return outcome
+    if not known:
+        lookup_error = _text(current.get("route_lookup_error"), 160)
+        reason = "configured model route could not be determined on this host"
+        if lookup_error:
+            reason += f" ({lookup_error})"
+        outcome.update({
+            "status": "blocked",
+            "healthy": False,
+            "reason": reason,
+            "remedy": ("Restore native route introspection and re-check status; an "
+                       "unknown route is not treated as intentionally unconfigured."),
+            "detail": reason + "; no model call was made",
+        })
+        return outcome
+    if not requested:
+        outcome.update({
+            "status": "neutral",
+            "detail": ("no configured model route; model-dependent work is "
+                       "disabled or unconfigured"),
+        })
+        return outcome
+    if strict and not blockers:
+        outcome.update({
+            "status": "ok",
+            "detail": "configured model work is available through the strict host contract",
+        })
+        return outcome
+    if strict:
+        reason = ("configured model route is blocked: "
+                  + ("; ".join(blockers) if blockers else "unspecified route blocker"))
+    else:
+        reason = ("configured model work is enabled but blocked: host lacks "
+                  "register_auxiliary_task(fallback_policy=\"configured_only\")")
+        registration_error = _text(current.get("registration_error"), 160)
+        if registration_error:
+            reason += f"; registration failed: {registration_error}"
+    remedy = ("Apply the separate native Hermes host patch that supplies this named "
+              "strict contract; this plugin cannot restore inference and must not "
+              "weaken the guard. Deterministic reminders and controls remain available.")
+    outcome.update({
+        "status": "blocked",
+        "healthy": False,
+        "reason": reason,
+        "remedy": remedy,
+        "detail": reason + "; no model call was made",
+    })
+    return outcome
 
 
 def _owned_jobs(backend: Any = None, *, probe_empty: bool = False) -> dict[str, Any]:
@@ -296,6 +390,8 @@ def collect(ctx: Any, service: Any = None, *,
     health, queue = _health_and_queue()
     onboarding = _onboarding(ctx, service, info)
     prefs = _read_prefs()
+    capability = model_capability_health(
+        route.get("status") or {}, paused=_paused(prefs))
     destination = _text(config.get("destination"), 80)
     return {
         "installed": True,
@@ -313,6 +409,7 @@ def collect(ctx: Any, service: Any = None, *,
         "scheduled": bool(jobs.get("count") or jobs.get("state") == "owned"),
         "model_route": route,
         "model_status": route.get("status") or {},
+        "model_capability": capability,
         "strict_active": route.get("strict_active", False),
         "model_blockers": route.get("blockers") or [],
         "onboarding": onboarding,
@@ -339,6 +436,7 @@ def render_chat(status: dict[str, Any]) -> str:
     delivery = status.get("delivery") or {}
     health = status.get("health_incident") or {}
     queue = status.get("prepare_queue") or {}
+    capability = status.get("model_capability") or {}
     job_ids = status.get("owned_job_ids") or []
     lines = [
         ("Secretary: installed; "
@@ -348,6 +446,9 @@ def render_chat(status: dict[str, Any]) -> str:
          + f"; scheduled={'yes' if status.get('scheduled') else 'no'}"
          + f"; delivery={delivery.get('state') or 'not-configured'}"),
         (f"Model: {route_label}; strict={route.get('strict_state') or 'unsupported'}"
+         + f"; capability={capability.get('status') or 'unknown'}"
+         + (f"; {_text(capability.get('detail'), 180)}"
+            if capability.get("status") == "blocked" else "")
          + (f"; blockers={'; '.join(blockers[:3])}" if blockers else "")),
         (f"Jobs: {status.get('owned_job_count', 0)} owned"
          + (f" [{', '.join(job_ids[:5])}]" if job_ids else " (none recorded)")
