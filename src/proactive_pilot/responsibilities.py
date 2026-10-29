@@ -66,6 +66,7 @@ MAX_LEASE_MINUTES = 120
 
 READY_STATUSES = frozenset({"", "queued", "invalidated"})
 NOTIFICATION_STATUSES = frozenset({"", "attempted", "delivered", "unknown"})
+ATTENTION_STATUSES = frozenset({"", "attempted", "delivered", "unknown", "legacy"})
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -379,6 +380,14 @@ def _validate_record(rid: Any, rec: Any) -> None:
     _stored_iso(notification, "claimed_at", required=False)
     _stored_iso(notification, "updated_at", required=False)
 
+    attention = rec.get("attention", {})
+    if not isinstance(attention, dict):
+        raise _corrupt("attention state is malformed")
+    if attention.get("status", "") not in ATTENTION_STATUSES:
+        raise _corrupt("attention status is invalid")
+    _stored_text(attention, "material", MAX_REF, required=False)
+    _stored_iso(attention, "at", required=False)
+
     completion = rec.get("completion", {})
     if not isinstance(completion, dict):
         raise _corrupt("completion is malformed")
@@ -442,6 +451,10 @@ def _empty_notification() -> dict[str, Any]:
             "generation": 0, "source_version": "", "artifact_ref": "", "hash": ""}
 
 
+def _empty_attention() -> dict[str, Any]:
+    return {"material": "", "status": "", "at": ""}
+
+
 def _invalidate_ready(rec: dict[str, Any], stamp: datetime, reason: str) -> None:
     ready = rec.get("ready") or {}
     if ready.get("status") == "queued":
@@ -477,6 +490,7 @@ def _readback(rec: dict[str, Any], *, include_claim: bool = False,
         "checkpoint": dict(rec.get("checkpoint") or {}),
         "artifact_refs": list(rec.get("artifact_refs") or []),
         "ready": dict(rec.get("ready") or {}),
+        "attention": dict(rec.get("attention") or {}),
         "completion": dict(rec.get("completion") or {}),
         "created_at": rec.get("created_at", ""),
         "updated_at": rec.get("updated_at", ""),
@@ -550,6 +564,7 @@ def create(
             "ready": {"status": "", "artifact_ref": "", "hash": "", "size": 0,
                       "queued_at": "", "notified_at": "",
                       "notification": _empty_notification()},
+            "attention": _empty_attention(),
             "completion": {"evidence_refs": [], "completed_at": "", "note": ""},
             "claim": {"token": "", "claimed_at": "", "expires_at": "",
                       "generation": 0, "source_version": ""},
@@ -1077,6 +1092,7 @@ def claim_ready_notification(
     source_version: Any,
     artifact_ref: Any,
     artifact_hash: Any,
+    material_key: Any = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Atomically reserve notification of exactly one queued artifact.
@@ -1084,6 +1100,11 @@ def claim_ready_notification(
     The authoritative responsibility record is the ledger. Only one caller can
     hold the one-shot notification token for a given id/generation/hash. A token
     from an older generation/artifact can never mark a newer artifact.
+
+    When ``material_key`` is supplied it is the stable semantic owner outcome
+    (goal/decision/deadline), never the artifact hash, generation or polling
+    timestamp. An unchanged key that was already emitted (or whose emission is
+    ambiguous/legacy) is not re-armed by regenerated drafts.
     """
     stamp = _now(store, now)
     rid = str(responsibility_id or "")
@@ -1091,6 +1112,7 @@ def claim_ready_notification(
         raise ResponsibilityError("responsibility_id is invalid")
     ref = _ref(artifact_ref, "artifact_ref")
     digest = _text(artifact_hash, "artifact_hash", MAX_REF, required=True)
+    material = _text(material_key, "material_key", MAX_REF, required=False) if material_key else ""
     with _locked(store) as acquired:
         _require_writer(acquired)
         data = _load(store)
@@ -1099,6 +1121,16 @@ def claim_ready_notification(
             raise ResponsibilityError(f"no responsibility with id {rid!r}")
         if rec.get("status") != ACCEPTED:
             raise ResponsibilityError(f"responsibility is {rec.get('status')}")
+        if material:
+            attention = rec.get("attention") or {}
+            # Any recorded attempt for this same owner outcome blocks another
+            # announcement. ``attempted`` is included deliberately: if the
+            # post-emit receipt write was lost, a regenerated artifact must not
+            # turn an ambiguous emission into a second message. Silence is the
+            # owner's stated preference over a duplicate; a genuinely changed
+            # outcome has a different key and remains eligible.
+            if str(attention.get("material", "")) == material and attention.get("status"):
+                raise ResponsibilityError("unchanged material was already notified")
         if int(rec.get("generation", 0)) != int(generation):
             raise ResponsibilityError("queued artifact generation is stale")
         if str(rec.get("source_version", "")) != str(source_version or ""):
@@ -1125,6 +1157,12 @@ def claim_ready_notification(
             "hash": digest,
         }
         rec["ready"]["notification"] = notification
+        if material:
+            rec["attention"] = {
+                "material": material,
+                "status": "attempted",
+                "at": stamp.isoformat(),
+            }
         rec["updated_at"] = stamp.isoformat()
         _save(store, data, stamp)
         return {
@@ -1134,8 +1172,44 @@ def claim_ready_notification(
             "source_version": str(source_version or ""),
             "artifact_ref": ref,
             "hash": digest,
+            "material": material,
             "claimed_at": stamp.isoformat(),
         }
+
+
+def seed_legacy_attention(
+    store: StateStore,
+    responsibility_id: str,
+    *,
+    material_key: Any,
+    now: datetime | None = None,
+) -> bool:
+    """Seed semantic history from already-emitted legacy evidence.
+
+    This never invents a delivery, resets a claim or changes generation. It only
+    records that this responsibility's current material was already announced by
+    the pre-0.5.3 path, so a regenerated draft cannot flood chat on upgrade.
+    """
+    stamp = _now(store, now)
+    rid = str(responsibility_id or "")
+    material = _text(material_key, "material_key", MAX_REF, required=True)
+    with _locked(store) as acquired:
+        _require_writer(acquired)
+        data = _load(store)
+        rec = data["records"].get(rid)
+        if rec is None:
+            raise ResponsibilityError(f"no responsibility with id {rid!r}")
+        attention = rec.get("attention") or {}
+        if attention.get("material"):
+            return False
+        rec["attention"] = {
+            "material": material,
+            "status": "legacy",
+            "at": stamp.isoformat(),
+        }
+        rec["updated_at"] = stamp.isoformat()
+        _save(store, data, stamp)
+        return True
 
 
 def mark_ready_notification(
@@ -1188,6 +1262,11 @@ def mark_ready_notification(
         notification["updated_at"] = stamp.isoformat()
         rec["ready"]["notification"] = notification
         rec["ready"]["notified_at"] = stamp.isoformat()
+        attention = rec.get("attention")
+        if isinstance(attention, dict) and attention.get("material"):
+            attention["status"] = status
+            attention["at"] = stamp.isoformat()
+            rec["attention"] = attention
         rec["updated_at"] = stamp.isoformat()
         _save(store, data, stamp)
         return _readback(rec)

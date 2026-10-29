@@ -612,6 +612,144 @@ def public_artifact_ref(artifact_ref: Any) -> str:
     return f"artifact:{rid}:handle-{handle}"
 
 
+# --------------------------------------------------------------------------- #
+# Semantic attention identity + bounded human notice text
+# --------------------------------------------------------------------------- #
+
+_NOTICE_ARTIFACT = re.compile(
+    r"\b(?:artifact|responsibility|generation|ref|path|handle)\s*[:=]\s*\S+",
+    re.IGNORECASE)
+_NOTICE_PATH = re.compile(r"(?:/[\w.~-]+){2,}")
+_NOTICE_LONG_TOKEN = re.compile(r"\b[A-Za-z0-9][A-Za-z0-9._:-]{23,}\b")
+# Opaque internal handles are frequently short (resp_ab12cd34, artifact:…,
+# sec-…). They are stripped explicitly so a bare id cannot survive prose.
+_NOTICE_OPAQUE_ID = re.compile(
+    r"\b(?:resp|artifact|artifact_ref|sec|cal|mail|task|thread|evt|msg|"
+    r"responsibility|handle)_[A-Za-z0-9][A-Za-z0-9_-]{3,}\b",
+    re.IGNORECASE)
+_NOTICE_HEX = re.compile(r"\b[0-9a-f]{16,}\b", re.IGNORECASE)
+_NOTICE_SPACE = re.compile(r"\s+")
+
+
+def _notice_fragment(value: Any, limit: int) -> str:
+    """Bounded, identifier-free owner prose for chat.
+
+    Only accepted responsibility prose is used, never an artifact title/path,
+    ref, generation counter or source identifier. Untrusted text cannot inject
+    a ref/URL/path-shaped handle into the rendered sentence.
+    """
+    text = str(value or "")
+    text = _CITATION.sub(" ", text)
+    text = _URL.sub(" ", text)
+    text = _REF_TOKEN.sub(" ", text)
+    text = _NOTICE_ARTIFACT.sub(" ", text)
+    text = _NOTICE_PATH.sub(" ", text)
+    text = _NOTICE_LONG_TOKEN.sub(" ", text)
+    text = _NOTICE_OPAQUE_ID.sub(" ", text)
+    text = _NOTICE_HEX.sub(" ", text)
+    text = _CONTROL.sub(" ", text)
+    text = text.replace("<", " ").replace(">", " ")
+    text = _NOTICE_SPACE.sub(" ", text).strip(" \"'“”‘’.,;:-")
+    if len(text) > limit:
+        text = text[:limit].rstrip(" ,;:-") + "..."
+    return text
+
+
+def ready_material_fingerprint(rec: dict[str, Any]) -> str:
+    """Stable semantic identity for a responsibility's owner outcome.
+
+    Only the owner goal, required decision/acceptance and deadline participate.
+    Artifact hashes, refs, generations, polling timestamps, evidence ordering and
+    cosmetic evidence rewording deliberately do not. Missing values stay empty
+    rather than being guessed, so uncertainty cannot fabricate material change.
+    """
+    fields = [
+        _NOTICE_SPACE.sub(" ", str(rec.get("desired_outcome") or "")).strip().casefold(),
+        _NOTICE_SPACE.sub(" ", str(rec.get("acceptance_criterion") or "")).strip().casefold(),
+        str(rec.get("due_at") or "").strip(),
+    ]
+    payload = json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def render_ready_notice(rec: dict[str, Any]) -> str:
+    """Task-specific, bounded notice or ``""`` when there is nothing useful.
+
+    The first ready notice is not mandatory: a generic status-only sentence is
+    never emitted. The owner's own goal and acceptance note provide the useful
+    task-specific content; detailed linkage stays structured/on demand.
+    """
+    goal = _notice_fragment(rec.get("desired_outcome"), 180)
+    if not goal:
+        return ""
+    criterion = _notice_fragment(rec.get("acceptance_criterion"), 120)
+    text = f'Your private draft for "{goal}" is ready to review.'
+    if criterion and criterion.casefold() not in goal.casefold():
+        text += f' It was prepared against your acceptance note: "{criterion}".'
+    text += " Open it from your preparation queue when convenient."
+    return text
+
+
+def seed_legacy_ready_attention(
+    store: StateStore,
+    state: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    """Backfill suppression from real emitted/unknown legacy evidence only.
+
+    A pre-0.5.3 delivered row or a terminal delivered/unknown receipt on the
+    responsibility is evidence that the current owner outcome was already
+    announced. We record that semantic identity without inventing delivery,
+    resetting claims/history or modifying generations. Ambiguous legacy records
+    are suppressed conservatively; records with no such evidence remain eligible.
+    """
+    seeded: list[str] = []
+    delivered = state.get("delivered") if isinstance(state, dict) else None
+    rows = delivered if isinstance(delivered, list) else []
+    try:
+        records = R.list_records(store)
+    except Exception:  # noqa: BLE001 - corrupt state must not fabricate history
+        return seeded
+    for rec in records:
+        rid = str(rec.get("id") or "")
+        if not rid:
+            continue
+        prefix = "preparation-ready:artifact:" + rid + ":"
+        semantic_prefix = "preparation-ready:" + rid + ":"
+        ready = rec.get("ready") or {}
+        current_ref = str(ready.get("artifact_ref") or "")
+        current_name = current_ref.rsplit(":", 1)[-1]
+        receipt = (ready.get("notification") or {})
+
+        def _same_artifact(signature: Any) -> bool:
+            """Historical evidence must describe the CURRENT artifact.
+
+            Seeding the current semantic key from an announcement of a
+            different artifact would suppress a genuinely changed outcome
+            forever, so only evidence naming this exact artifact counts.
+            """
+            text = str(signature or "")
+            if not text.startswith("preparation-ready:"):
+                return False
+            return bool(current_name) and current_name in text
+
+        emitted = any(isinstance(row, dict) and _same_artifact(row.get("signature"))
+                      for row in rows)
+        if not emitted:
+            if receipt.get("status") not in {"delivered", "unknown"}:
+                continue
+            if not current_ref or str(receipt.get("artifact_ref") or "") != current_ref:
+                continue
+        try:
+            if R.seed_legacy_attention(
+                    store, rid, material_key=ready_material_fingerprint(rec), now=now):
+                seeded.append(rid)
+        except Exception:  # noqa: BLE001 - best effort, never blocks a real notice
+            continue
+    return seeded
+
+
 def resolve_artifact_handle(store: StateStore, handle: Any) -> dict[str, Any]:
     """Resolve an opaque public handle to the exact current artifact identity."""
     wanted = str(handle or "").strip()
@@ -950,12 +1088,21 @@ def claim_ready_notice(
             except Exception:  # noqa: BLE001 - unknown scope fails closed
                 continue
         try:
+            preview = R.inspect(store, item["responsibility_id"])
+        except R.ResponsibilityError:
+            continue
+        text = render_ready_notice(preview)
+        if not text:
+            continue
+        material = ready_material_fingerprint(preview)
+        try:
             claim = R.claim_ready_notification(
                 store, item["responsibility_id"],
                 generation=item["generation"],
                 source_version=item["source_version"],
                 artifact_ref=item["artifact_ref"],
                 artifact_hash=item["hash"],
+                material_key=material,
                 now=stamp,
             )
         except R.ResponsibilityError:
@@ -976,8 +1123,9 @@ def claim_ready_notice(
             "source_version": claim["source_version"],
             "artifact_ref": claim["artifact_ref"],
             "hash": claim["hash"],
+            "material": material,
             "target": item["target"],
-            "text": "",
+            "text": text,
         }
     return {"eligible": False, "reason": "no unclaimed ready artifact", "text": ""}
 

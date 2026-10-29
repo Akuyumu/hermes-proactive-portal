@@ -53,7 +53,7 @@ from .source_health import (
     record_observations,
     routine_health_reason,
 )
-from .policy import in_quiet_hours, load_policy, load_preferences
+from .policy import in_quiet_hours, load_policy, load_preferences, preference_blocks
 from .state import CorruptStateError, StateStore
 from .watchdog import RunDeadlineExceeded, run_deadline
 
@@ -1030,6 +1030,36 @@ def _maybe_emit_tentative_notice(args: Any, store: Any, state: dict[str, Any],
     return 0
 
 
+def _preparation_preference_blocked(rec: dict[str, Any], prefs: dict[str, Any],
+                                    now: Any) -> bool:
+    """Apply ordinary explicit suppressions/snoozes to preparation notices.
+
+    ``notice_allowed`` only checks global quiet/pause/cooldown/cap. The same
+    per-item explicit preference and scoped-snooze rules used by ordinary
+    candidates must also apply here, including the source-kind rules the owner
+    configured (mail/calendar/tasks/feed).
+    """
+    try:
+        from . import preparation as _prep
+        subject = (str(rec.get("desired_outcome") or "") + " "
+                   + str(rec.get("acceptance_criterion") or ""))
+        kinds = ["preparation"]
+        required, _reason = _prep.required_scopes(rec)
+        mapping = {"mail": "mail", "calendar": "calendar",
+                   "tasks": "task", "public": "feed"}
+        for scope in sorted(required or ()):
+            kind = mapping.get(scope)
+            if kind and kind not in kinds:
+                kinds.append(kind)
+        for kind in kinds:
+            if preference_blocks({"kind": kind, "subject": subject, "message": ""},
+                                 prefs, now):
+                return True
+    except Exception:  # noqa: BLE001 - unknown preference state fails closed
+        return True
+    return False
+
+
 def _maybe_emit_ready_notice(args: Any, store: Any, state: dict[str, Any],
                              policy: dict[str, Any], prefs: dict[str, Any],
                              clock: Any) -> int | None:
@@ -1037,7 +1067,8 @@ def _maybe_emit_ready_notice(args: Any, store: Any, state: dict[str, Any],
 
     Returns ``None`` when no artifact is eligible, ``0`` after an emission, and
     ``1`` when emission was ambiguous (marked ``unknown``; never retried). This
-    never runs in dry/check modes and never prints private facts or a claim token.
+    never runs in dry/check modes and never prints raw identifiers, private
+    source facts or a claim token.
     """
     if getattr(args, "check", False) or getattr(args, "dry_run", False):
         return None
@@ -1066,7 +1097,14 @@ def _maybe_emit_ready_notice(args: Any, store: Any, state: dict[str, Any],
             if not _prep.scope_decision(policy, rec).get("allowed"):
                 return False
             source_ok, _source_reason = _prep.source_state(rec, policy)
-            return bool(source_ok)
+            if not source_ok:
+                return False
+            return not _preparation_preference_blocked(rec, prefs, clock.now())
+
+        try:
+            _prep.seed_legacy_ready_attention(store, state, now=clock.now())
+        except Exception:  # noqa: BLE001 - migration is best effort, never a flood
+            pass
 
         notice = _prep.claim_ready_notice(
             store, now=clock.now(),
@@ -1075,17 +1113,14 @@ def _maybe_emit_ready_notice(args: Any, store: Any, state: dict[str, Any],
         if not notice.get("eligible"):
             return _maybe_emit_tentative_notice(args, store, state, policy, clock,
                                                 allowed, guard_reason)
-        public_ref = _prep.public_artifact_ref(notice["artifact_ref"])
-        text = ("A private secretary preparation draft is ready for your review. "
-                f"Responsibility {notice['responsibility_id']}; "
-                f"artifact {public_ref}. "
-                "No external action was taken.")
+        text = notice["text"]
         alert_ref = ""
         try:
             facade = getattr(getattr(args, "native_ctx", None), "state", None)
             record = remember_alert(
                 facade,
-                signature="preparation-ready:" + str(public_ref),
+                signature="preparation-ready:" + str(notice["responsibility_id"])
+                          + ":" + str(notice["material"])[:16],
                 kind="preparation",
                 candidate_refs=[{"ref": notice["responsibility_id"],
                                  "version": str(notice.get("generation") or ""),
@@ -1097,12 +1132,11 @@ def _maybe_emit_ready_notice(args: Any, store: Any, state: dict[str, Any],
                 alert_ref = str(record["ref"])
         except Exception:  # noqa: BLE001 - ref bookkeeping never blocks emission
             alert_ref = ""
-        if alert_ref:
-            text += f" Reference {alert_ref}."
         state["last_delivery_at"] = clock.now().isoformat()
         state.setdefault("delivered", []).append({
             "at": clock.now().isoformat(),
-            "signature": "preparation-ready:" + str(public_ref)[:80],
+            "signature": "preparation-ready:" + str(notice["responsibility_id"])
+                         + ":" + str(notice["material"])[:16],
             "urgent": False,
         })
         store.save("notify_state.json", state)

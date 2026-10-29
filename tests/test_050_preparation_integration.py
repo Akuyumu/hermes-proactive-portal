@@ -303,8 +303,13 @@ class PrepareCommandTests(unittest.TestCase):
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = main_mod.run_once(args, evaluator=FakeEvaluator(EvaluatorResult("silence")))
         self.assertEqual(rc, 0, err.getvalue())
-        self.assertIn("private secretary preparation draft is ready", out.getvalue().lower(),
-                      msg="OUT=" + out.getvalue() + " ERR=" + err.getvalue())
+        # 0.5.3 owner contract: the notice names the actual task and contains no
+        # registry/artifact identifiers or generic status boilerplate.
+        notice = out.getvalue()
+        self.assertIn("draft for", notice.lower(), msg="OUT=" + notice + " ERR=" + err.getvalue())
+        self.assertNotIn("artifact:", notice)
+        self.assertNotIn("responsibility", notice.lower())
+        self.assertNotIn("no external action", notice.lower())
         # A second run must not repeat the same notice.
         out2 = io.StringIO()
         with mock.patch.object(main_mod, "default_sources", lambda *a, **k: []), \
@@ -312,6 +317,7 @@ class PrepareCommandTests(unittest.TestCase):
                 contextlib.redirect_stdout(out2), contextlib.redirect_stderr(io.StringIO()):
             main_mod.run_once(args, evaluator=FakeEvaluator(EvaluatorResult("silence")))
         self.assertNotIn("private secretary preparation draft", out2.getvalue().lower())
+        self.assertEqual(out2.getvalue().strip(), "", "a repeated unchanged outcome must stay silent")
 
     def test_untrusted_model_output_cannot_escape_artifact_root(self):
         bad = FakeLlm(parsed={

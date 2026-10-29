@@ -457,10 +457,10 @@ class OnboardingAndDiscoveryTests(Workspace):
 
 class PackagingTests(Workspace):
     def test_reproducible_code_only_package_and_doctor(self):
-        out = self.root / "secretary-0.5.2.tar.gz"
+        out = self.root / "secretary-0.5.3.tar.gz"
         result = release_export.build_package(out, root=ROOT)
         self.assertTrue(result["ok"])
-        self.assertEqual(result["version"], "0.5.2")
+        self.assertEqual(result["version"], "0.5.3")
         with tarfile.open(out) as archive:
             names = archive.getnames()
             self.assertTrue(any(name.endswith("plugin.yaml") for name in names))
@@ -471,7 +471,7 @@ class PackagingTests(Workspace):
             archive.extractall(install)
         doctor = release_export.doctor(install)
         self.assertTrue(doctor["ok"], doctor)
-        self.assertEqual(doctor["version"], "0.5.2")
+        self.assertEqual(doctor["version"], "0.5.3")
         self.assertEqual(doctor["identity"], "hermes-proactive-secretary")
 
 
@@ -807,8 +807,12 @@ class LastMileReadyNoticeTruthTests(Workspace):
                 self.store, {}, policy, {}, SeededClock(T0.isoformat()))
         self.assertEqual(rc, 0)
         text = out.getvalue()
-        self.assertIn("artifact:", text)
+        self.assertIn("Prepare", text)
+        self.assertIn("acceptance note", text)
+        self.assertNotIn("artifact:", text)
+        self.assertNotIn(rec["id"], text)
         self.assertNotIn("Private Alpha", text)
+        self.assertNotIn("No external action", text)
         missing = dict(policy, _config_present=False)
         out2 = io.StringIO()
         with contextlib.redirect_stdout(out2):

@@ -2,7 +2,16 @@
 
 A conservative, opt-in proactive secretary for [Hermes](https://hermes-agent.nousresearch.com). It reads only the sources you explicitly authorise, judges whether anything is genuinely worth interrupting you for, and stays silent otherwise. It never sends mail, changes calendars or tasks, books, purchases, publishes, or expands its own access.
 
-Version **0.5.2** is a pre-1.0 release. The default posture is user-agnostic: no accounts, no public seeds, no personal interests, and no assumed location. Every source and permission is opt-in. See the compatibility and qualification limits below.
+Version **0.5.3** is a pre-1.0 release. The default posture is user-agnostic: no accounts, no public seeds, no personal interests, and no assumed location. Every source and permission is opt-in. See the compatibility and qualification limits below.
+
+## Changes in 0.5.3
+
+- Preparation notices now key on a stable owner outcome (goal, required decision/acceptance note and deadline), not artifact hashes, refs, generations or polling timestamps. Repeated scheduler ticks, restarts and regenerated drafts for the same unchanged responsibility stay silent.
+- A notice is emitted only when it carries useful task-specific content from the accepted responsibility. Owner-facing text no longer includes raw responsibility/artifact identifiers, paths, handles or generation counters; detailed linkage remains structured and on demand.
+- Upgrade migration seeds suppression only from historical evidence that names the *current* draft, so an already-announced draft is not repeated. Evidence about a different draft never pre-suppresses a newer outcome; at worst the first tick after upgrading emits one notice for a draft generated after the last announcement. Delivery is not fabricated and old claims/history are not reset.
+- Ordinary explicit preference and scoped-snooze suppression is rechecked per responsibility in this path, in addition to quiet hours, pause, cooldown and the daily ceiling. The ceiling remains a maximum, never a target.
+- The existing critical-source health contract is retained and covered by regression proof: one notice per unresolved persistent incident across retries/restarts and wording changes, with a new incident allowed only after authoritative recovery.
+- Version surfaces are aligned to 0.5.3. See [the notification contract](https://github.com/Akuyumu/hermes-proactive-secretary/blob/main/docs/notification-contract.md) in the repository source for the rationale and rejected alternatives.
 
 ## Changes in 0.5.2
 
@@ -288,7 +297,7 @@ Maintainer commands from the source tree, using a Python environment with the He
 PYTHONPATH=src python3 -m unittest discover -s tests
 PYTHONPATH=src python3 -m proactive_pilot.selftest
 python3 release_export.py scan
-python3 release_export.py build --output ./dist/hermes-proactive-secretary-0.5.2.tar.gz
+python3 release_export.py build --output ./dist/hermes-proactive-secretary-0.5.3.tar.gz
 python3 release_export.py doctor --installed /path/to/extracted-package
 ```
 
@@ -296,9 +305,9 @@ python3 release_export.py doctor --installed /path/to/extracted-package
 
 ## Qualification and limitations
 
-The 0.5.2 candidate has automated isolated test evidence. Live host/device qualification is still pending: real Telegram delivery, Desktop form interaction, real connector reads, real model calls and mobile/device canaries are not claimed here. The reviewed strict auxiliary-host patch remains a separate change that must be applied and verified on the host before model-dependent work can run.
+The 0.5.3 candidate includes synthetic automated regression coverage. Live host/device qualification is still pending: real Telegram delivery, Desktop form interaction, real connector reads, real model calls and mobile/device canaries are not claimed here. The reviewed strict auxiliary-host patch remains a separate change that must be applied and verified on the host before model-dependent work can run.
 
-0.5.2 remains limited: delivery is unconfirmed, source coverage is bounded, quiet/attention behavior is deterministic but not omniscient, and model-dependent features require a compatible host. Validate the exact connectors and messaging route you intend to use. The custom settings page, grouped editable controls and confirmed reset are included in this candidate, but they were verified with synthetic host/API/Node tests, not a live Desktop visual, accessibility or device session. The reviewed strict auxiliary-host patch is still a separate host activation prerequisite for model-dependent work.
+0.5.3 remains limited: delivery is unconfirmed, source coverage is bounded, quiet/attention behavior is deterministic but not omniscient, and model-dependent features require a compatible host. Validate the exact connectors and messaging route you intend to use. The custom settings page, grouped editable controls and confirmed reset are included in this candidate, but they were verified with synthetic host/API/Node tests, not a live Desktop visual, accessibility or device session. The reviewed strict auxiliary-host patch is still a separate host activation prerequisite for model-dependent work.
 
 For agent-assisted installation, give your agent [AGENT_SETUP.md](AGENT_SETUP.md). The operational skill is [skills/proactive-secretary/SKILL.md](skills/proactive-secretary/SKILL.md).
 
