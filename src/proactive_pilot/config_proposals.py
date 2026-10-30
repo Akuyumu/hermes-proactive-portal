@@ -29,6 +29,7 @@ DEFAULT_TTL_HOURS = 168
 MAX_PROPOSALS = 32
 MAX_TOMBSTONES = 128
 
+# --- Typed settings -------------------------------------------------------
 # The ONLY fields a proposal may name. Nested/section paths are deliberately not
 # accepted, so no arbitrary configuration key can ever be proposed or executed.
 ALLOWED_KEYS: dict[str, dict[str, Any]] = {
@@ -48,6 +49,7 @@ ALLOWED_KEYS: dict[str, dict[str, Any]] = {
 _TRANSIENT_CLASSES = {"rate_limited", "retryable"}
 
 
+# --- Shared time/value helpers --------------------------------------------
 def _now(value: datetime | None) -> datetime:
     if value is None:
         return datetime.now(timezone.utc)
@@ -76,6 +78,7 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+# --- Registry lifecycle ---------------------------------------------------
 def _ensure(registry: dict[str, Any]) -> None:
     if not isinstance(registry.get("proposals"), dict):
         registry["proposals"] = {}
@@ -111,6 +114,14 @@ def _save_if_changed(store: Any, registry: dict[str, Any], before: str,
     registry["updated_at"] = now.isoformat()
     save_registry(store, registry)
     return True
+
+
+def _load_current(store: Any, now: datetime) -> tuple[dict[str, Any], str]:
+    """Load a registry, snapshot it, and expire obsolete pending proposals."""
+    registry = load_registry(store)
+    before = _snapshot(registry)
+    _expire(registry, now)
+    return registry, before
 
 
 def _validate_change(key: str, before: Any, after: Any) -> None:
@@ -182,6 +193,105 @@ def _close(registry: dict[str, Any], proposal: dict[str, Any], status: str,
         _remember_tombstone(registry, str(proposal.get("id") or ""), status, now)
 
 
+def _expire(registry: dict[str, Any], now: datetime) -> None:
+    for proposal in list(registry.get("proposals", {}).values()):
+        if not isinstance(proposal, dict) or str(proposal.get("status")) != "pending":
+            continue
+        expires = _parse_iso(proposal.get("expires_at"), now)
+        if expires is None or expires <= now:
+            _close(registry, proposal, "expired", "proposal expired before approval", now)
+
+
+# --- Source relevance -----------------------------------------------------
+def _failure_threshold(policy: dict[str, Any]) -> int:
+    return max(1, _safe_int(policy.get("source_replacement_failure_threshold", 3), 3))
+
+
+def _source_view(public_registry: dict[str, Any] | None,
+                 policy: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
+    """Normalize public sources, preserving absent-vs-malformed distinction."""
+    registry = public_registry if isinstance(public_registry, dict) else None
+    sources = registry.get("sources") if registry is not None else None
+    if not isinstance(sources, dict):
+        sources = {} if registry is not None else None
+    return sources, _failure_threshold(policy)
+
+
+def _find_source(sources: dict[str, Any], source_id: str) -> dict[str, Any] | None:
+    direct = sources.get(source_id)
+    if isinstance(direct, dict):
+        return direct
+    for rec in sources.values():
+        if isinstance(rec, dict) and str(rec.get("id") or "") == source_id:
+            return rec
+    return None
+
+
+def _inactive(rec: dict[str, Any]) -> bool:
+    if rec.get("parked") or rec.get("disabled"):
+        return True
+    if rec.get("enabled") is False:
+        return True
+    maintenance = rec.get("maintenance")
+    if isinstance(maintenance, dict):
+        if str(maintenance.get("state") or "").strip().lower() in {
+                "parked", "disabled", "off", "stopped"}:
+            return True
+    return False
+
+
+def _inherits_global_cadence(rec: dict[str, Any]) -> bool:
+    # A source with its own cadence field does not inherit the global default,
+    # so changing feed_cadence_minutes would not affect it.
+    return not rec.get("cadence_minutes")
+
+
+def _reconcile(registry: dict[str, Any], policy: dict[str, Any],
+               sources: dict[str, Any] | None, threshold: int,
+               now: datetime) -> None:
+    """Close pending proposals whose configured value or source issue changed."""
+    for proposal in list(registry.get("proposals", {}).values()):
+        if not isinstance(proposal, dict) or str(proposal.get("status")) != "pending":
+            continue
+        key = str(proposal.get("key") or "")
+        if key not in ALLOWED_KEYS:
+            _close(registry, proposal, "superseded",
+                   "configuration key is no longer proposal-eligible", now)
+            continue
+        current = _policy_value(policy, key)
+        before = proposal.get("before")
+        if type(current) is not int or current != before:
+            _close(registry, proposal, "superseded",
+                   "configured value changed; this suggestion is obsolete", now)
+            continue
+        source_id = str(proposal.get("source_id") or "")
+        if sources is None or not source_id:
+            continue
+        rec = _find_source(sources, source_id)
+        if not isinstance(rec, dict):
+            _close(registry, proposal, "withdrawn",
+                   "the source this suggestion was based on is gone", now)
+            continue
+        if _inactive(rec):
+            _close(registry, proposal, "withdrawn",
+                   "the source is parked/disabled", now)
+            continue
+        failures = max(0, _safe_int(rec.get("failures", 0), 0))
+        if failures < threshold:
+            _close(registry, proposal, "withdrawn",
+                   "the underlying source failure is resolved", now)
+            continue
+        reason = str(rec.get("stale_reason") or "")
+        if classify_failure(reason) not in _TRANSIENT_CLASSES:
+            _close(registry, proposal, "withdrawn",
+                   "the underlying failure is no longer transient", now)
+            continue
+        if key == "feed_cadence_minutes" and not _inherits_global_cadence(rec):
+            _close(registry, proposal, "withdrawn",
+                   "the source has its own cadence; the global value is inapplicable", now)
+
+
+# --- Public lifecycle APIs ------------------------------------------------
 def add_proposal(
     registry: dict[str, Any],
     *,
@@ -260,89 +370,6 @@ def add_proposal(
     return proposal
 
 
-def _expire(registry: dict[str, Any], now: datetime) -> None:
-    for proposal in list(registry.get("proposals", {}).values()):
-        if not isinstance(proposal, dict) or str(proposal.get("status")) != "pending":
-            continue
-        expires = _parse_iso(proposal.get("expires_at"), now)
-        if expires is None or expires <= now:
-            _close(registry, proposal, "expired", "proposal expired before approval", now)
-
-
-def _find_source(sources: dict[str, Any], source_id: str) -> dict[str, Any] | None:
-    direct = sources.get(source_id)
-    if isinstance(direct, dict):
-        return direct
-    for rec in sources.values():
-        if isinstance(rec, dict) and str(rec.get("id") or "") == source_id:
-            return rec
-    return None
-
-
-def _inactive(rec: dict[str, Any]) -> bool:
-    if rec.get("parked") or rec.get("disabled"):
-        return True
-    if rec.get("enabled") is False:
-        return True
-    maintenance = rec.get("maintenance")
-    if isinstance(maintenance, dict):
-        if str(maintenance.get("state") or "").strip().lower() in {
-                "parked", "disabled", "off", "stopped"}:
-            return True
-    return False
-
-
-def _inherits_global_cadence(rec: dict[str, Any]) -> bool:
-    # A source with its own cadence field does not inherit the global default,
-    # so changing feed_cadence_minutes would not affect it.
-    return not rec.get("cadence_minutes")
-
-
-def _reconcile(registry: dict[str, Any], policy: dict[str, Any],
-               sources: dict[str, Any] | None, threshold: int,
-               now: datetime) -> None:
-    """Close pending proposals whose configured value or source issue changed."""
-    for proposal in list(registry.get("proposals", {}).values()):
-        if not isinstance(proposal, dict) or str(proposal.get("status")) != "pending":
-            continue
-        key = str(proposal.get("key") or "")
-        if key not in ALLOWED_KEYS:
-            _close(registry, proposal, "superseded",
-                   "configuration key is no longer proposal-eligible", now)
-            continue
-        current = _policy_value(policy, key)
-        before = proposal.get("before")
-        if type(current) is not int or current != before:
-            _close(registry, proposal, "superseded",
-                   "configured value changed; this suggestion is obsolete", now)
-            continue
-        source_id = str(proposal.get("source_id") or "")
-        if sources is None or not source_id:
-            continue
-        rec = _find_source(sources, source_id)
-        if not isinstance(rec, dict):
-            _close(registry, proposal, "withdrawn",
-                   "the source this suggestion was based on is gone", now)
-            continue
-        if _inactive(rec):
-            _close(registry, proposal, "withdrawn",
-                   "the source is parked/disabled", now)
-            continue
-        failures = max(0, _safe_int(rec.get("failures", 0), 0))
-        if failures < threshold:
-            _close(registry, proposal, "withdrawn",
-                   "the underlying source failure is resolved", now)
-            continue
-        reason = str(rec.get("stale_reason") or "")
-        if classify_failure(reason) not in _TRANSIENT_CLASSES:
-            _close(registry, proposal, "withdrawn",
-                   "the underlying failure is no longer transient", now)
-            continue
-        if key == "feed_cadence_minutes" and not _inherits_global_cadence(rec):
-            _close(registry, proposal, "withdrawn",
-                   "the source has its own cadence; the global value is inapplicable", now)
-
-
 def observe(
     store: Any,
     policy: dict[str, Any],
@@ -354,14 +381,8 @@ def observe(
     now = _now(now)
     if not isinstance(policy, dict):
         policy = {}
-    registry = load_registry(store)
-    before_state = _snapshot(registry)
-    _expire(registry, now)
-    source_registry = public_registry if isinstance(public_registry, dict) else None
-    sources = source_registry.get("sources") if source_registry is not None else None
-    if not isinstance(sources, dict):
-        sources = {} if source_registry is not None else None
-    threshold = max(1, _safe_int(policy.get("source_replacement_failure_threshold", 3), 3))
+    registry, before_state = _load_current(store, now)
+    sources, threshold = _source_view(public_registry, policy)
     current = _safe_int(policy.get("feed_cadence_minutes", 60), 60)
     current = max(1, current)
 
@@ -419,15 +440,9 @@ def pending_notice(
 ) -> tuple[str, str] | None:
     """Return ``(proposal_id, message)`` for one relevant unpresented proposal."""
     now = _now(now)
-    registry = load_registry(store)
-    before_state = _snapshot(registry)
-    _expire(registry, now)
+    registry, before_state = _load_current(store, now)
     if isinstance(policy, dict):
-        source_registry = public_registry if isinstance(public_registry, dict) else None
-        sources = source_registry.get("sources") if source_registry is not None else None
-        if not isinstance(sources, dict):
-            sources = {} if source_registry is not None else None
-        threshold = max(1, _safe_int(policy.get("source_replacement_failure_threshold", 3), 3))
+        sources, threshold = _source_view(public_registry, policy)
         _reconcile(registry, policy, sources, threshold, now)
     _save_if_changed(store, registry, before_state, now)
     for pid, proposal in sorted(registry.get("proposals", {}).items(),
@@ -451,9 +466,7 @@ def pending_notice(
 def show(store: Any, proposal_id: str, now: datetime | None = None) -> dict[str, Any] | None:
     """Show exactly one proposal by id (expiring obsolete pending records first)."""
     now = _now(now)
-    registry = load_registry(store)
-    before_state = _snapshot(registry)
-    _expire(registry, now)
+    registry, before_state = _load_current(store, now)
     _save_if_changed(store, registry, before_state, now)
     proposal = registry.get("proposals", {}).get(str(proposal_id))
     return proposal if isinstance(proposal, dict) else None
@@ -516,8 +529,7 @@ def approval_handoff(
     if isinstance(public_registry, dict):
         sources = public_registry.get("sources")
         if isinstance(sources, dict):
-            threshold = max(1, _safe_int(
-                policy.get("source_replacement_failure_threshold", 3), 3))
+            threshold = _failure_threshold(policy)
             _reconcile(registry, policy, sources, threshold, now)
             if str(proposal.get("status")) != "pending":
                 save_registry(store, registry)
@@ -553,6 +565,7 @@ def approval_handoff(
     }
 
 
+# --- CLI ------------------------------------------------------------------
 def command(args: Any) -> int:
     """CLI: list/show/handoff/dismiss typed proposals (never applies a change)."""
     import sys
@@ -564,43 +577,46 @@ def command(args: Any) -> int:
     clock = SeededClock(args.seeded_clock) if getattr(args, "seeded_clock", None) else Clock()
     store = StateStore(Path(args.state_dir), clock)
     action = str(getattr(args, "feedback", "") or "")
+
+    def emit(payload: Any) -> None:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+
+    def required_id() -> str | None:
+        target = str(getattr(args, "id", "") or "")
+        if target:
+            return target
+        print("proactive-secretary config proposal rejected: --id is required",
+              file=sys.stderr)
+        return None
+
     try:
         if action == "config-proposal-list":
-            registry = load_registry(store)
-            before_state = _snapshot(registry)
-            _expire(registry, clock.now())
+            registry, before_state = _load_current(store, clock.now())
             _save_if_changed(store, registry, before_state, clock.now())
-            print(json.dumps(registry, indent=2, sort_keys=True))
+            emit(registry)
             return 0
         if action in {"config-proposal-show", "config-show"}:
-            target = str(getattr(args, "id", "") or "")
-            if not target:
-                print("proactive-secretary config proposal rejected: --id is required",
-                      file=sys.stderr)
+            target = required_id()
+            if target is None:
                 return 2
             proposal = show(store, target, clock.now())
             if proposal is None:
                 print(f"proactive-secretary config proposal rejected: no proposal {target!r}",
                       file=sys.stderr)
                 return 2
-            print(json.dumps(proposal, indent=2, sort_keys=True))
+            emit(proposal)
             return 0
         if action in {"config-proposal-dismiss", "config-dismiss"}:
-            target = str(getattr(args, "id", "") or "")
-            if not target:
-                print("proactive-secretary config proposal rejected: --id is required",
-                      file=sys.stderr)
+            target = required_id()
+            if target is None:
                 return 2
             proposal = dismiss(store, target, clock.now())
-            print(json.dumps({"feedback": action, "status": "dismissed",
-                              "proposal": proposal}, indent=2, sort_keys=True))
+            emit({"feedback": action, "status": "dismissed", "proposal": proposal})
             return 0
         if action in {"config-proposal-handoff", "config-proposal-approve",
                       "config-approve"}:
-            target = str(getattr(args, "id", "") or "")
-            if not target:
-                print("proactive-secretary config proposal rejected: --id is required",
-                      file=sys.stderr)
+            target = required_id()
+            if target is None:
                 return 2
             policy = getattr(args, "policy", None)
             if not isinstance(policy, dict):
@@ -612,7 +628,7 @@ def command(args: Any) -> int:
                 store, target, policy, now=clock.now(),
                 public_registry=getattr(args, "public_registry", None),
             )
-            print(json.dumps(result, indent=2, sort_keys=True))
+            emit(result)
             return 0
     except ValueError as exc:
         print(f"proactive-secretary config proposal rejected: {exc}", file=sys.stderr)

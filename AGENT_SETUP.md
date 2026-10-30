@@ -51,22 +51,13 @@ hermes secretary doctor
 
 The private repository must be accessible to the installer's Git transport. If it is not, stop and report the access requirement; do not bypass it. An immutable reviewed release may be pinned with `--ref <full-40-character-commit-sha>`.
 
-Desktop note: the normal `hermes plugins install ...` command installs both the
-agent and Desktop halves of the package. There is no native `--desktop` flag and
-no desktop SHA pin. The current Desktop plugin form has no Desktop-target checkbox
-(its tooltip is stale). The code-supported Desktop-only compatibility URI is:
+Desktop installation uses the same unified native flow. Open **Capabilities → Plugins → Install from Git**, or use:
 
-```
-hermes://plugin-desktop/install?repo=Akuyumu/hermes-proactive-secretary&enable=1
+```text
+hermes://plugin/install?repo=Akuyumu/hermes-proactive-secretary&enable=1
 ```
 
-Use it only from the client Desktop app. The repository download happens on the
-client computer and requires working private Git access there; the backend cannot
-fetch it. A repository form that cannot inject an action/link still works through
-the normal plugin install; adding a button requires a local Desktop half or an
-upstream form enhancement. Do not create internal marker files, bypass the install
-scanner or weaken a security check. Conversational onboarding works without the
-Desktop half, so a missing button must not block setup.
+The [official plugin guide](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins#one-click-install-links-desktop) describes a confirmation dialog that detects agent and Desktop components and lets the user choose. Older clients may expose different controls. There is no separate native `--desktop` CLI flag. Client-side private-repository downloads require working Git access on the client; backend access alone does not prove that. Never create marker files, bypass a scanner or weaken a security check. Conversational onboarding works without the Desktop component and must not be blocked by a missing button.
 
 
 The plugin bundles its operational skill at `skills/proactive-secretary/SKILL.md`. Load that installed file through your skill system if available; otherwise read it directly. Do not accidentally load an unrelated skill with the same short name.

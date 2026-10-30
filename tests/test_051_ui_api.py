@@ -38,7 +38,7 @@ class PackagingAndSchemaTests(unittest.TestCase):
         module_version = _version_from(ROOT / "src" / "proactive_pilot" / "__init__.py",
                                        r'__version__\s*=\s*"([^"]+)"')
         self.assertEqual(manifest_version, module_version)
-        self.assertEqual(manifest_version, "0.6.0")
+        self.assertEqual(manifest_version, "0.6.1")
         report = exporter.scan(ROOT)
         self.assertTrue(report["ok"], report["problems"])
         for name in ("desktop/plugin.js", "dashboard/plugin_api.py", "dashboard/manifest.json"):
@@ -55,6 +55,12 @@ class PackagingAndSchemaTests(unittest.TestCase):
         self.assertIn("desktop/plugin.js", members)
         self.assertIn("dashboard/plugin_api.py", members)
         self.assertIn("dashboard/manifest.json", members)
+        self.assertIn("docs/operations.md", members)
+        # Every relative README link must work in the shipped archive, not just Git.
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for link in re.findall(r"\]\(([^)]+)\)", readme):
+            if "://" not in link and not link.startswith("#"):
+                self.assertIn(link.split("#", 1)[0], members)
         self.assertFalse(any(name.startswith((".build-context", "tests/")) for name in members))
         self.assertFalse(any("private" in Path(name).parts for name in members))
 
@@ -64,7 +70,7 @@ class PackagingAndSchemaTests(unittest.TestCase):
         imported = exporter._import_registration(extracted)
         self.assertTrue(imported["ok"], imported)
         dashboard = json.loads((extracted / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(dashboard["version"], "0.6.0")
+        self.assertEqual(dashboard["version"], "0.6.1")
         self.assertEqual(dashboard["api"], "plugin_api.py")
 
     def test_doctor_requires_the_real_custom_ui_and_api(self):
