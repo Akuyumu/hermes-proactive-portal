@@ -393,6 +393,7 @@ def ensure_discovered_sources(
         for sid, rec in registry.get("sources", {}).items()
         if str(rec.get("watch_id") or "") == wid and rec.get("discovered")
         and int(rec.get("plan_version", -1) or 0) == version
+        and not rec.get("parked")
     }
 
     chosen: list[tuple[str, dict[str, Any]]] = []  # (url, src-descriptor)
@@ -431,7 +432,7 @@ def ensure_discovered_sources(
     keep_sids = {existing[url][0] for url, _ in chosen if url in existing}
     for sid, rec in list(registry.get("sources", {}).items()):
         if (str(rec.get("watch_id") or "") == wid and rec.get("discovered")
-                and sid not in keep_sids):
+                and sid not in keep_sids and not rec.get("parked")):
             registry["sources"].pop(sid, None)
 
     # 4. Refresh/insert the chosen records (bounded by the registry limit).

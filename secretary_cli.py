@@ -398,8 +398,15 @@ def _freshness(last_success: str, now: Any, stale_minutes: int) -> tuple[bool, s
         return False, "unknown"
 
 
-def _capability_truth(config: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    """Separate installed/available from enabled/authorized/verified/fresh."""
+def _capability_truth(config: dict[str, Any], state: dict[str, Any],
+                      public_registry: dict[str, Any] | None = None,
+                      adaptive_coverage: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Separate installed/available from enabled/authorized/verified/fresh.
+
+    Public truth is evaluated per configured source when the runtime registry /
+    adaptive coverage is supplied; without them the legacy health-only view is
+    preserved for callers that only have configuration and notify state.
+    """
     from datetime import datetime
     health = (state.get("source_health") or {}).get("sources") or {}
     now = datetime.now().astimezone()
@@ -450,6 +457,15 @@ def _capability_truth(config: dict[str, Any], state: dict[str, Any]) -> dict[str
     tasks = (config.get("tasks") or {}).get("accounts") or []
     lists = (config.get("tasks") or {}).get("lists") or []
     public_scope = (config.get("public_sources") or config.get("public_interests") or [])
+    try:
+        from proactive_pilot.source_truth import public_truth
+        public_entry = public_truth(
+            config, state, registry=public_registry, adaptive=adaptive_coverage, now=now)
+    except Exception:  # noqa: BLE001 - preserve the legacy truth if the helper fails
+        public_entry = status("public", True, bool(sources.get("public_feeds")),
+                             list(public_scope),
+                             "Add explicit public interests/sources; empty means none.",
+                             prefixes=("feed:",))
     return {
         "mail": status("mail", shutil.which("himalaya") is not None,
                        bool(sources.get("mail")), mail,
@@ -460,10 +476,7 @@ def _capability_truth(config: dict[str, Any], state: dict[str, Any]) -> dict[str
         "tasks": status("tasks", _secretary_src_available(),
                         bool(sources.get("tasks")), tasks or lists,
                         f"Set {_secretary_env_hint()} and an explicit task adapter/list."),
-        "public": status("public", True, bool(sources.get("public_feeds")),
-                         list(public_scope),
-                         "Add explicit public interests/sources; empty means none.",
-                         prefixes=("feed:",)),
+        "public": public_entry,
         "obligations": status("obligation",
                               shutil.which("himalaya") is not None,
                               bool(sources.get("obligations")), mail,
@@ -512,7 +525,11 @@ def detect_capabilities() -> dict[str, Any]:
         # private source look disabled and monitoring falsely public-only.
         routed = routed_retrieval.capabilities(effective, ctx=get_native_context())
         state = _read_json(paths.state_dir() / "notify_state.json")
-        truth = _capability_truth(loaded.config, state)
+        public_registry = _read_json(paths.state_dir() / "public_registry.json")
+        adaptive_coverage = _read_json(paths.state_dir() / "adaptive_coverage.json")
+        truth = _capability_truth(loaded.config, state,
+                                  public_registry=public_registry or None,
+                                  adaptive_coverage=adaptive_coverage or None)
         # Availability is not coverage: only an enabled AND explicitly scoped
         # private source counts as more than public-only capability.
         private_configured = any(
@@ -1673,6 +1690,22 @@ def feedback_command(args: argparse.Namespace) -> int:
               as_json=bool(getattr(args, "json", False)),
               human="usage: hermes secretary feedback <action> [options]")
         return 2
+    if str(rest[0]).startswith("config-proposal") or str(rest[0]) in {
+            "config-show", "config-dismiss", "config-approve"}:
+        # Use the SAME effective native/local configuration and current public
+        # registry that the scheduled pipeline uses. Never apply a change here.
+        import argparse as _argparse
+        from proactive_pilot import config_proposals
+        _loaded, effective = _effective_config_and_policy()
+        public_registry = _read_json(paths.state_dir() / "public_registry.json")
+        id_value = ""
+        for index, token in enumerate(rest):
+            if token == "--id" and index + 1 < len(rest):
+                id_value = rest[index + 1]
+        ns = _argparse.Namespace(
+            feedback=rest[0], id=id_value, state_dir=str(paths.state_dir()),
+            policy=effective, public_registry=public_registry, seeded_clock=None)
+        return config_proposals.command(ns)
     argv = ["--state-dir", str(paths.state_dir()), "--policy", str(paths.policy_path()),
             "--preferences", str(paths.preferences_path()), "--feedback", *rest]
     return pilot_main(argv)

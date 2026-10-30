@@ -2141,11 +2141,14 @@ def registry_add(
     sid = _source_id(kind, url)
     if sid in registry["sources"]:
         return True
-    if len(registry["sources"]) >= max(1, int(limit)):
-        # Rotate: drop the oldest non-seed auto-added source, if any.
+    live_count = sum(1 for rec in registry["sources"].values()
+                     if isinstance(rec, dict) and not rec.get("parked"))
+    if live_count >= max(1, int(limit)):
+        # Rotate: drop the oldest non-seed auto-added source, if any. Parked
+        # lineage records never count toward capacity and are never removed.
         candidates = [
             (key, rec) for key, rec in registry["sources"].items()
-            if rec.get("auto_added") and not rec.get("seed")
+            if rec.get("auto_added") and not rec.get("seed") and not rec.get("parked")
         ]
         if not candidates:
             return False
@@ -2780,6 +2783,13 @@ def collect_public_feeds(
     firecrawl: Any = None,
     credentialed_fetcher: Callable[..., FetchResponse] | None = None,
     transport_gate: Any = None,
+    search_bridge: Any = None,
+    search_budget: Any = None,
+    overall_budget: Any = None,
+    maintenance_decider: Any = None,
+    resolver: Callable[[str], list[str]] | None = None,
+    maintenance_context: list[str] | None = None,
+    maintenance_privacy_verifier: Any = None,
 ) -> list[SourceResult]:
     """Collect bounded public feeds. Never raises; failures are labelled.
 
@@ -2809,7 +2819,8 @@ def collect_public_feeds(
     topics = discover_topics(context, max_topics=int(policy.get("discovery_topics_cap", 4)))
     ensure_discovery_sources(registry, topics, policy, now)
     limit = int(policy.get("max_public_registry", DEFAULT_REGISTRY_LIMIT))
-    sources = list(registry["sources"].values())[:limit]
+    sources = [rec for rec in registry["sources"].values()
+               if not rec.get("parked")][:limit]
 
     # Only sources whose cadence has elapsed are "due"; rotate across them.
     due: list[dict[str, Any]] = []
@@ -2928,6 +2939,57 @@ def collect_public_feeds(
         if rec.get("cache_at") and _age_minutes(now, rec["cache_at"]) > retention_minutes:
             rec["cache_items"] = []
             rec["cache_at"] = ""
+    # Scheduled public maintenance seam: a persistently defective ordinary
+    # source may be replaced with a freshly verified equivalent from the SAME
+    # interest. This runs only inside the production collection path, uses the
+    # remaining shared public budget/attempt allowance, and never triggers on a
+    # transient/rate-limit/deferred observation (see source_maintenance).
+    from .source_maintenance import attempt_replacements, maintenance_enabled
+    if maintenance_enabled(policy):
+        def _can_attempt() -> bool:
+            if overall_budget is not None and overall_budget.remaining() <= 1.0:
+                return False
+            if budget is not None and budget.remaining() <= 1.0:
+                return False
+            if attempt_ledger is not None and attempt_ledger.remaining() <= 0:
+                return False
+            return True
+
+        def _probe(kind, url, interest):
+            if not _can_attempt():
+                raise RuntimeError("maintenance budget deferred")
+            if attempt_ledger is not None and attempt_ledger.take(1) != 1:
+                raise RuntimeError("shared source-attempt allowance exhausted")
+            probe_policy = dict(policy)
+            remaining = float(budget.remaining()) if budget is not None else 30.0
+            if overall_budget is not None:
+                remaining = min(remaining, float(overall_budget.remaining()))
+            probe_policy["feed_timeout_seconds"] = max(
+                1, int(min(int(policy.get("feed_timeout_seconds", DEFAULT_TIMEOUT)),
+                           remaining)))
+            probe_rec = {
+                "id": f"replacement-probe:{hashlib.sha256(url.encode()).hexdigest()[:8]}",
+                "kind": kind, "url": url, "interest": interest,
+                "host": canonical_host(urllib.parse.urlsplit(url).hostname or ""),
+                "cadence_minutes": 360, "vetted_public": True,
+                "provenance": "automatic replacement probe",
+            }
+            result, _used = _collect_one(
+                probe_rec, policy=probe_policy, clock=clock, now=now, fetcher=fetcher,
+                reddit_budget=reddit_budget, reddit_ledger=reddit_ledger,
+                renderer=renderer, firecrawl=firecrawl,
+                credentialed_fetcher=credentialed_fetcher,
+                transport_gate=transport_gate)
+            return result
+
+        attempt_replacements(
+            registry, policy=policy, now=now, probe=_probe,
+            decider=maintenance_decider, search_bridge=search_bridge,
+            search_budget=search_budget, overall_budget=overall_budget,
+            resolver=resolver, can_attempt=_can_attempt,
+            max_probes=int(policy.get("source_replacement_max_probes_per_cycle", 1)),
+            origin="ordinary", context=maintenance_context,
+            privacy_verifier=maintenance_privacy_verifier)
     registry["updated_at"] = now.isoformat()
     save_registry(store, registry)
     return results

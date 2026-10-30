@@ -68,6 +68,26 @@ DEFAULT_POLICY: dict[str, Any] = {
     # Neutral default: no source is critical until the user's validated
     # configuration names it. This is the ONLY way a source becomes critical.
     "health_critical_sources": [],
+    # -- automatic reversible public-source maintenance -----------------------
+    # Standing public-maintenance authority: a persistently defective public
+    # source may be replaced by a freshly verified equivalent from the SAME
+    # interest. Transient/rate-limited/deferred observations never trigger this.
+    # One bounded probe per cycle and a cooldown prevent loops. The old record is
+    # parked with lineage, not deleted.
+    "source_replacement_failure_threshold": 3,
+    "source_replacement_max_attempts": 3,
+    "source_replacement_max_probes_per_cycle": 1,
+    "source_replacement_cooldown_minutes": 360,
+    "source_replacement_max_sources_per_cycle": 2,
+    "source_replacement_decision_timeout_seconds": 20,
+    "source_replacement_max_tokens": 500,
+    # Explicit standing consent for automatic public maintenance on ordinary
+    # sources. adaptive_mode="active" is also standing consent; feeds_enabled
+    # alone is not.
+    "public_source_maintenance_enabled": False,
+    # Typed configuration proposals are evidence-backed, deduplicated, expiring
+    # and only ever shown through the ordinary attention envelope.
+    "config_proposal_ttl_hours": 168,
     # -- public awareness expansion -------------------------------------------
     "feeds_enabled": True,
     "obligations_enabled": True,

@@ -2,7 +2,16 @@
 
 A conservative, opt-in proactive secretary for [Hermes](https://hermes-agent.nousresearch.com). It reads only the sources you explicitly authorise, judges whether anything is genuinely worth interrupting you for, and stays silent otherwise. It never sends mail, changes calendars or tasks, books, purchases, publishes, or expands its own access.
 
-Version **0.5.3** is a pre-1.0 release. The default posture is user-agnostic: no accounts, no public seeds, no personal interests, and no assumed location. Every source and permission is opt-in. See the compatibility and qualification limits below.
+Version **0.6.0** is a pre-1.0 release. The default posture is user-agnostic: no accounts, no public seeds, no personal interests, and no assumed location. Every source and permission is opt-in. See the compatibility and qualification limits below.
+
+## Changes in 0.6.0
+
+- Public coverage reflects each source's cadence and content validity, including partial coverage; an intentional skip or a healthy cache is not a new successful fetch.
+- Within active, authorised public discovery, defective sources can be replaced automatically using vetted fresh evidence and strict purpose/authority judgment. Replacements preserve typed official validity, retain lineage and can be disputed or restored.
+- Existing interest feedback now governs acquisition and maintenance as well as relevance. Temporary snoozes resume; acknowledgements do not silently retire interests.
+- Specific, typed configuration suggestions are deduplicated and share the ordinary attention ceiling. Exact foreground handoff uses effective settings and never applies a change automatically.
+- Configured privacy review and residual budgets cover maintenance queries. LTA gating, requested reminders, strict model routing and the low-noise notification contract are preserved.
+- See [adaptive maintenance](https://github.com/Akuyumu/hermes-proactive-secretary/blob/v0.6.0/docs/adaptive-maintenance.md) for behavior, limits and reversal.
 
 ## Changes in 0.5.3
 
@@ -239,6 +248,16 @@ Public discovery is off by default. Add only public, keyless sources you trust, 
 
 When adaptive discovery is explicitly enabled, its query boundary is public and bounded. Queries come from explicit public interests/watches, or tentative inferred goals only if you separately enable them; private facts are never turned into public queries, and a broad public grant never authorises a private source or scope. Discovered content is untrusted evidence, never instructions. Enabling a source does not grant permission to read a different source.
 
+## Adaptive public maintenance and proposals
+
+Status/doctor reports per-public-source truth rather than a single newest success. Cached-but-not-due, budget-deferred, transient/rate-limited and intentional LTA transport-gate skips are not reported as global failure; an unsupported adaptive route is an explicit unresolved limitation.
+
+Within standing public-maintenance consent **and** enabled broad public discovery, a persistently defective **public** source may be replaced automatically only when the existing bounded discovery path finds a candidate, a real fetch yields fresh usable evidence, and a strict zero-tool structured decision verifies the same purpose, authority and date scope. A same-topic search hit is not an equivalent; official SMRT/NTU/weather sources cannot be replaced by forum or project chatter. Missing strict decision, privacy rejection, transient/rate-limit/deferred observations, or disabled/revoked/paused/snoozed sources cause no replacement. The old source is parked with preserved failure history and stable lineage, its evidence/cache is preserved on the adopted source, one concise notice is emitted at most once per change through the ordinary envelope, and `hermes secretary feedback --feedback source-dispute --id <stable-ref>` performs a locked idempotent restore that blocks the same rejected replacement from returning.
+
+Feedback also changes subsequent adaptive acquisition and relevance: explicit corrections revise the plan, explicit suppression or a scoped temporary snooze blocks the watch/evidence without retiring it, and the snooze expires automatically. "Thanks" or silence is not disinterest. Conditional rules are not blanket suppressions.
+
+The plugin may propose a specific typed configuration adjustment from bounded operational evidence (with reason and expiry) through the same five-per-day attention envelope. A proposal never changes configuration; it stays unapplied until exact foreground approval through the existing validated writer/backup path. See [docs/adaptive-maintenance.md](docs/adaptive-maintenance.md).
+
 ## Optional integrations
 
 These are optional and off by default; they do not ship with credentials.
@@ -297,7 +316,7 @@ Maintainer commands from the source tree, using a Python environment with the He
 PYTHONPATH=src python3 -m unittest discover -s tests
 PYTHONPATH=src python3 -m proactive_pilot.selftest
 python3 release_export.py scan
-python3 release_export.py build --output ./dist/hermes-proactive-secretary-0.5.3.tar.gz
+python3 release_export.py build --output ./dist/hermes-proactive-secretary-0.6.0.tar.gz
 python3 release_export.py doctor --installed /path/to/extracted-package
 ```
 
@@ -305,9 +324,9 @@ python3 release_export.py doctor --installed /path/to/extracted-package
 
 ## Qualification and limitations
 
-The 0.5.3 candidate includes synthetic automated regression coverage. Live host/device qualification is still pending: real Telegram delivery, Desktop form interaction, real connector reads, real model calls and mobile/device canaries are not claimed here. The reviewed strict auxiliary-host patch remains a separate change that must be applied and verified on the host before model-dependent work can run.
+The 0.6.0 release includes synthetic automated regression coverage: 1,472 tests, 56 skipped, no failures, plus 20 independent acceptance checks. Packaging and extracted-host validation pass. These results do not establish that a particular user's sources have useful live alternatives or that a physical device received a notification. Real connector access, model calls, messaging delivery and Desktop/device interaction require separate installation-specific qualification.
 
-0.5.3 remains limited: delivery is unconfirmed, source coverage is bounded, quiet/attention behavior is deterministic but not omniscient, and model-dependent features require a compatible host. Validate the exact connectors and messaging route you intend to use. The custom settings page, grouped editable controls and confirmed reset are included in this candidate, but they were verified with synthetic host/API/Node tests, not a live Desktop visual, accessibility or device session. The reviewed strict auxiliary-host patch is still a separate host activation prerequisite for model-dependent work.
+0.6.0 remains limited: source coverage is bounded, quiet/attention behavior is deterministic but not omniscient, and model-dependent features require a compatible host exposing the strict configured auxiliary lane. Validate the exact connectors and messaging route you intend to use. Configuration proposals remain foreground-approved typed handoffs, not automatic settings changes. A defective official source with no verified equivalent remains honestly unresolved. The custom settings page, grouped editable controls and confirmed reset retain their synthetic host/API/Node qualification; no live Desktop visual, accessibility or physical-device result is claimed by the package.
 
 For agent-assisted installation, give your agent [AGENT_SETUP.md](AGENT_SETUP.md). The operational skill is [skills/proactive-secretary/SKILL.md](skills/proactive-secretary/SKILL.md).
 

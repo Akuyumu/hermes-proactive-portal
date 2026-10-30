@@ -39,6 +39,7 @@ from .watchstore import (
     active_watches,
     load_watchstore,
     save_watchstore,
+    watch_is_active,
     watch_is_retired,
     watch_lock,
 )
@@ -316,6 +317,8 @@ def _prepare_interest_plan(policy: dict[str, Any], clock: Any, *, store: Any,
     call. A new installation has no interests and therefore enters none of this.
     """
     interests = approved_interest_targets(policy)
+    from .interest_feedback import filter_interest_targets
+    interests = filter_interest_targets(interests, policy, now)
     if not interests:
         return None
     cadence = max(1, int(policy.get("adaptive_plan_cadence_minutes", 360))) * 60
@@ -414,6 +417,8 @@ def prepare_adaptive_plan(
             if watch_is_retired(watch, now):
                 purge_watch_evidence(store, wid)
         active = sorted(active_watches(data, now), key=lambda w: str(w.get("id")))
+        from .interest_feedback import filter_watches
+        active = filter_watches(active, policy, now)
         if not active:
             # ZERO explicit watches: the default-off inferred-goals stage runs
             # every slot (no contention to ration).
@@ -535,7 +540,8 @@ def ensure_adaptive_sources(
     # Dynamically discovered sources for this watch are owned by the discovery
     # reconciler; a plan-route reconcile must never wipe them.
     existing = [rec for rec in registry.get("sources", {}).values()
-                if str(rec.get("watch_id") or "") == wid and not rec.get("discovered")]
+                if str(rec.get("watch_id") or "") == wid and not rec.get("discovered")
+                and not rec.get("parked")]
     existing_keys = {(str(rec.get("kind") or ""), str(rec.get("url") or "")) for rec in existing}
     # Idempotent reconcile: when the same watch revision still maps to the same
     # route set, keep the existing records so cadence/cache are preserved. A
@@ -546,7 +552,8 @@ def ensure_adaptive_sources(
     ):
         return len(existing)
     for sid in [key for key, rec in registry.get("sources", {}).items()
-                if str(rec.get("watch_id") or "") == wid and not rec.get("discovered")]:
+                if str(rec.get("watch_id") or "") == wid and not rec.get("discovered")
+                and not rec.get("parked")]:
         registry["sources"].pop(sid, None)
     limit = int(policy.get("adaptive_registry_limit", pf.DEFAULT_REGISTRY_LIMIT))
     added = 0
@@ -802,6 +809,7 @@ def collect_adaptive(
     interest_proposer: Any = None,
     context: list[str] | None = None,
     privacy_verifier: Any = None,
+    maintenance_decider: Any = None,
 ) -> dict[str, Any]:
     """Run at most ONE adaptive watch acquisition and return a redacted summary.
 
@@ -904,6 +912,8 @@ def collect_adaptive(
                 watch = current
         else:
             active = sorted(active_watches(data, now), key=lambda w: str(w.get("id")))
+            from .interest_feedback import filter_watches
+            active = filter_watches(active, policy, now)
             inferred = None
             if _inferred_enabled(policy) and (not active or inferred_turn(store, policy)):
                 # Standalone path: explicit watches take precedence, but the
@@ -956,6 +966,12 @@ def collect_adaptive(
         interest_goal = interest_goal or str((prepared or {}).get("origin") or "") == "approved_interest"
         scope = str(plan.get("scope") or "public")
         watch_id = str(watch.get("id") or "")
+        from .interest_feedback import watch_allowed
+        if not watch_allowed(watch, policy, now):
+            # A suppression/snooze added between planning and acquisition must
+            # reach zero HTTP and must not retire the watch. Corrupt prefs fail
+            # closed here too.
+            return _empty_summary("deferred", "watch blocked by preference")
 
         registry = load_adaptive_registry(store)
         sources_out: list[dict[str, Any]] = []
@@ -1037,7 +1053,7 @@ def collect_adaptive(
             planned_desc["discovery"] = discovery
 
         live = [rec for rec in registry["sources"].values()
-                if str(rec.get("watch_id") or "") == watch_id]
+                if str(rec.get("watch_id") or "") == watch_id and not rec.get("parked")]
         due = [rec for rec in live if _due(rec, now)]
         per_run = max(1, int(policy.get("adaptive_fetch_max_sources_per_run", 2)))
         if attempt_ledger is not None:
@@ -1096,8 +1112,77 @@ def collect_adaptive(
             sources_out.append(row)
             raw_results.append(_raw_from_row(rec, row))
 
+        # Feedback-responsive relevance: an explicit suppression or an active
+        # scoped snooze removes matching adaptive evidence from THIS cycle. It
+        # never revokes the watch/goal; when a temporary snooze expires the same
+        # acquisition resumes. Conditional rules are not blanket suppressions.
+        from .interest_feedback import filter_results
+        filter_results(raw_results, policy, now)
+
         if inferred_goal:
             _tag_inferred_items(raw_results)
+
+        # Scheduled adaptive maintenance seam: replace a defective adaptive
+        # public source with a verified equivalent from the same watch/interest.
+        # Inferred/revoked/expired goals are never repaired behind the owner's
+        # back; only a currently active watch is eligible.
+        from .source_maintenance import attempt_replacements, maintenance_enabled
+        if maintenance_enabled(policy):
+            from . import interestproposal as _ip
+            active_ids: set[str] = set()
+            from .interest_feedback import watch_allowed
+            for wid, row in data.get("watches", {}).items():
+                if (isinstance(row, dict) and watch_is_active(row, now)
+                        and watch_allowed(row, policy, now)):
+                    active_ids.add(str(wid))
+            idata = _ip.load_inferred_registry(store, strict=False)
+            for gid, goal in (idata.get("goals") or {}).items():
+                if isinstance(goal, dict) and _ip.goal_is_active(goal, now):
+                    if watch_allowed(_ip.goal_to_watch(goal), policy, now):
+                        active_ids.add(str(gid))
+
+            def _can_attempt() -> bool:
+                if overall_budget is not None and overall_budget.remaining() <= 1.0:
+                    return False
+                if budget is not None and budget.remaining() <= 1.0:
+                    return False
+                if attempt_ledger is not None and attempt_ledger.remaining() <= 0:
+                    return False
+                return True
+
+            def _probe(kind, url, interest):
+                if not _can_attempt():
+                    raise RuntimeError("maintenance budget deferred")
+                if attempt_ledger is not None and attempt_ledger.take(1) != 1:
+                    raise RuntimeError("shared source-attempt allowance exhausted")
+                probe_policy = dict(policy)
+                remaining = float(budget.remaining()) if budget is not None else 30.0
+                if overall_budget is not None:
+                    remaining = min(remaining, float(overall_budget.remaining()))
+                probe_policy["feed_timeout_seconds"] = max(
+                    1, int(min(int(policy.get("feed_timeout_seconds", pf.DEFAULT_TIMEOUT)),
+                               remaining)))
+                probe_rec = {
+                    "id": f"replacement-probe:{hashlib.sha256(url.encode()).hexdigest()[:8]}",
+                    "kind": kind, "url": url, "interest": interest,
+                    "host": pf.canonical_host(urllib.parse.urlsplit(url).hostname or ""),
+                    "cadence_minutes": 360, "vetted_public": True,
+                    "provenance": "automatic replacement probe",
+                }
+                result, _used = pf._collect_one(
+                    probe_rec, policy=probe_policy, clock=clock, now=now, fetcher=fetcher,
+                    reddit_budget=reddit_budget, reddit_ledger=reddit_ledger)
+                return result
+
+            attempt_replacements(
+                registry, policy=policy, now=now, probe=_probe,
+                decider=maintenance_decider, search_bridge=search_bridge,
+                search_budget=search_budget, overall_budget=overall_budget,
+                resolver=resolver, can_attempt=_can_attempt,
+                max_probes=int(policy.get("source_replacement_max_probes_per_cycle", 1)),
+                origin="adaptive",
+                watch_active=lambda wid: (not wid) or wid in active_ids,
+                context=context, privacy_verifier=privacy_verifier)
 
         retention_minutes = int(policy.get("public_findings_retention_days", 30)) * 24 * 60
         for rec in registry["sources"].values():

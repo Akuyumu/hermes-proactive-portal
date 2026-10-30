@@ -208,6 +208,7 @@ def collect_public_and_adaptive(
     native_ctx=None,
     native_renderer=None,
     transport_gate=None,
+    maintenance_decider=None,
 ) -> list:
     """Collect the public category: ordinary feeds + (when enabled) adaptive.
 
@@ -231,6 +232,19 @@ def collect_public_and_adaptive(
     feeds_enabled = bool(policy.get("feeds_enabled", True))
     adaptive_on = _adaptive_work_enabled(policy)
     inferred_on = _inferred_goals_enabled(policy)
+    from .source_maintenance import (NativeEquivalenceDecider,
+                                     maintenance_enabled)
+    maintenance_on = maintenance_enabled(policy)
+    if (maintenance_on and privacy_verifier is None
+            and bool(policy.get("adaptive_privacy_review_enabled", False))):
+        from .interestproposal import NativePrivacyVerifier
+        privacy_verifier = NativePrivacyVerifier(ctx=native_ctx)
+    if (maintenance_on and maintenance_decider is None and native_ctx is not None):
+        try:
+            _maintenance_lane = NativeEquivalenceDecider(native_ctx, policy)
+            maintenance_decider = _maintenance_lane if _maintenance_lane.available else None
+        except Exception:  # noqa: BLE001 - missing strict lane => no adoption, not substitution
+            maintenance_decider = None
 
     prepared = None
     if adaptive_on:
@@ -275,6 +289,16 @@ def collect_public_and_adaptive(
                 watch_version=int(_plan.get("watch_version") or 0),
                 revision_token=str(_plan.get("privacy_revision")
                                    or _plan.get("context_revision") or ""))
+    if (maintenance_on and search_bridge is None
+            and bool(policy.get("adaptive_broad_discovery_enabled", False))):
+        from .searchbridge import build_native_bridge
+        _plan = (prepared or {}).get("plan") or {}
+        search_bridge = build_native_bridge(
+            policy, store=store,
+            watch_id=str(_plan.get("watch_id") or "maintenance"),
+            watch_version=int(_plan.get("watch_version") or 0),
+            revision_token=str(_plan.get("privacy_revision")
+                               or _plan.get("context_revision") or ""))
     if adaptive_first is None:
         adaptive_first = False
 
@@ -303,7 +327,8 @@ def collect_public_and_adaptive(
                                    search_bridge=search_bridge, search_budget=search_budget,
                                    resolver=resolver, reddit_ledger=reddit_ledger,
                                    interest_proposer=interest_proposer, context=context,
-                                   privacy_verifier=privacy_verifier)
+                                   privacy_verifier=privacy_verifier,
+                                   maintenance_decider=maintenance_decider)
         return build_packet_results(summary.get("results", []), policy)
 
     def _run_ordinary() -> list:
@@ -311,7 +336,14 @@ def collect_public_and_adaptive(
                                     budget=public_budget, fetcher=public_fetcher,
                                     attempt_ledger=ledger, reddit_ledger=reddit_ledger,
                                     renderer=native_renderer, firecrawl=firecrawl,
-                                    transport_gate=transport_gate)
+                                    transport_gate=transport_gate,
+                                    search_bridge=search_bridge,
+                                    search_budget=search_budget,
+                                    overall_budget=overall_budget,
+                                    maintenance_decider=maintenance_decider,
+                                    resolver=resolver,
+                                    maintenance_context=context,
+                                    maintenance_privacy_verifier=privacy_verifier)
 
     if adaptive_on and adaptive_first:
         results.extend(_run_adaptive())
@@ -605,6 +637,7 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
                         native_ctx=getattr(args, "native_ctx", None),
                         native_renderer=getattr(args, "native_renderer", None),
                         transport_gate=transport_gate,
+                        maintenance_decider=getattr(args, "maintenance_decider", None),
                     ))
                 except Exception as exc:  # noqa: BLE001
                     results.append(SourceResult("feed:error", "error",
@@ -642,6 +675,16 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
         observed_names = {r.name for r in observed_obligations}
         record_observations(state, [r for r in results if r.name not in observed_names]
                             + observed_obligations, clock.now(), policy)
+        # Typed, expiring configuration PROPOSALS from bounded operational
+        # evidence. This never writes configuration; a proposal only competes in
+        # the same ordinary attention envelope below.
+        try:
+            from . import config_proposals
+            from .publicfeeds import load_registry as _load_public_registry
+            config_proposals.observe(store, policy, public_registry=_load_public_registry(store),
+                                     now=clock.now())
+        except Exception:  # noqa: BLE001 - proposal bookkeeping never breaks a run
+            pass
         if snapshot_view is not None:
             # Bounded, text-free health for the delivery cache: available /
             # expired / invalid / unconfigured is visible without exposing text.
@@ -706,9 +749,27 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
         if _ready_rc is not None:
             return _ready_rc
 
-        if not health_alert(state, clock.now(), policy, commit=False) and should_skip_inference(state, digest, clock.now(), policy,
-                                 context_fingerprint=context_digest,
-                                 context_present=context_present):
+        # A pending replacement/proposal must not be starved by an unchanged
+        # evidence digest; it is a real owner-visible event and still obeys the
+        # shared envelope later.
+        try:
+            from .source_maintenance import pending_replacement_notice as _pending_repl
+            _pending_replacement = _pending_repl(store, clock.now())
+        except Exception:  # noqa: BLE001
+            _pending_replacement = None
+        try:
+            from . import config_proposals as _cp
+            from .publicfeeds import load_registry as _load_public_registry
+            _pending_config = _cp.pending_notice(
+                store, clock.now(), policy=policy,
+                public_registry=_load_public_registry(store))
+        except Exception:  # noqa: BLE001
+            _pending_config = None
+        if (not health_alert(state, clock.now(), policy, commit=False)
+                and not _pending_replacement and not _pending_config
+                and should_skip_inference(state, digest, clock.now(), policy,
+                                          context_fingerprint=context_digest,
+                                          context_present=context_present)):
             # Upgrade a LEGACY record that predates the context fingerprint and
             # was skipped only because there is no real context: persist the key
             # so the next run compares it instead of re-checking forever. When
@@ -746,17 +807,72 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             }, indent=2))
             return 0
 
-        _outage_rc = _maybe_model_outage_notice(
-            args, store, state, policy, prefs, clock, proposal)
-        if _outage_rc is not None:
-            return _outage_rc
-
         # Health alerts are not an escape hatch: they obey the shared quiet /
         # pause / snooze / cooldown / cap guards, and the incident is only
         # consumed once a notice is actually emitted. Ordinary per-source
         # failures (including retryable timeouts/503) are silent here; only a
         # critical, persistent, recovery-exhausted loss surfaces, once/incident.
         allowed, _guard_reason = notice_allowed(state, policy, prefs, clock.now())
+        def _emit_maintenance_if_pending() -> int | None:
+            """Emit one deterministic pending notice using authoritative accounting.
+
+            The ordinary daily-cap entry is recorded BEFORE stdout, so an
+            interrupted process cannot exceed the cap; a crash loses at most the
+            one notice and never repeats it. A genuinely urgent/business alert is
+            never displaced: callers invoke this only when no such notice wins.
+            """
+            if not allowed:
+                return None
+            replacement = _pending_replacement
+            if replacement:
+                key, message = replacement
+                from .source_maintenance import mark_replacement_notice
+                mark_replacement_notice(store, key, "emitted", clock.now())
+                decision = {"signature": "source-replacement:" + key,
+                            "kind": "source_replacement", "key": key,
+                            "expiry": "", "urgent": False}
+                record_delivery(state, decision, packet, clock, policy)
+                store.prune_notify_state(state, int(policy.get("state_retention_days", 30)))
+                store.save("notify_state.json", state)
+                try:
+                    _emit(message)
+                except (OSError, RuntimeError) as exc:
+                    _diag({"diagnostic": "replacement-emission-uncertain",
+                           "error": type(exc).__name__})
+                    return 1
+                return 0
+            config_notice = _pending_config
+            if config_notice:
+                proposal_id, message = config_notice
+                from . import config_proposals
+                config_proposals.mark_presented(store, proposal_id, clock.now())
+                decision = {"signature": "config-proposal:" + proposal_id,
+                            "kind": "config_proposal", "key": proposal_id,
+                            "expiry": "", "urgent": False}
+                record_delivery(state, decision, packet, clock, policy)
+                store.prune_notify_state(state, int(policy.get("state_retention_days", 30)))
+                store.save("notify_state.json", state)
+                try:
+                    _emit(message)
+                except (OSError, RuntimeError) as exc:
+                    _diag({"diagnostic": "config-proposal-emission-uncertain",
+                           "error": type(exc).__name__})
+                    return 1
+                return 0
+            return None
+
+        # Pending maintenance evidence is deterministic. If the evaluator lane is
+        # unavailable it must still be displayable WITHOUT dispatching a main
+        # model, while ordinary failure notices remain governed by their counter.
+        if proposal.action in {"error", "invalid"}:
+            note_evaluator_outcome(proposal, state, policy, prefs, clock.now())
+            _maintenance_rc = _emit_maintenance_if_pending()
+            if _maintenance_rc is not None:
+                return _maintenance_rc
+        _outage_rc = _maybe_model_outage_notice(
+            args, store, state, policy, prefs, clock, proposal)
+        if _outage_rc is not None:
+            return _outage_rc
         health_notice = health_alert(state, clock.now(), policy, commit=False)
         # A model cannot smuggle a routine health/coverage message as a business
         # alert: the runtime guard rejects it, without blocking a real warning
@@ -808,6 +924,14 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             store.save("notify_state.json", state)
             _emit(evaluator_notice)
             return 0
+
+        # Only after health/urgent/evaluator-failure priority: show a pending
+        # deterministic maintenance notice when it would not displace a genuine
+        # business alert.
+        if not (proposal.action == "notify" and business_message):
+            _maintenance_rc = _emit_maintenance_if_pending()
+            if _maintenance_rc is not None:
+                return _maintenance_rc
 
         if guard_reason:
             # Runtime guard: reject a routine health/coverage message from the
@@ -1407,6 +1531,9 @@ def build_parser() -> argparse.ArgumentParser:
         "watch-add", "watch-list", "watch-change", "watch-stop", "watch-snooze",
         "watch-forget", "watch-feedback", "inferred-list", "inferred-revoke",
         "context-list", "context-show", "context-update", "context-revoke",
+        "source-list", "source-replacements", "source-dispute", "source-restore",
+        "config-proposal-list", "config-proposal-show", "config-proposal-handoff",
+        "config-proposal-dismiss", "config-dismiss",
     ], default=None)
     parser.add_argument("--watch-topic", default="")
     parser.add_argument("--include", default="")
@@ -1463,6 +1590,12 @@ def main(argv: list[str] | None = None) -> int:
             if str(args.feedback).startswith("context-"):
                 from .contextsnapshot import context_command
                 return context_command(args)
+            if str(args.feedback).startswith("source-"):
+                from .source_maintenance import replacement_command
+                return replacement_command(args)
+            if str(args.feedback).startswith("config"):
+                from .config_proposals import command as config_proposal_command
+                return config_proposal_command(args)
             return feedback_command(args)
         if args.self_test:
             return self_test(args)
