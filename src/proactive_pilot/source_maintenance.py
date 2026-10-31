@@ -461,8 +461,8 @@ def attempt_replacements(
                 "at": now.isoformat(),
             }
             if status in {"no_authorised_route", "privacy_rejected", "disabled",
-                          "unsupported", "budget", "rate_limited", "search_failed",
-                          "no_intent", "no_alternative"}:
+                          "unsupported", "budget", "budget_deferred", "rate_limited",
+                          "search_failed", "failed", "no_intent", "no_alternative"}:
                 # No usable route/lane means no real repair attempt occurred.
                 continue
             _charge_attempt()

@@ -1,4 +1,4 @@
-"""Reproducible code-only 0.6.1 export builder and installed-candidate doctor.
+"""Reproducible code-only 0.6.2 export builder and installed-candidate doctor.
 
 This is not a new package manager. It uses the plugin's existing manifest and
 Python modules, applies the same export rules the release review requires, and
@@ -10,7 +10,7 @@ Rules enforced by :func:`build_package`:
 * every shipped file comes from an explicit allowlist of code/docs/policy/skill/
   runner trees (no ``.build-context``, tests, git metadata, caches, private
   runtime state or scratch files);
-* the manifest and ``src/proactive_pilot/__init__.py`` both say 0.6.1;
+* the manifest and ``src/proactive_pilot/__init__.py`` both say 0.6.2;
 * sanitisation terms and absolute personal home paths are rejected;
 * file order, timestamps and hashes are deterministic.
 """
@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 SHIPPED_DIRS = ("src", "policy", "skills", "runners", "public_samples", "fixtures",
                 "desktop", "dashboard", "docs")
 # Nested trees contain executable/assets as well as docs. Keep the same
