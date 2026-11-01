@@ -6,7 +6,7 @@ Proactive Secretary gives [Hermes](https://hermes-agent.nousresearch.com) a back
 
 You choose what it can read and how much attention it can ask for. It starts with no connected accounts, assumed interests or assumed location. It can deliver notices through your configured Hermes notification route, but it never sends emails, changes calendars or tasks, books, buys or publishes on your behalf.
 
-> **Project status:** pre-1.0. This branch includes an opt-in context-refresh feature beyond the published 0.6.2 release. Installing from the repository does not retrieve unpublished local commits. Features depend on your permissions, working integrations and Hermes compatibility.
+> **Project status:** pre-1.0. This local candidate adds optional context refresh, isolated public-page rendering and fairer source rotation beyond the published 0.6.2 release. These changes are not yet published; installing from the repository does not retrieve unpublished local work. Features depend on your permissions, working integrations and Hermes compatibility.
 
 ## What can it do for you?
 
@@ -45,6 +45,10 @@ Preparation is off by default, needs explicit scope and a compatible model confi
 ## 4. Follow public topics and keep sources useful
 
 Choose public topics, feeds or supported pages you care about. Optional discovery can look for related public material within the permissions and limits you set. Supported formats include release feeds, RSS/Atom, Reddit RSS, ordinary public pages and selected official information feeds—not every website or social platform.
+
+**Less repeated checking, more useful coverage.** Ordinary feeds and adaptive topic checks share the same attempt limit, with reserved turns when both are active. Sources rotate independently for each watch, and checks deferred for lack of time do not spend a source-attempt slot or count as a fresh successful check. Limits still apply: this improves fairness, not a promise to check every source every cycle.
+
+**An optional second look at JavaScript pages.** When enabled with consent, a bounded browser fallback can render supported public HTTPS pages in a fresh isolated session—not your signed-in browser. It requires compatible Playwright and Chromium already installed, has time/request/response-body/output limits, and refuses private-network targets and non-GET requests. It does not log in, bypass challenges or support WebSocket-dependent content. If the browser or a required safeguard is unavailable, the fallback fails rather than claiming it read the page. See [public-page rendering](docs/native-rendering.md) for prerequisites and limits.
 
 With separate consent, public-source upkeep can try to replace a persistently broken source. It must verify an equivalent source with usable evidence; a same-topic search result is not enough. The original is parked rather than deleted, and you can dispute the replacement and restore it.
 

@@ -302,8 +302,13 @@ def collect_public_and_adaptive(
     if adaptive_first is None:
         adaptive_first = False
 
-    ledger = PublicAttemptLedger(int(policy.get("feed_max_sources_per_run", 2)),
-                                 adaptive_first=bool(adaptive_first))
+    ledger = PublicAttemptLedger(
+        int(policy.get("feed_max_sources_per_run", 2)),
+        adaptive_first=bool(adaptive_first),
+        ordinary_active=feeds_enabled,
+        adaptive_active=bool(adaptive_on
+                            and str((prepared or {}).get("status") or "") == "prepared"),
+    )
     # ONE shared per-cycle Reddit allowance across ordinary feeds AND adaptive
     # evidence, so the combined cycle never issues two Reddit requests.
     reddit_ledger = RedditLedger(1)
@@ -320,30 +325,48 @@ def collect_public_and_adaptive(
         except Exception:  # noqa: BLE001 - a fallback build failure never breaks the run
             firecrawl = None
 
+    # Native render worker factory (sibling-owned). Built lazily ONLY when the
+    # explicit render flags are on and no renderer was injected. A missing
+    # module/dependency leaves None with the truthful existing capability status.
+    if (native_renderer is None
+            and bool(policy.get("native_render_fallback_enabled", False))
+            and bool(policy.get("native_render_consent", False))):
+        try:
+            from .native_renderer import build_native_renderer
+            native_renderer = build_native_renderer(policy)
+        except Exception:  # noqa: BLE001 - optional renderer never breaks baseline
+            native_renderer = None
+
     def _run_adaptive() -> list:
-        summary = collect_adaptive(policy, clock, store=store, planner=planner,
-                                   fetcher=fetcher, budget=public_budget,
-                                   attempt_ledger=ledger, prepared=prepared,
-                                   search_bridge=search_bridge, search_budget=search_budget,
-                                   resolver=resolver, reddit_ledger=reddit_ledger,
-                                   interest_proposer=interest_proposer, context=context,
-                                   privacy_verifier=privacy_verifier,
-                                   maintenance_decider=maintenance_decider)
-        return build_packet_results(summary.get("results", []), policy)
+        try:
+            summary = collect_adaptive(policy, clock, store=store, planner=planner,
+                                       fetcher=fetcher, budget=public_budget,
+                                       attempt_ledger=ledger, prepared=prepared,
+                                       search_bridge=search_bridge, search_budget=search_budget,
+                                       resolver=resolver, reddit_ledger=reddit_ledger,
+                                       interest_proposer=interest_proposer, context=context,
+                                       privacy_verifier=privacy_verifier,
+                                       maintenance_decider=maintenance_decider)
+            return build_packet_results(summary.get("results", []), policy)
+        finally:
+            ledger.mark_done("adaptive")
 
     def _run_ordinary() -> list:
-        return collect_public_feeds(policy, clock, store=store, context=context,
-                                    budget=public_budget, fetcher=public_fetcher,
-                                    attempt_ledger=ledger, reddit_ledger=reddit_ledger,
-                                    renderer=native_renderer, firecrawl=firecrawl,
-                                    transport_gate=transport_gate,
-                                    search_bridge=search_bridge,
-                                    search_budget=search_budget,
-                                    overall_budget=overall_budget,
-                                    maintenance_decider=maintenance_decider,
-                                    resolver=resolver,
-                                    maintenance_context=context,
-                                    maintenance_privacy_verifier=privacy_verifier)
+        try:
+            return collect_public_feeds(policy, clock, store=store, context=context,
+                                        budget=public_budget, fetcher=public_fetcher,
+                                        attempt_ledger=ledger, reddit_ledger=reddit_ledger,
+                                        renderer=native_renderer, firecrawl=firecrawl,
+                                        transport_gate=transport_gate,
+                                        search_bridge=search_bridge,
+                                        search_budget=search_budget,
+                                        overall_budget=overall_budget,
+                                        maintenance_decider=maintenance_decider,
+                                        resolver=resolver,
+                                        maintenance_context=context,
+                                        maintenance_privacy_verifier=privacy_verifier)
+        finally:
+            ledger.mark_done("ordinary")
 
     if adaptive_on and adaptive_first:
         results.extend(_run_adaptive())

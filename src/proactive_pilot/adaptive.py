@@ -51,6 +51,8 @@ MAX_COVERAGE_WATCHES = 20
 # A whole-number-of-seconds floor below which model planning is DEFERRED to the
 # honest deterministic fallback rather than risk overrunning the collector.
 PLAN_DEFER_MIN_SECONDS = 1.0
+# A positive-but-too-small HTTP budget is a truthful deferral, not a failed fetch.
+MIN_ATTEMPT_SECONDS = 1.0
 
 
 def _default_pinned_fetcher(resolver: Any = None) -> Any:
@@ -73,24 +75,71 @@ class PublicAttemptLedger:
 
     Ordinary feeds and adaptive evidence draw from the SAME allowance so the
     combined HTTP attempts per cycle never exceed ``feed_max_sources_per_run``
-    (never 2 ordinary PLUS 2 adaptive). Which path gets first refusal rotates per
-    cycle (see :func:`next_public_rotation`) so an enabled adaptive watch is not
-    forever starved by the ordinary feeds. The ordinary-only baseline (adaptive
+    (never 2 ordinary PLUS 2 adaptive). When both paths are active and due, each
+    keeps a guaranteed share (2 => 1/1); an odd spare follows the existing
+    alternating priority (``adaptive_first``). A path may use unused spare quota
+    or borrow a completed path's unspent guaranteed share, but can never steal
+    another due path's reservation. The ordinary-only baseline (adaptive
     disabled) never constructs this ledger, so its behaviour is unchanged.
     """
 
-    def __init__(self, total: int, *, adaptive_first: bool = False):
+    def __init__(self, total: int, *, adaptive_first: bool = False,
+                 ordinary_active: bool = True, adaptive_active: bool = True):
         self.total = max(0, int(total))
         self.used = 0
         self.adaptive_first = bool(adaptive_first)
+        self.ordinary_active = bool(ordinary_active)
+        self.adaptive_active = bool(adaptive_active)
+        self._used: dict[str, int] = {"ordinary": 0, "adaptive": 0}
+        self._done: set[str] = set()
+        self._shares = self._compute_shares()
+
+    def _compute_shares(self) -> dict[str, int]:
+        if not self.ordinary_active:
+            return {"ordinary": 0, "adaptive": self.total}
+        if not self.adaptive_active:
+            return {"ordinary": self.total, "adaptive": 0}
+        base = self.total // 2
+        spare = self.total % 2
+        if spare:
+            first = "adaptive" if self.adaptive_first else "ordinary"
+            return {
+                "ordinary": base + (spare if first == "ordinary" else 0),
+                "adaptive": base + (spare if first == "adaptive" else 0),
+            }
+        return {"ordinary": base, "adaptive": base}
 
     def remaining(self) -> int:
         return max(0, self.total - self.used)
 
-    def take(self, want: int) -> int:
-        got = min(self.remaining(), max(0, int(want)))
+    def _path_left(self, path: str) -> int:
+        return max(0, int(self._shares.get(path, 0)) - int(self._used.get(path, 0)))
+
+    def remaining_for(self, path: str) -> int:
+        """Attempts this path may still make without stealing a due reservation."""
+        if path not in self._shares:
+            return self.remaining()
+        left = self._path_left(path)
+        guaranteed_left = sum(self._path_left(p) for p in self._shares)
+        spare = max(0, self.remaining() - guaranteed_left)
+        other = "adaptive" if path == "ordinary" else "ordinary"
+        borrow = self._path_left(other) if other in self._done else 0
+        return min(self.remaining(), left + spare + borrow)
+
+    def take(self, want: int, path: str | None = None) -> int:
+        if path is None or path not in self._shares:
+            got = min(self.remaining(), max(0, int(want)))
+            self.used += got
+            return got
+        got = min(self.remaining_for(path), max(0, int(want)))
+        self._used[path] = int(self._used.get(path, 0)) + got
         self.used += got
         return got
+
+    def mark_done(self, path: str) -> None:
+        """Release this path's unused share to the other path."""
+        if path in self._shares:
+            self._done.add(path)
 
 
 def next_public_rotation(store: Any) -> bool:
@@ -143,8 +192,54 @@ def inferred_turn(store: Any, policy: dict[str, Any]) -> bool:
     return (cursor % period) == (period - 1)
 
 
+MAX_FEED_CURSORS = 40
+
+
 def new_adaptive_registry() -> dict[str, Any]:
-    return {"schema": 1, "updated_at": "", "feed_cursor": 0, "sources": {}}
+    return {"schema": 1, "updated_at": "", "feed_cursor": 0,
+            "feed_cursors": {}, "feed_cursor_ids": {}, "sources": {}}
+
+
+def adaptive_feed_cursor(registry: dict[str, Any], watch_id: str,
+                         due_count: int) -> int:
+    """Per-watch rotation cursor, safely migrated from the old global cursor."""
+    if due_count <= 0:
+        return 0
+    cursors = registry.get("feed_cursors")
+    if not isinstance(cursors, dict):
+        # Migrate the legacy single cursor once: it becomes this watch's start.
+        cursors = {}
+        legacy = int(registry.get("feed_cursor", 0) or 0)
+        if legacy:
+            cursors[str(watch_id)] = legacy
+        registry["feed_cursors"] = cursors
+    return int(cursors.get(str(watch_id), 0) or 0) % due_count
+
+
+def advance_adaptive_feed_cursor(registry: dict[str, Any], watch_id: str,
+                                 due_count: int, examined: int,
+                                 last_key: str | None = None) -> None:
+    """Advance only this watch's cursor; keep the durable maps bounded."""
+    if due_count <= 0:
+        return
+    cursors = registry.get("feed_cursors")
+    if not isinstance(cursors, dict):
+        cursors = {}
+        registry["feed_cursors"] = cursors
+    cursors[str(watch_id)] = (int(cursors.get(str(watch_id), 0) or 0)
+                              + max(0, int(examined))) % due_count
+    if len(cursors) > MAX_FEED_CURSORS:
+        for stale in list(cursors)[:-MAX_FEED_CURSORS]:
+            cursors.pop(stale, None)
+    if last_key:
+        ids = registry.get("feed_cursor_ids")
+        if not isinstance(ids, dict):
+            ids = {}
+            registry["feed_cursor_ids"] = ids
+        ids[str(watch_id)] = str(last_key)
+        if len(ids) > MAX_FEED_CURSORS:
+            for stale in list(ids)[:-MAX_FEED_CURSORS]:
+                ids.pop(stale, None)
 
 
 def load_adaptive_registry(store: Any) -> dict[str, Any]:
@@ -716,17 +811,31 @@ def _rescreen_inferred_plan_queries(plan: dict[str, Any], context: list[str] | N
             plan["unsupported_reason"] = "query failed the privacy boundary; rejected"
 
 
-def _raw_from_row(rec: dict[str, Any], row: dict[str, Any]) -> SourceResult:
+def _raw_from_row(rec: dict[str, Any], row: dict[str, Any],
+                  now: datetime | None = None) -> SourceResult:
     """Build a partial, non-fresh SourceResult for a source that was not fetched.
 
     A skipped/deferred source is reported partial (truncated) rather than as a
     healthy empty check, so integration cannot mistake it for fresh evidence.
+    An expired structured cache stays explicitly stale; deferral never revives it.
     """
     name = f"feed:{rec.get('id','unknown')}"
-    checked = str(row.get("checked_at") or "")
+    checked = str(row.get("checked_at") or rec.get("cache_at") or "")
+    stale_reason = str(rec.get("stale_reason") or "")
+    unsafe = stale_reason
+    if not unsafe and now is not None:
+        try:
+            _usable, unsafe = pf._usable_cache_items(rec.get("cache_items") or [], now)
+        except Exception:  # noqa: BLE001 - malformed cache is never fresh
+            unsafe = "cached items malformed"
+    if unsafe:
+        return SourceResult(name, "stale", count=0, items=[], checked_at=checked,
+                            truncated=False, cached=bool(checked), cache_at=checked,
+                            failure=unsafe, attempted=False)
     return SourceResult(name, "ok", count=0, items=[], checked_at=checked,
                         truncated=True, cached=bool(checked), cache_at=checked,
-                        failure=str(row.get("reason") or row.get("error") or "not fetched"))
+                        failure=str(row.get("reason") or row.get("error") or "not fetched"),
+                        attempted=False)
 
 
 def _tag_inferred_items(results: list[SourceResult]) -> None:
@@ -1057,17 +1166,16 @@ def collect_adaptive(
         due = [rec for rec in live if _due(rec, now)]
         per_run = max(1, int(policy.get("adaptive_fetch_max_sources_per_run", 2)))
         if attempt_ledger is not None:
-            # Draw from the SAME combined allowance as the ordinary feeds, so the
-            # two paths can never add up to more than feed_max_sources_per_run.
-            per_run = min(per_run, attempt_ledger.remaining())
-        cursor_r = int(registry.get("feed_cursor", 0)) % max(1, len(due)) if due else 0
-        ordered = due[cursor_r:] + due[:cursor_r]
-        attempt = ordered[:per_run]
-        deferred = ordered[per_run:]
-        if attempt_ledger is not None:
-            # Only actual attempts consume the allowance.
-            attempt_ledger.take(len(attempt))
-        registry["feed_cursor"] = (cursor_r + len(attempt)) % max(1, len(due)) if due else 0
+            # Draw from this path's reserved share of the SAME combined
+            # allowance as the ordinary feeds; borrowing unused spare never
+            # steals a due path's guaranteed share.
+            per_run = min(per_run, attempt_ledger.remaining_for("adaptive"))
+        cursor_r = adaptive_feed_cursor(registry, watch_id, len(due))
+        fallback_order = due[cursor_r:] + due[:cursor_r]
+        cursor_ids = registry.get("feed_cursor_ids")
+        cursor_id = (cursor_ids.get(str(watch_id))
+                     if isinstance(cursor_ids, dict) else "")
+        ordered = pf._stable_due_order(live, due, cursor_id, fallback_order)
 
         # The HTTP budget is created/started only NOW, after planning. When the
         # caller shares an existing public budget (main integration) it is used
@@ -1082,13 +1190,16 @@ def collect_adaptive(
             budget.exclude(time.monotonic() - plan_started)
 
         reddit_budget = 1
-        for rec in attempt:
-            if budget.expired():
-                row = _coverage_row(rec, None, status="skipped",
-                                    reason="collector budget exhausted")
-                sources_out.append(row)
-                raw_results.append(_raw_from_row(rec, row))
-                continue
+        examined = 0
+        actual = 0
+        budget_deferred = False
+        for rec in ordered:
+            if actual >= per_run:
+                break
+            if budget is not None and budget.remaining() < MIN_ATTEMPT_SECONDS:
+                budget_deferred = True
+                break
+            examined += 1
             rec_policy = dict(policy)
             rec_policy["feed_timeout_seconds"] = max(
                 1, int(min(int(policy.get("feed_timeout_seconds", pf.DEFAULT_TIMEOUT)),
@@ -1104,13 +1215,27 @@ def collect_adaptive(
                 used = 0
             if used:
                 reddit_budget = 0
+            if result.attempted is False:
+                # Cadence/cooldown/reddit/transport/budget skips are examination
+                # progress, NEVER a charged source attempt.
+                sources_out.append(_coverage_row(rec, result, status=""))
+                raw_results.append(result)
+                continue
+            if attempt_ledger is not None:
+                attempt_ledger.take(1, path="adaptive")
+            actual += 1
             sources_out.append(_coverage_row(rec, result, status=""))
             raw_results.append(result)
-        for rec in deferred:
+        last_key = (pf._record_key(ordered[examined - 1])
+                    if examined and ordered else None)
+        advance_adaptive_feed_cursor(registry, watch_id, len(due), examined,
+                                     last_key=last_key)
+        for rec in ordered[examined:]:
             row = _coverage_row(rec, None, status="skipped",
-                                reason="deferred by per-run cap")
+                                reason=("budget deferred before attempt" if budget_deferred
+                                        else "deferred by per-run cap"))
             sources_out.append(row)
-            raw_results.append(_raw_from_row(rec, row))
+            raw_results.append(_raw_from_row(rec, row, now))
 
         # Feedback-responsive relevance: an explicit suppression or an active
         # scoped snooze removes matching adaptive evidence from THIS cycle. It
@@ -1142,19 +1267,17 @@ def collect_adaptive(
                         active_ids.add(str(gid))
 
             def _can_attempt() -> bool:
-                if overall_budget is not None and overall_budget.remaining() <= 1.0:
+                if overall_budget is not None and overall_budget.remaining() <= MIN_ATTEMPT_SECONDS:
                     return False
-                if budget is not None and budget.remaining() <= 1.0:
+                if budget is not None and budget.remaining() <= MIN_ATTEMPT_SECONDS:
                     return False
-                if attempt_ledger is not None and attempt_ledger.remaining() <= 0:
+                if attempt_ledger is not None and attempt_ledger.remaining_for("adaptive") <= 0:
                     return False
                 return True
 
             def _probe(kind, url, interest):
                 if not _can_attempt():
                     raise RuntimeError("maintenance budget deferred")
-                if attempt_ledger is not None and attempt_ledger.take(1) != 1:
-                    raise RuntimeError("shared source-attempt allowance exhausted")
                 probe_policy = dict(policy)
                 remaining = float(budget.remaining()) if budget is not None else 30.0
                 if overall_budget is not None:
@@ -1172,6 +1295,9 @@ def collect_adaptive(
                 result, _used = pf._collect_one(
                     probe_rec, policy=probe_policy, clock=clock, now=now, fetcher=fetcher,
                     reddit_budget=reddit_budget, reddit_ledger=reddit_ledger)
+                if result.attempted is not False and attempt_ledger is not None:
+                    if attempt_ledger.take(1, path="adaptive") != 1:
+                        raise RuntimeError("shared source-attempt allowance exhausted")
                 return result
 
             attempt_replacements(

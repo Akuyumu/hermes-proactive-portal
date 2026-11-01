@@ -199,7 +199,7 @@ class PlanBeforeHttpTests(unittest.TestCase):
     def test_planning_is_excluded_from_the_shared_http_budget(self):
         class SlowPlanner:
             def plan(self, watch, policy):
-                time.sleep(0.9)
+                time.sleep(1.3)
                 return _reddit_plan()
 
         with tempfile.TemporaryDirectory(dir=str(ROOT)) as tmp:
@@ -211,7 +211,9 @@ class PlanBeforeHttpTests(unittest.TestCase):
                                         REDDIT_SEARCH: {"body": RSS}})
             # The planner outruns the public HTTP budget: without the exclusion
             # the ordinary feed would see an already-exhausted budget and skip.
-            budget = Budget(0.8)
+            # Keep the initial allowance above the 1s minimum-attempt floor;
+            # tiny-budget deferral is tested independently.
+            budget = Budget(1.2)
             collect_public_and_adaptive(
                 policy, SeededClock(NOW.isoformat()), store=store, context=[],
                 public_budget=budget, planner=SlowPlanner(), fetcher=fetcher,

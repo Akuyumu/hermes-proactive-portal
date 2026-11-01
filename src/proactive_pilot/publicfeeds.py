@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import copy
 import os
 import re
 import urllib.error
@@ -39,6 +40,7 @@ DEFAULT_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_TIMEOUT = 20
 DEFAULT_MAX_ITEMS = 15
 DEFAULT_REGISTRY_LIMIT = 12
+MIN_ATTEMPT_SECONDS = 1.0
 REDDIT_CADENCE_MINUTES = 60
 
 USER_AGENT = "proactive-pilot/0.2 (public feeds; read-only)"
@@ -2267,6 +2269,34 @@ class RedditLedger:
         return got
 
 
+def _record_key(rec: dict[str, Any]) -> str:
+    return str(rec.get("id") or rec.get("url") or "")
+
+
+def _stable_due_order(full_sources: list[dict[str, Any]],
+                      due: list[dict[str, Any]], cursor_id: Any,
+                      fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rotate after the last-examined SOURCE ID in stable full-registry order.
+
+    A numeric index into the filtered due list aliases whenever cadence removes
+    an earlier row. Identity keeps progression stable across such changes; the
+    old numeric cursor remains the compatibility fallback when the id is absent.
+    """
+    if not due:
+        return []
+    key = str(cursor_id or "")
+    if key:
+        full_keys = [_record_key(rec) for rec in full_sources]
+        if key in full_keys:
+            pos = full_keys.index(key)
+            due_keys = {_record_key(rec) for rec in due}
+            rotated = full_sources[pos + 1:] + full_sources[:pos + 1]
+            ordered = [rec for rec in rotated if _record_key(rec) in due_keys]
+            if ordered:
+                return ordered
+    return fallback
+
+
 def _age_minutes(now: datetime, iso: str) -> int:
     if not iso:
         return 0
@@ -2423,16 +2453,20 @@ def _collect_one(
         cache_at = str(rec.get("cache_at") or "")
         return SourceResult(name, "stale", count=0, items=[], checked_at=cache_at,
                             cached=bool(cache_at), cache_at=cache_at,
-                            failure=stale_reason), used
+                            failure=stale_reason, attempted=False), used
 
     if rec.get("last_fetch_at") and since < cadence:
-        return _cached_result(rec, now, name, reason=f"cadence ({cadence}m)"), used
+        res = _cached_result(rec, now, name, reason=f"cadence ({cadence}m)")
+        res.attempted = False
+        return res, used
     # One shared per-cycle Reddit allowance across ordinary + adaptive acquisition
     # (never 1 ordinary PLUS 1 adaptive). Falls back to the legacy local budget
     # when no shared ledger is supplied.
     reddit_left = reddit_ledger.remaining() if reddit_ledger is not None else int(reddit_budget)
     if is_reddit and reddit_left <= 0:
-        return _cached_result(rec, now, name, reason="reddit per-cycle limit (1)"), used
+        res = _cached_result(rec, now, name, reason="reddit per-cycle limit (1)")
+        res.attempted = False
+        return res, used
 
     # A dynamically discovered source is fetched only because the discovery
     # layer already vetted it (public https host, all-resolved-IP public, no
@@ -2815,6 +2849,7 @@ def collect_public_feeds(
         from .publictransport import PinnedHTTPSTransport
         fetcher = PinnedHTTPSTransport().fetch
     registry = load_registry(store)
+    before = copy.deepcopy(registry)
     ensure_seed_sources(registry, policy, now)
     topics = discover_topics(context, max_topics=int(policy.get("discovery_topics_cap", 4)))
     ensure_discovery_sources(registry, topics, policy, now)
@@ -2833,35 +2868,56 @@ def collect_public_feeds(
             not_due.append(rec)
     per_run = max(1, int(policy.get("feed_max_sources_per_run", 2)))
     if attempt_ledger is not None:
-        # Draw from the SAME combined allowance as the adaptive path. A 0 here
-        # means adaptive already consumed the shared cap this cycle.
-        per_run = min(per_run, attempt_ledger.remaining())
+        # Draw only from this path's reserved share. Skipped rows do not consume
+        # quota; unused spare/borrowed share still preserves the combined total.
+        per_run = min(per_run, attempt_ledger.remaining_for("ordinary"))
     cursor = int(registry.get("feed_cursor", 0)) % max(1, len(due)) if due else 0
-    ordered = due[cursor:] + due[:cursor]
-    attempt = ordered[:per_run]
-    # A due source beyond the per-run slice is explicitly deferred.
-    deferred = ordered[per_run:]
-    if attempt_ledger is not None:
-        # Only ACTUAL attempts consume the shared allowance, so an empty due set
-        # never silently starves the other path.
-        attempt_ledger.take(len(attempt))
-    registry["feed_cursor"] = (cursor + len(attempt)) % max(1, len(due)) if due else 0
+    fallback_order = due[cursor:] + due[:cursor]
+    ordered = _stable_due_order(sources, due, registry.get("feed_cursor_id"),
+                                fallback_order)
+
+    def _deferred_result(rec: dict[str, Any], reason: str) -> SourceResult:
+        name = f"feed:{rec.get('id','unknown')}"
+        cache_at = str(rec.get("cache_at") or "")
+        if rec.get("stale_reason"):
+            res = SourceResult(name, "stale", count=0, items=[], checked_at=cache_at,
+                               cached=bool(cache_at), cache_at=cache_at,
+                               cache_age_minutes=_age_minutes(now, cache_at) if cache_at else 0,
+                               failure=str(rec["stale_reason"]))
+        elif cache_at:
+            _usable, unsafe = _usable_cache_items(rec.get("cache_items") or [], now)
+            if unsafe:
+                res = SourceResult(name, "stale", count=0, items=[], checked_at=cache_at,
+                                   cached=True, cache_at=cache_at,
+                                   cache_age_minutes=_age_minutes(now, cache_at),
+                                   failure=unsafe)
+            else:
+                res = SourceResult(name, "ok",
+                                   count=len(rec.get("cache_items") or []),
+                                   items=list(rec.get("cache_items") or []),
+                                   checked_at=cache_at, truncated=True, cached=True,
+                                   cache_at=cache_at, failure=reason)
+        else:
+            res = SourceResult(name, "ok", count=0, items=[], checked_at="",
+                               truncated=True, cached=False, cache_at="", failure=reason)
+        res.attempted = False
+        return res
 
     results: list[SourceResult] = []
     reddit_budget = 1  # conservative: at most one Reddit request per run
-    for rec in attempt:
-        if budget is not None and budget.expired():
-            cache_at = str(rec.get("cache_at") or "")
-            _usable, unsafe = _usable_cache_items(rec.get("cache_items") or [], now)
-            results.append(SourceResult(
-                f"feed:{rec.get('id','unknown')}", "stale" if unsafe else "ok", count=0,
-                items=[], checked_at=cache_at, truncated=True,
-                cached=bool(cache_at), cache_at=cache_at,
-                cache_age_minutes=_age_minutes(now, cache_at) if cache_at else 0,
-                failure=unsafe or "collector budget exhausted"))
-            continue
+    examined = 0
+    actual = 0
+    budget_deferred = False
+    for rec in ordered:
+        if actual >= per_run:
+            break
+        if budget is not None and budget.remaining() < MIN_ATTEMPT_SECONDS:
+            budget_deferred = True
+            break
+        examined += 1
         if budget is not None:
-            rec_cap = min(int(policy.get("feed_timeout_seconds", DEFAULT_TIMEOUT)), max(1, int(budget.remaining())))
+            rec_cap = min(int(policy.get("feed_timeout_seconds", DEFAULT_TIMEOUT)),
+                          max(1, int(budget.remaining())))
             policy = dict(policy)
             policy["feed_timeout_seconds"] = rec_cap
         try:
@@ -2877,41 +2933,26 @@ def collect_public_feeds(
             used = 0
         if used:
             reddit_budget = 0
-        results.append(res)
-    for rec in deferred:
-        cache_at = str(rec.get("cache_at") or "")
-        name = f"feed:{rec.get('id','unknown')}"
-        if rec.get("stale_reason"):
-            # A deferred source already marked stale (expired/API/rate-limit/http)
-            # must stay stale and must not resurface its last cache as a healthy
-            # candidate merely because it was skipped by the per-run cap.
-            results.append(SourceResult(name, "stale", count=0, items=[],
-                                        checked_at=cache_at, cached=bool(cache_at),
-                                        cache_at=cache_at,
-                                        cache_age_minutes=_age_minutes(now, cache_at) if cache_at else 0,
-                                        failure=str(rec["stale_reason"])))
+        if res.attempted is False:
+            # Cadence/cooldown/reddit/transport/budget skips advance examination
+            # progress but are NEVER charged as source attempts.
+            results.append(res)
             continue
-        if cache_at:
-            _usable, unsafe = _usable_cache_items(rec.get("cache_items") or [], now)
-            if unsafe:
-                # A deferred structured source whose cached validity has elapsed
-                # must not be re-served as a healthy candidate just because the
-                # per-run/source cap skipped it this cycle.
-                results.append(SourceResult(
-                    name, "stale", count=0, items=[], checked_at=cache_at,
-                    cached=True, cache_at=cache_at,
-                    cache_age_minutes=_age_minutes(now, cache_at), failure=unsafe))
-                continue
-        # A source deferred by the per-run cap was NOT checked this run. Carry
-        # real cached evidence forward only with its true observation time; with
-        # no cache, report an explicit partial with no fabricated fresh check.
-        results.append(SourceResult(name, "ok",
-                                    count=len(rec.get("cache_items") or []) if cache_at else 0,
-                                    items=list(rec.get("cache_items") or []) if cache_at else [],
-                                    checked_at=cache_at, truncated=True,
-                                    cached=bool(cache_at),
-                                    cache_at=cache_at,
-                                    failure="deferred by per-run source cap"))
+        if attempt_ledger is not None:
+            attempt_ledger.take(1, path="ordinary")
+        actual += 1
+        results.append(res)
+    new_cursor = ((cursor + examined) % max(1, len(due))) if due else 0
+    if registry.get("feed_cursor") != new_cursor:
+        registry["feed_cursor"] = new_cursor
+    if examined:
+        last_key = _record_key(ordered[examined - 1])
+        if registry.get("feed_cursor_id") != last_key:
+            registry["feed_cursor_id"] = last_key
+    for rec in ordered[examined:]:
+        results.append(_deferred_result(
+            rec, "budget deferred before attempt" if budget_deferred
+            else "deferred by per-run source cap"))
     # Sources still inside their cadence are not polled, but their last known
     # cache is carried forward so downstream coverage/evidence stays complete.
     # This is NOT a fresh check: ``checked_at`` is the true observation time.
@@ -2947,19 +2988,17 @@ def collect_public_feeds(
     from .source_maintenance import attempt_replacements, maintenance_enabled
     if maintenance_enabled(policy):
         def _can_attempt() -> bool:
-            if overall_budget is not None and overall_budget.remaining() <= 1.0:
+            if overall_budget is not None and overall_budget.remaining() <= MIN_ATTEMPT_SECONDS:
                 return False
-            if budget is not None and budget.remaining() <= 1.0:
+            if budget is not None and budget.remaining() <= MIN_ATTEMPT_SECONDS:
                 return False
-            if attempt_ledger is not None and attempt_ledger.remaining() <= 0:
+            if attempt_ledger is not None and attempt_ledger.remaining_for("ordinary") <= 0:
                 return False
             return True
 
         def _probe(kind, url, interest):
             if not _can_attempt():
                 raise RuntimeError("maintenance budget deferred")
-            if attempt_ledger is not None and attempt_ledger.take(1) != 1:
-                raise RuntimeError("shared source-attempt allowance exhausted")
             probe_policy = dict(policy)
             remaining = float(budget.remaining()) if budget is not None else 30.0
             if overall_budget is not None:
@@ -2980,6 +3019,9 @@ def collect_public_feeds(
                 renderer=renderer, firecrawl=firecrawl,
                 credentialed_fetcher=credentialed_fetcher,
                 transport_gate=transport_gate)
+            if result.attempted is not False and attempt_ledger is not None:
+                if attempt_ledger.take(1, path="ordinary") != 1:
+                    raise RuntimeError("shared source-attempt allowance exhausted")
             return result
 
         attempt_replacements(
@@ -2990,8 +3032,16 @@ def collect_public_feeds(
             max_probes=int(policy.get("source_replacement_max_probes_per_cycle", 1)),
             origin="ordinary", context=maintenance_context,
             privacy_verifier=maintenance_privacy_verifier)
-    registry["updated_at"] = now.isoformat()
-    save_registry(store, registry)
+    # A pure deferral (no seed/discovery/attempt/cursor/maintenance change) must
+    # not rewrite the registry or churn ``updated_at``. Real state changes still
+    # save normally, including safety/maintenance adoption updates.
+    comparable_before = dict(before)
+    comparable_now = dict(registry)
+    comparable_before.pop("updated_at", None)
+    comparable_now.pop("updated_at", None)
+    if comparable_now != comparable_before:
+        registry["updated_at"] = now.isoformat()
+        save_registry(store, registry)
     return results
 
 

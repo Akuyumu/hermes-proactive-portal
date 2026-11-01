@@ -278,6 +278,24 @@ def firecrawl_route(
                    "no API-key duplication)")
 
 
+def build_native_renderer(policy: dict[str, Any] | None) -> Any | None:
+    """Build the plugin-owned bounded renderer ONLY for the opt-in pair.
+
+    Lazy import keeps the neutral collector path free of any browser/Playwright
+    dependency and avoids a circular import.
+    """
+    from .native_renderer import build_native_renderer as _build
+
+    return _build(policy)
+
+
+def native_renderer_availability(policy: dict[str, Any] | None) -> tuple[bool, str]:
+    """Cheap ``(available, reason)`` for the built-in isolated renderer."""
+    from .native_renderer import native_renderer_availability as _availability
+
+    return _availability(policy)
+
+
 def native_render_route(
     policy: dict[str, Any] | None,
     *,
@@ -286,9 +304,10 @@ def native_render_route(
     """``(available, reason)`` for the bounded native render fallback.
 
     Off unless the owner set BOTH ``native_render_fallback_enabled`` and
-    ``native_render_consent`` AND an approved renderer callable was injected by
-    the host. When none is injected the generic shared browser tool is NOT
-    substituted: this is an explicit interface blocker, reported candidly.
+    ``native_render_consent`` AND an approved renderer was injected. When none is
+    injected the generic shared browser tool is NOT substituted: this is an
+    explicit interface blocker, reported candidly. (The built-in plugin-owned
+    adapter is reported separately by :func:`capabilities` / the build helper.)
     """
     policy = policy or {}
     if not bool(policy.get("native_render_fallback_enabled", False)):
@@ -308,8 +327,18 @@ def capabilities(
     renderer: Callable[[str], Any] | None = None,
     firecrawl_client: Any = None,
 ) -> dict[str, Any]:
-    """Candid capability report for status/doctor. No secret value is included."""
-    render_ok, render_reason = native_render_route(policy, renderer=renderer)
+    """Candid capability report for status/doctor. No secret value is included.
+
+    When the owner enabled/consented and no explicit renderer was injected, the
+    built-in plugin-owned adapter's actual policy availability is reported. This
+    check is cheap: it never opens a browser or probes a dependency.
+    """
+    if renderer is None and bool((policy or {}).get("native_render_fallback_enabled", False)) \
+            and bool((policy or {}).get("native_render_consent", False)):
+        render_ok, render_reason = native_renderer_availability(policy)
+        render_reason = f"built-in {render_reason}"
+    else:
+        render_ok, render_reason = native_render_route(policy, renderer=renderer)
     fc_ok, fc_reason = firecrawl_route(policy, ctx=ctx, client=firecrawl_client)
     cfg = resolve_firecrawl_config(policy)
     return {
@@ -355,7 +384,14 @@ def render_js_shell(
         raise RenderUnavailable(f"render url rejected: {exc}") from exc
     limit = int(max_bytes if max_bytes is not None else policy.get("retrieval_fallback_max_bytes", pf.DEFAULT_MAX_BYTES))
     try:
-        rendered = renderer(vetted)
+        # Built-in plugin-owned adapter exposes .render(url, timeout=, max_bytes=)
+        # so the caller's residual per-source budget is honoured. Legacy injected
+        # URL-only callables keep their original API.
+        method = getattr(renderer, "render", None)
+        if callable(method):
+            rendered = method(vetted, timeout=timeout, max_bytes=limit)
+        else:
+            rendered = renderer(vetted)
     except Exception as exc:  # noqa: BLE001 - a failed/side-effecting renderer is unavailable
         raise RenderUnavailable(f"native render failed ({type(exc).__name__})") from exc
     if not rendered:
@@ -1104,5 +1140,5 @@ __all__ = [
     "RenderUnavailable", "RetrievalUnavailable", "MeteredAttemptLedger",
     "FirecrawlMCPAdapter", "build_firecrawl_adapter", "resolve_firecrawl_config",
     "firecrawl_route", "native_render_route", "capabilities", "render_js_shell",
-    "resolve_native_secret",
+    "resolve_native_secret", "build_native_renderer", "native_renderer_availability",
 ]
