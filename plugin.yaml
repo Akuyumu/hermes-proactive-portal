@@ -25,6 +25,7 @@ provides_cli_commands:
   - secretary
 provides_tools:
   - secretary_onboarding
+  - secretary_context
   - secretary_responsibility
 provides_hooks:
   - pre_llm_call
@@ -172,6 +173,16 @@ config_schema:
       When on, discovery may infer public goals from your stated interests.
       Inferred goals stay separate from facts you approved and never become a
       standing permission. Off by default.
+    default: false
+  context_refresh:
+    type: bool
+    title: Allow assistant context refresh
+    description: >-
+      When on, the assistant may refresh the bounded, expiring context snapshot
+      with advisory facts, preferences and interests inferred from the current
+      private conversation. Off by default. Inferred entries are advisory, never
+      owner consent, and never open a source, account or grant. Pause, expiry,
+      revocation and the existing entry caps still apply.
     default: false
   collector_budget_seconds:
     type: int

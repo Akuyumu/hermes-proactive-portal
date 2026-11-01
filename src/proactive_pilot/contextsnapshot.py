@@ -8,8 +8,10 @@ pipeline ever scraping Hermes memory/USER/Hindsight/Library itself.
 Hard guarantees:
 - NOT a second memory backend and NOT an automatic importer. Entries are only
   ever written through the typed CLI/`update_context_entry` API by the assistant
-  acting on an explicit user request. Nothing here reads USER/MEMORY/Hindsight/
-  Library, a credential, a connector, an allowlist or the network.
+  acting on an explicit user request, or by the opt-in assistant-mediated
+  refresh tool (advisory entries only, explicit owner config, unpaused profile).
+  Nothing here reads USER/MEMORY/Hindsight/Library, a credential, a connector,
+  an allowlist or the network.
 - Owner-only atomic/lock writes via :mod:`proactive_pilot.state` (0700 dir /
   0600 file). Revoked ids are tombstoned so a stale entry cannot be revived.
 - Bounded: at most ``MAX_ENTRIES`` live entries, ``MAX_TEXT_CHARS`` per entry,
@@ -526,13 +528,33 @@ def _write(store: Any, data: dict[str, Any], now: datetime) -> None:
     store.save(CONTEXT_FILE, data)
 
 
+ASSISTANT_ADVISORY_SOURCES = ("assistant:knowledge", "assistant:memory")
+
+
+def _require_assistant_advisory_owner(existing: Any, allowed_sources: Any) -> None:
+    """Trusted-call-site guard: only assistant-advisory entries may be changed.
+
+    The check runs inside the caller's existing snapshot lock. It is never fed
+    from model payload text; the new tool passes fixed parameters and the CLI
+    keeps the default (no guard).
+    """
+    if (not isinstance(existing, dict) or existing.get("advisory") is not True
+            or existing.get("source") not in allowed_sources):
+        raise ContextSnapshotError("context entry is not assistant-owned")
+
+
 def update_context_entry(store: Any, fields: dict[str, Any], now: datetime,
-                         *, strict: bool = True) -> dict[str, Any]:
+                         *, strict: bool = True,
+                         require_assistant_owned: bool = False,
+                         assistant_sources: Any = ASSISTANT_ADVISORY_SOURCES) -> dict[str, Any]:
     """Add or replace one entry under the owner-only lock (atomic).
 
     A revoked id can never be revived, an existing ``created_at`` is preserved
     across updates, and entry/total caps are enforced after the edit; the whole
-    update is refused if it would exceed them.
+    update is refused if it would exceed them. Optional trusted-call-site guard:
+    when ``require_assistant_owned`` is set, an existing id may only be replaced
+    if its stored advisory flag is true and its provenance is an allowed
+    assistant source. Existing callers keep the unchanged default.
     """
     entry = validate_entry_fields(fields, now,
                                   entry_id=str(fields.get("id") or ""))
@@ -544,6 +566,10 @@ def update_context_entry(store: Any, fields: dict[str, Any], now: datetime,
         if str(entry["id"]) in (data.get("revoked") or {}):
             raise ContextSnapshotError("entry id was revoked and cannot be revived")
         entries = dict(data.get("entries") or {})
+        if require_assistant_owned:
+            existing_owned = entries.get(str(entry["id"]))
+            if existing_owned is not None:
+                _require_assistant_advisory_owner(existing_owned, assistant_sources)
         # Reclaim EXPIRED entries before enforcing the live-entry cap. Expiry is
         # not revocation: dropping an expired record is the documented lifecycle
         # and does not create (or need) a tombstone.
@@ -574,8 +600,15 @@ def update_context_entry(store: Any, fields: dict[str, Any], now: datetime,
 
 
 def revoke_context_entry(store: Any, entry_id: str, now: datetime,
-                         *, strict: bool = True) -> dict[str, Any]:
-    """Remove one entry and tombstone its id (durable; no auto-recreate)."""
+                         *, strict: bool = True,
+                         require_assistant_owned: bool = False,
+                         assistant_sources: Any = ASSISTANT_ADVISORY_SOURCES) -> dict[str, Any]:
+    """Remove one entry and tombstone its id (durable; no auto-recreate).
+
+    The optional trusted-call-site ownership guard runs inside the same lock as
+    the removal. The CLI keeps the unchanged default and remains the explicit
+    owner-authority path.
+    """
     target = str(entry_id or "").strip()
     if not _ID_RE.match(target):
         raise ContextSnapshotError("entry id is malformed")
@@ -587,6 +620,8 @@ def revoke_context_entry(store: Any, entry_id: str, now: datetime,
         entries = dict(data.get("entries") or {})
         if target not in entries:
             raise ContextSnapshotError("no such context entry")
+        if require_assistant_owned:
+            _require_assistant_advisory_owner(entries[target], assistant_sources)
         entries.pop(target, None)
         data["entries"] = entries
         revoked = dict(data.get("revoked") or {})

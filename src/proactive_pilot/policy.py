@@ -23,6 +23,7 @@ except Exception:  # pragma: no cover - defensive; only used with strict load
 
 DEFAULT_POLICY: dict[str, Any] = {
     "timezone": "UTC",
+    "context_refresh": False,
     "quiet_start_hour": 0,
     "quiet_end_hour": 8,
     # A ceiling, never a target. Zero suppresses ordinary discretionary

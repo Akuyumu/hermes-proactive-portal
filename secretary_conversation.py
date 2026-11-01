@@ -320,6 +320,13 @@ def relevance_context(ctx: Any, *, user_message: Any, platform: Any,
     return "\n".join(lines)
 
 
+def _append_guidance(context: str, guidance: str | None) -> str:
+    """Append optional refresh guidance while preserving every existing line."""
+    if not guidance or guidance in context:
+        return context
+    return f"{context}\n\n{guidance}"
+
+
 def make_pre_llm_hook(ctx: Any, service: OnboardingService | None = None):
     service = service or OnboardingService(ctx)
 
@@ -343,13 +350,24 @@ def make_pre_llm_hook(ctx: Any, service: OnboardingService | None = None):
                                   session_id=session_id, chat_type=chat_type,
                                   is_shared=is_shared)
         if pending is not None:
+            # An actual pending onboarding continuation keeps display priority
+            # and may defer the optional hint; its safety lines are unchanged.
             return {"context": pending}
+        try:
+            from .secretary_context_refresh import refresh_guidance
+            guidance = refresh_guidance(
+                ctx, platform=platform, user_message=user_message,
+                task_id=str(kwargs.get("task_id") or ""),
+                parent_session_id=str(kwargs.get("parent_session_id") or ""),
+                chat_type=chat_type, is_shared=is_shared)
+        except Exception:  # noqa: BLE001 - optional guidance never breaks a turn
+            guidance = None
         relevant = relevance_context(ctx, user_message=user_message, platform=platform,
                                      chat_type=chat_type, is_shared=is_shared)
         if relevant is not None:
-            return {"context": relevant}
+            return {"context": _append_guidance(relevant, guidance)}
         if responsibility is not None:
-            return {"context": responsibility}
+            return {"context": _append_guidance(responsibility, guidance)}
         invited = invitation_context(
             ctx, service, platform=platform, user_message=user_message,
             task_id=str(kwargs.get("task_id") or ""),
@@ -357,7 +375,9 @@ def make_pre_llm_hook(ctx: Any, service: OnboardingService | None = None):
             chat_type=chat_type, sender_id=str(kwargs.get("sender_id") or ""),
             is_shared=is_shared, session_id=session_id)
         if invited is not None:
-            return {"context": invited}
+            return {"context": _append_guidance(invited, guidance)}
+        if guidance is not None:
+            return {"context": guidance}
         return None
 
     return pre_llm_call

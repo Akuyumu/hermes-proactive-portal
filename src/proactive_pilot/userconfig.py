@@ -75,9 +75,10 @@ _SAFE_TIMEZONE = re.compile(r"^[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+)*$")
 _SAFE_MCP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 _SECTIONS = (
-    "schema", "version", "timezone", "notification", "sources", "mail",
-    "calendar", "tasks", "public_interests", "public_sources", "adaptive",
-    "bounds", "adapters", "retrieval", "health", "preparation", "advanced",
+    "schema", "version", "timezone", "context_refresh", "notification",
+    "sources", "mail", "calendar", "tasks", "public_interests",
+    "public_sources", "adaptive", "bounds", "adapters", "retrieval", "health",
+    "preparation", "advanced",
 )
 
 # Small documented standing-approval vocabulary for private preparation. Broad
@@ -97,6 +98,7 @@ def default_config() -> dict[str, Any]:
         "schema": CONFIG_SCHEMA,
         "version": CONFIG_VERSION,
         "timezone": DEFAULT_TIMEZONE,
+        "context_refresh": False,
         "notification": {
             "persona": "Hermes",
             "notify_address": "the user",
@@ -292,6 +294,8 @@ def validate_config(raw: Any) -> dict[str, Any]:
                 remedy="use e.g. \"UTC\" or \"Europe/London\"",
             ) from exc
         config["timezone"] = timezone.strip()
+    config["context_refresh"] = _bounded_bool(
+        raw.get("context_refresh"), "context_refresh", False)
 
     notif = _require_mapping(raw.get("notification") or {}, "notification")
     base_notif = config["notification"]
@@ -680,6 +684,7 @@ def policy_overrides(config: dict[str, Any]) -> dict[str, Any]:
             overrides[key] = copy.deepcopy(value)
     typed: dict[str, Any] = {
         "timezone": config["timezone"],
+        "context_refresh": config["context_refresh"],
         "persona": notif["persona"],
         "notify_address": notif["notify_address"],
         "quiet_start_hour": notif["quiet_start_hour"],
@@ -811,6 +816,7 @@ def _read_native_setting(native: Any) -> tuple[str, Any]:
 # CLI/file owner uses; the native form is not a second preference store.
 NATIVE_FLAT_FIELDS = {
     "timezone": ("timezone",),
+    "context_refresh": ("context_refresh",),
     "destination": ("notification", "destination"),
     "daily_normal_cap": ("notification", "daily_normal_cap"),
     "quiet_start_hour": ("notification", "quiet_start_hour"),
@@ -935,6 +941,7 @@ def native_flat_values(config: Mapping[str, Any]) -> dict[str, Any]:
     sources = validated["sources"]
     return {
         "timezone": validated["timezone"],
+        "context_refresh": validated["context_refresh"],
         "destination": notif["destination"],
         "daily_normal_cap": notif["daily_normal_cap"],
         "quiet_start_hour": notif["quiet_start_hour"],
@@ -1181,6 +1188,9 @@ def migrate_legacy(
     else:
         report["notes"].append(f"legacy timezone {timezone!r} not carried; neutral UTC used")
 
+    config["context_refresh"] = _bounded_bool(
+        policy.get("context_refresh"), "context_refresh", False)
+
     notif = config["notification"]
     notif["persona"] = str(policy.get("persona") or notif["persona"])[:64]
     notif["notify_address"] = str(policy.get("notify_address") or notif["notify_address"])[:64]
@@ -1311,7 +1321,8 @@ def migrate_legacy(
     # precedence over these when the policy is rebuilt, so nothing is widened and
     # nothing is silently dropped.
     _mapped_keys = {
-        "timezone", "persona", "notify_address", "quiet_start_hour", "quiet_end_hour",
+        "timezone", "context_refresh", "persona", "notify_address",
+        "quiet_start_hour", "quiet_end_hour",
         "daily_normal_cap", "cooldown_minutes", "feeds_enabled", "obligations_enabled",
         "feed_seed_sources", "adaptive_mode", "adaptive_privacy_review_enabled",
         "adaptive_inferred_goals_enabled", "collector_budget_seconds",
