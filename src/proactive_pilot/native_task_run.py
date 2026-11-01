@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
@@ -16,6 +17,7 @@ MAX_TOOLSETS = 32
 MAX_EXPECTED_TOOLS = 512
 TERM_GRACE_SECONDS = 2.0
 KILL_GRACE_SECONDS = 2.0
+GROUP_POLL_SECONDS = 0.02
 
 DEFAULT_MAX_TURNS = 12
 DEFAULT_RUN_BUDGET_SECONDS = 90
@@ -72,11 +74,21 @@ Resolver = Callable[..., tuple[bool, Sequence[str], str]]
 
 
 def _default_resolver(
-    toolset: str, *, hermes_bin: str, timeout: int
+    toolsets: Sequence[str],
+    *,
+    hermes_bin: str,
+    timeout: int,
+    profile: str,
 ) -> tuple[bool, Sequence[str], str]:
     from .evaluator import resolve_toolset_tools
 
-    return resolve_toolset_tools(toolset, hermes_bin=hermes_bin, timeout=timeout)
+    return resolve_toolset_tools(
+        None,
+        hermes_bin=hermes_bin,
+        timeout=timeout,
+        toolsets=toolsets,
+        profile=profile,
+    )
 
 
 def _reject(reason: str) -> None:
@@ -214,6 +226,22 @@ def _tool_is_denied(name: str) -> bool:
     return any(token in _DENIED_TOOL_WORDS for token in _tool_tokens(name))
 
 
+def _default_group_probe(pid: int) -> bool:
+    """True while any process remains in the owned pgid (leader may be gone)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.killpg(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        # EPERM/EIO/etc. mean the group cannot be disproven, not that it is gone.
+        return True
+
+
 class NativeTaskRunner:
     def __init__(
         self,
@@ -221,11 +249,13 @@ class NativeTaskRunner:
         resolver: Resolver | None = None,
         popen_factory: Callable[..., Any] | None = None,
         killpg: Callable[[int, int], Any] | None = None,
+        group_probe: Callable[[int], bool] | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._resolver = resolver or _default_resolver
         self._popen = popen_factory or subprocess.Popen
         self._killpg = killpg or os.killpg
+        self._group_probe = group_probe or _default_group_probe
         self._clock = clock or time.monotonic
 
     def run(
@@ -257,6 +287,7 @@ class NativeTaskRunner:
             resolved = self._preflight(
                 toolsets_out,
                 expected_out,
+                profile=profile,
                 hermes_bin=hermes_bin,
                 timeout=resolve_timeout,
             )
@@ -319,18 +350,11 @@ class NativeTaskRunner:
             )
 
         try:
-            stdout, stderr = proc.communicate(input=text, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self._terminate(proc)
-            return self._result(
-                "timeout", started, reason="native CLI exceeded its deadline",
-                toolsets=toolsets_out, expected_tools=expected_out,
-                resolved_tools=resolved, route_provenance=route_provenance,
-                model=model, provider=provider,
-                diagnostics=(f"timeout_seconds={timeout}", "process_group_terminated"),
+            stdout, stderr, rc, timed_out, terminated, io_errors, collected_truncated = (
+                self._collect(proc, text, timeout)
             )
         except Exception as exc:  # noqa: BLE001 - clean up before reporting
-            self._terminate(proc)
+            _terminated, _detail = self._terminate(proc)
             return self._result(
                 "error", started,
                 reason=f"native CLI communication failed ({type(exc).__name__})",
@@ -340,8 +364,33 @@ class NativeTaskRunner:
             )
 
         output, truncated = self._retain(stdout)
-        rc = proc.returncode
-        diagnostics = (f"exit={rc}", f"stderr_chars={len(stderr or '')}")
+        truncated = truncated or collected_truncated
+        if timed_out:
+            diagnostics = [f"timeout_seconds={timeout}"]
+            diagnostics.append(
+                "process_group_terminated" if terminated
+                else "process_group_termination_unconfirmed"
+            )
+            return self._result(
+                "timeout", started, output=output,
+                reason="native CLI exceeded its deadline",
+                toolsets=toolsets_out, expected_tools=expected_out,
+                resolved_tools=resolved, route_provenance=route_provenance,
+                model=model, provider=provider, output_truncated=truncated,
+                diagnostics=tuple(diagnostics),
+            )
+        if io_errors:
+            diagnostics = [f"exit={rc}", f"stderr_chars={len(stderr)}"]
+            diagnostics.append(f"io_error={io_errors[0]}")
+            return self._result(
+                "error", started, output=output, exit_code=rc,
+                reason="native CLI stream collection failed",
+                toolsets=toolsets_out, expected_tools=expected_out,
+                resolved_tools=resolved, route_provenance=route_provenance,
+                model=model, provider=provider, output_truncated=truncated,
+                diagnostics=tuple(diagnostics),
+            )
+        diagnostics = (f"exit={rc}", f"stderr_chars={len(stderr)}")
         if rc == 0:
             return self._result(
                 "executed_unverified", started, output=output, exit_code=rc,
@@ -364,41 +413,39 @@ class NativeTaskRunner:
         toolsets: tuple[str, ...],
         expected: tuple[str, ...],
         *,
+        profile: str,
         hermes_bin: str,
         timeout: int,
     ) -> tuple[str, ...]:
+        # Resolve the COMBINED explicit selection exactly once, even when it is
+        # empty. An empty list is a real zero-tool assertion, never a skip that
+        # would let the ambient/default resolver stand in for it.
+        try:
+            outcome = self._resolver(
+                tuple(toolsets),
+                hermes_bin=hermes_bin,
+                timeout=timeout,
+                profile=profile,
+            )
+        except Exception as exc:  # noqa: BLE001 - resolution never permissive
+            _reject(f"effective tool resolution failed ({type(exc).__name__})")
+        if not isinstance(outcome, tuple) or len(outcome) != 3:
+            _reject("effective tool resolver returned malformed data")
+        ok, names, detail = outcome
+        if ok is not True:
+            safe_detail = str(detail).replace("\n", " ")[:200]
+            _reject(f"effective tool resolution failed: {safe_detail}")
+        if isinstance(names, (str, bytes)) or not isinstance(names, Sequence):
+            _reject("effective tool resolver returned malformed names")
         actual: set[str] = set()
-        for toolset in toolsets:
-            try:
-                outcome = self._resolver(
-                    toolset, hermes_bin=hermes_bin, timeout=timeout
-                )
-            except Exception as exc:  # noqa: BLE001 - resolution never permissive
-                _reject(
-                    f"toolset resolution failed for {toolset!r} "
-                    f"({type(exc).__name__})"
-                )
-            if (
-                not isinstance(outcome, tuple)
-                or len(outcome) != 3
-            ):
-                _reject(f"toolset resolver returned malformed data for {toolset!r}")
-            ok, names, detail = outcome
-            if ok is not True:
-                safe_detail = str(detail).replace("\n", " ")[:200]
-                _reject(
-                    f"toolset resolution failed for {toolset!r}: {safe_detail}"
-                )
-            if isinstance(names, (str, bytes)) or not isinstance(names, Sequence):
-                _reject(f"toolset resolver returned malformed names for {toolset!r}")
-            for name in names:
-                if not isinstance(name, str) or not _TOOL_RE.fullmatch(name):
-                    _reject(f"toolset resolver returned an invalid tool name for {toolset!r}")
-                if name == "no_mcp":
-                    continue
-                if _tool_is_denied(name):
-                    _reject(f"unexpected tool exposure {name!r}")
-                actual.add(name)
+        for name in names:
+            if not isinstance(name, str) or not _TOOL_RE.fullmatch(name):
+                _reject("effective tool resolver returned an invalid tool name")
+            if name == "no_mcp":
+                continue
+            if _tool_is_denied(name):
+                _reject(f"unexpected tool exposure {name!r}")
+            actual.add(name)
         resolved = tuple(sorted(actual))
         if resolved != tuple(sorted(set(expected))):
             _reject(
@@ -407,29 +454,155 @@ class NativeTaskRunner:
             )
         return resolved
 
-    def _terminate(self, proc: Any) -> None:
-        self._signal_group(proc, signal.SIGTERM)
-        try:
-            proc.communicate(timeout=TERM_GRACE_SECONDS)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        except Exception:  # noqa: BLE001 - still attempt the hard kill
-            pass
-        self._signal_group(proc, signal.SIGKILL)
-        try:
-            proc.communicate(timeout=KILL_GRACE_SECONDS)
-        except Exception:  # noqa: BLE001 - bounded wait completed
-            pass
+    def _collect(
+        self, proc: Any, text: str, timeout: float
+    ) -> tuple[str, str, int | None, bool, bool, tuple[str, ...], bool]:
+        """Collect bounded stdout/stderr while the child runs.
 
-    def _signal_group(self, proc: Any, sig: int) -> None:
+        Output is capped AS IT IS READ; the pipes are still drained to EOF so a
+        verbose child cannot deadlock. The deadline covers every I/O thread and
+        the child wait, and cleanup reports confirmed exit only when the owned
+        process group actually exited.
+        """
+        out_holder: list[tuple[str, int, Exception | None]] = []
+        err_holder: list[tuple[str, int, Exception | None]] = []
+
+        def _reader(stream: Any, holder: list) -> None:
+            chunks: list[str] = []
+            kept = 0
+            total = 0
+            error: Exception | None = None
+            try:
+                while True:
+                    chunk = stream.read(8192)
+                    if not chunk:
+                        break
+                    if isinstance(chunk, bytes):
+                        chunk = chunk.decode("utf-8", "replace")
+                    total += len(chunk)
+                    if kept < MAX_OUTPUT_CHARS:
+                        take = min(MAX_OUTPUT_CHARS - kept, len(chunk))
+                        chunks.append(chunk[:take])
+                        kept += take
+            except Exception as exc:  # noqa: BLE001 - surfaced below
+                error = exc
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            holder.append(("".join(chunks), total, error))
+
+        threads: list[threading.Thread] = []
+        for stream, holder in (
+            (getattr(proc, "stdout", None), out_holder),
+            (getattr(proc, "stderr", None), err_holder),
+        ):
+            if stream is not None:
+                thread = threading.Thread(
+                    target=_reader, args=(stream, holder), daemon=True
+                )
+                thread.start()
+                threads.append(thread)
+
+        stdin = getattr(proc, "stdin", None)
+        if stdin is not None:
+            def _writer() -> None:
+                try:
+                    stdin.write(text)
+                    stdin.flush()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        stdin.close()
+                    except Exception:
+                        pass
+
+            writer = threading.Thread(target=_writer, daemon=True)
+            writer.start()
+            threads.append(writer)
+
+        deadline = self._clock() + timeout
+        for thread in threads:
+            thread.join(max(0.0, deadline - self._clock()))
+        timed_out = any(thread.is_alive() for thread in threads)
+
+        rc: int | None = None
+        if not timed_out:
+            try:
+                rc = proc.wait(timeout=max(0.0, deadline - self._clock()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            except Exception:
+                timed_out = True
+
+        terminated = False
+        if timed_out:
+            terminated, _detail = self._terminate(proc)
+            for thread in threads:
+                thread.join(0.2)
+            rc = getattr(proc, "returncode", None)
+
+        out = out_holder[0][0] if out_holder else ""
+        err = err_holder[0][0] if err_holder else ""
+        errors = tuple(
+            f"{kind}:{type(holder[0][2]).__name__}"
+            for kind, holder in (("stdout", out_holder), ("stderr", err_holder))
+            if holder and holder[0][2] is not None
+        )
+        out_total = out_holder[0][1] if out_holder else 0
+        err_total = err_holder[0][1] if err_holder else 0
+        truncated = out_total > len(out) or err_total > len(err)
+        return out, err, rc, timed_out, terminated, errors, truncated
+
+    def _group_alive(self, proc: Any) -> bool:
         pid = getattr(proc, "pid", None)
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-            return
+            return False
+        try:
+            return self._group_probe(pid) is True
+        except Exception:
+            return True  # cannot prove demise: stay conservative
+
+    def _wait_group_gone(self, proc: Any, grace: float) -> bool:
+        deadline = time.monotonic() + grace
+        while True:
+            try:
+                proc.poll()  # reap an exited leader so it cannot hold the group open
+            except Exception:
+                pass
+            if not self._group_alive(proc):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(GROUP_POLL_SECONDS, remaining))
+
+    def _terminate(self, proc: Any) -> tuple[bool, str]:
+        """Terminate the OWNED GROUP; confirmed only after the group is gone."""
+        if not self._group_alive(proc):
+            return True, "already_exited"
+        for sig, grace, label in (
+            (signal.SIGTERM, TERM_GRACE_SECONDS, "sigterm"),
+            (signal.SIGKILL, KILL_GRACE_SECONDS, "sigkill"),
+        ):
+            if not self._group_alive(proc):
+                return True, "already_exited"
+            self._signal_group(proc, sig)
+            if self._wait_group_gone(proc, grace):
+                return True, label
+        return False, "unconfirmed"
+
+    def _signal_group(self, proc: Any, sig: int) -> bool:
+        pid = getattr(proc, "pid", None)
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return False
         try:
             self._killpg(pid, sig)
+            return True
         except (ProcessLookupError, OSError):
-            pass
+            return False
 
     def _result(
         self,

@@ -16,11 +16,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 
 DEFAULT_PERSONA = "Hermes"
@@ -209,33 +212,305 @@ def _default_agent_src() -> str:
     return str(_ownerpaths.hermes_home() / "hermes-agent")
 
 
-def resolve_toolset_tools(
-    toolset: str, *, hermes_bin: str = "hermes", timeout: int = 30
-) -> tuple[bool, list[str], str]:
-    """Resolve the ACTUAL tools a toolset yields on the native runtime.
+_RESOLVER_STREAM_LIMIT = 1_048_576
+_PROBE_STREAM_LIMIT = 65_536
+_PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_GROUP_TERM_GRACE_SECONDS = 2.0
+_GROUP_KILL_GRACE_SECONDS = 2.0
+_GROUP_POLL_SECONDS = 0.02
 
-    Returns ``(ok, names, detail)``. ``ok`` is False when the runtime cannot be
-    resolved; callers must fail closed rather than assume zero tools. Resolving
-    the mounted toolset (not just counting tool calls in the response) is what
-    proves the evaluator has no terminal/file/browser/message tools.
+
+def _same_path(left: Any, right: Any) -> bool:
+    def key(value: Any) -> str:
+        try:
+            return os.path.normcase(str(Path(value).expanduser().resolve(strict=False)))
+        except (OSError, RuntimeError):
+            return os.path.normcase(os.path.abspath(os.path.expanduser(str(value))))
+
+    return key(left) == key(right)
+
+
+def _profile_matches_active(profile: str) -> bool:
+    """True only when the process is CURRENTLY scoped to *profile*.
+
+    An in-process ``model_tools`` registry is process-global and captures the
+    ambient profile. It must never certify a different selected profile.
     """
-    # 1. In-process is exact when running inside the native Hermes environment.
     try:
-        from model_tools import get_tool_definitions  # type: ignore
+        from hermes_cli.profiles import resolve_profile_env  # type: ignore
+        from hermes_constants import get_hermes_home  # type: ignore
 
-        defs = get_tool_definitions(enabled_toolsets=[toolset], quiet_mode=True)
-        names = [d.get("function", {}).get("name", "") for d in defs if isinstance(d, dict)]
-        return True, names, "in-process"
+        return _same_path(get_hermes_home(), resolve_profile_env(profile))
     except Exception:
-        pass
+        return False
+
+
+def _collect_stream(stream: Any, limit: int) -> tuple[str, int, Exception | None]:
+    """Read *stream* incrementally, retaining at most *limit* characters.
+
+    The pipe is always drained to EOF so the child can never block on a full
+    pipe, but retained memory is bounded by ``limit`` regardless of child output.
+    """
+    chunks: list[str] = []
+    kept = 0
+    total = 0
+    error: Exception | None = None
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode("utf-8", "replace")
+            total += len(chunk)
+            if kept < limit:
+                take = min(limit - kept, len(chunk))
+                chunks.append(chunk[:take])
+                kept += take
+    except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+        error = exc
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+    return "".join(chunks), total, error
+
+
+def _group_alive(proc: Any) -> bool:
+    """True while ANY process remains in the owned process group.
+
+    ``proc.poll()``/``wait()`` only observe the group LEADER. A descendant that
+    inherited stdout/stderr can outlive it, so group membership must be probed
+    with the owned pgid (signal 0) rather than trusting leader exit.
+    """
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.killpg(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        # EPERM/EIO/etc. mean the group cannot be disproven, not that it is gone.
+        return True
+
+
+def _signal_group(proc: Any, sig: int) -> bool:
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.killpg(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+
+
+def _wait_group_gone(proc: Any, grace: float) -> bool:
+    """Bounded wait for the OWNED GROUP (not just its leader) to disappear."""
+    deadline = time.monotonic() + grace
+    while True:
+        try:
+            proc.poll()  # reap an exited leader so it cannot hold the group open
+        except Exception:
+            pass
+        if not _group_alive(proc):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_GROUP_POLL_SECONDS, remaining))
+
+
+def _terminate_group(proc: Any) -> tuple[bool, str]:
+    """Terminate the owned group; confirmed only after the GROUP is gone."""
+    if not _group_alive(proc):
+        return True, "already_exited"
+    for sig, grace, label in (
+        (signal.SIGTERM, _GROUP_TERM_GRACE_SECONDS, "sigterm"),
+        (signal.SIGKILL, _GROUP_KILL_GRACE_SECONDS, "sigkill"),
+    ):
+        if not _group_alive(proc):
+            return True, "already_exited"
+        _signal_group(proc, sig)
+        if _wait_group_gone(proc, grace):
+            return True, label
+    return False, "unconfirmed"
+
+
+def _run_bounded(
+    argv: Sequence[str],
+    *,
+    timeout: float,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+    stream_limit: int = _RESOLVER_STREAM_LIMIT,
+) -> tuple[int | None, str, str, bool, bool]:
+    """Run one native helper in an owned process group with bounded capture.
+
+    Returns ``(returncode, stdout, stderr, timed_out, terminated)``. ``timed_out``
+    is True when any I/O thread or the child wait exceeded the deadline.
+    ``terminated`` is True only when process-group exit was CONFIRMED.
+    """
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            shell=False,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env=env,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"spawn failed ({type(exc).__name__})") from exc
+
+    out_holder: list[tuple[str, int, Exception | None]] = []
+    err_holder: list[tuple[str, int, Exception | None]] = []
+
+    def _reader(stream: Any, holder: list) -> None:
+        holder.append(_collect_stream(stream, stream_limit))
+
+    threads: list[threading.Thread] = []
+    for stream, holder in ((getattr(proc, "stdout", None), out_holder),
+                           (getattr(proc, "stderr", None), err_holder)):
+        if stream is not None:
+            thread = threading.Thread(target=_reader, args=(stream, holder), daemon=True)
+            thread.start()
+            threads.append(thread)
+
+    if input_text is not None:
+        stdin = getattr(proc, "stdin", None)
+        if stdin is not None:
+            def _writer() -> None:
+                try:
+                    stdin.write(input_text)
+                    stdin.flush()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        stdin.close()
+                    except Exception:
+                        pass
+
+            writer = threading.Thread(target=_writer, daemon=True)
+            writer.start()
+            threads.append(writer)
+
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    timed_out = any(thread.is_alive() for thread in threads)
+
+    rc: int | None = None
+    if not timed_out:
+        try:
+            rc = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        except Exception:
+            timed_out = True
+
+    terminated = False
+    if timed_out:
+        terminated, _ = _terminate_group(proc)
+        for thread in threads:
+            thread.join(0.2)
+        try:
+            rc = proc.wait(timeout=0.2)
+        except Exception:
+            rc = getattr(proc, "returncode", None)
+
+    out = out_holder[0][0] if out_holder else ""
+    err = err_holder[0][0] if err_holder else ""
+    return rc, out, err, timed_out, terminated
+
+
+def _selected_scope_code(profile: str | None) -> str:
+    """Python preamble that binds HERMES_HOME to the SAME selected profile."""
+    if profile is None:
+        return (
+            "os.environ['HERMES_HOME']=os.environ.get('HERMES_HOME') or "
+            "str(__import__('hermes_constants').get_default_hermes_root())\n"
+        )
+    # Resolve through the native profile owner exactly as `hermes -p` does.
+    return (
+        "from hermes_cli.profiles import resolve_profile_env\n"
+        f"os.environ['HERMES_HOME']=resolve_profile_env({profile!r})\n"
+    )
+
+
+def resolve_toolset_tools(
+    toolset: str | None = None,
+    *,
+    hermes_bin: str = "hermes",
+    timeout: int = 30,
+    toolsets: Sequence[str] | None = None,
+    profile: str | None = None,
+) -> tuple[bool, list[str], str]:
+    """Resolve the ACTUAL effective tools for an explicit toolset selection.
+
+    Legacy callers keep using ``resolve_toolset_tools("name")`` (ambient
+    process scope). New callers that must certify a *selected* profile pass
+    ``toolsets=[...]`` and ``profile="..."``; the resolution then runs with
+    ``HERMES_HOME`` bound to that same profile and the in-process registry is
+    only trusted when the process is already scoped to it.
+
+    An explicit empty ``toolsets=[]`` is resolved as zero tools; it is never
+    converted into the default toolset set. ``ok`` is False when the runtime
+    cannot be resolved; callers must fail closed rather than assume zero tools.
+    """
+    if toolsets is None:
+        if not isinstance(toolset, str) or not toolset:
+            return False, [], "an explicit toolset or toolsets list is required"
+        requested = [toolset]
+    else:
+        if isinstance(toolsets, (str, bytes)) or not isinstance(toolsets, Sequence):
+            return False, [], "toolsets must be an explicit list"
+        requested = []
+        for item in toolsets:
+            if not isinstance(item, str) or not item:
+                return False, [], "toolset names must be exact non-empty strings"
+            if item == "no_mcp":
+                continue  # transport sentinel: it can only remove MCP, never add tools
+            requested.append(item)
+    if profile is not None:
+        if not isinstance(profile, str) or not _PROFILE_RE.fullmatch(profile) or ".." in profile:
+            return False, [], "profile must be an exact validated literal"
+
+    # 1. In-process is exact ONLY when it is scoped to the same selected profile.
+    if profile is None or _profile_matches_active(profile):
+        try:
+            from model_tools import get_tool_definitions  # type: ignore
+
+            defs = get_tool_definitions(enabled_toolsets=list(requested), quiet_mode=True)
+            names = [d.get("function", {}).get("name", "") for d in defs if isinstance(d, dict)]
+            return True, names, "in-process"
+        except Exception:
+            pass
 
     # 2. Otherwise ask the native runtime for its interpreter and import path.
+    #    The probe itself is bounded and owns its process group too.
     try:
-        probe = subprocess.run(
+        _rc, probe_out, _probe_err, probe_timeout, _probe_term = _run_bounded(
             [hermes_bin, "--print-runtime-command"],
-            shell=False, capture_output=True, text=True, timeout=timeout, check=False,
+            timeout=timeout,
+            stream_limit=_PROBE_STREAM_LIMIT,
         )
-        line = next((ln for ln in reversed((probe.stdout or "").splitlines()) if ln.strip().startswith("[")), "")
+        if probe_timeout:
+            return False, [], "cannot discover native runtime: timeout"
+        line = next(
+            (ln for ln in reversed((probe_out or "").splitlines()) if ln.strip().startswith("[")),
+            "",
+        )
         argv = json.loads(line)
         python = argv[0]
         joined = " ".join(argv)
@@ -248,21 +523,25 @@ def resolve_toolset_tools(
         "import os,sys,json\n"
         "os.environ.pop('PYTHONHOME',None);os.environ.pop('PYTHONPATH',None);os.environ.pop('VIRTUAL_ENV',None)\n"
         f"sys.path.insert(0,{agent_path!r})\n"
-        "os.environ['HERMES_HOME']=os.environ.get('HERMES_HOME') or str(__import__('hermes_constants').get_default_hermes_root())\n"
-        "import hermes_bootstrap\n"
+        + _selected_scope_code(profile)
+        + "import hermes_bootstrap\n"
         "from model_tools import get_tool_definitions\n"
-        f"defs=get_tool_definitions(enabled_toolsets=[{toolset!r}],quiet_mode=True)\n"
+        f"defs=get_tool_definitions(enabled_toolsets={requested!r},quiet_mode=True)\n"
         "names=[d.get('function',{}).get('name','') for d in defs if isinstance(d,dict)]\n"
         "print('RESOLVED_JSON '+json.dumps({'count':len(defs),'names':names}))\n"
     )
     try:
-        proc = subprocess.run(
+        rc, stdout_text, _stderr_text, timed_out, terminated = _run_bounded(
             [python, "-I", "-c", code],
-            shell=False, capture_output=True, text=True, timeout=timeout, check=False,
+            timeout=timeout,
+            stream_limit=_RESOLVER_STREAM_LIMIT,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except RuntimeError as exc:
         return False, [], f"native resolution failed: {exc}"
-    for ln in (proc.stdout or "").splitlines():
+    if timed_out:
+        suffix = "terminated" if terminated else "termination unconfirmed"
+        return False, [], f"native resolution timed out ({suffix})"
+    for ln in (stdout_text or "").splitlines():
         if ln.startswith("RESOLVED_JSON "):
             try:
                 payload = json.loads(ln[len("RESOLVED_JSON "):])
@@ -270,7 +549,7 @@ def resolve_toolset_tools(
                 break
             names = [str(n) for n in payload.get("names", [])]
             return True, names, "subprocess"
-    return False, [], f"native resolution produced no result (rc={proc.returncode})"
+    return False, [], f"native resolution produced no result (rc={rc})"
 
 
 
@@ -397,6 +676,7 @@ class NativeEvaluator:
         resolved_ok, resolved_names, detail = resolve_toolset_tools(
             toolset, hermes_bin=hermes_bin,
             timeout=int(cfg.get("resolve_timeout_seconds", 30)),
+            profile=profile,
         )
         if not resolved_ok:
             return EvaluatorResult("error", error=f"toolset resolution failed: {detail}")
