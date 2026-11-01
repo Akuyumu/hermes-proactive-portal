@@ -206,6 +206,78 @@ class NativeTaskRunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "denied")
         self.assertIn("outside the bounded task scope", result.reason)
 
+    def test_allowlisted_secretary_tools_reach_controlled_spawn(self):
+        for tool in ("secretary_task_inspect", "secretary_task_action"):
+            with self.subTest(tool=tool):
+                events = []
+                calls = []
+
+                def resolver(name, *, hermes_bin, timeout):
+                    events.append("resolve")
+                    calls.append((name, hermes_bin, timeout))
+                    return True, [tool], "ok"
+
+                runner, popen = self.runner(resolver, events=events)
+                result = runner.run(
+                    "inspect the bounded task",
+                    toolsets=["secretary_background"],
+                    expected_tools=[tool],
+                    policy=policy(),
+                    before_dispatch=lambda: events.append("callback") or True,
+                )
+                self.assertEqual(result.status, "executed_unverified")
+                self.assertEqual(result.toolsets, ("secretary_background",))
+                self.assertEqual(result.expected_tools, (tool,))
+                self.assertEqual(result.resolved_tools, (tool,))
+                self.assertEqual(events, ["resolve", "callback", "spawn"])
+                self.assertEqual(calls, [("secretary_background", "hermes", 5)])
+                self.assertIn("secretary_background,no_mcp", popen.argv)
+
+    def test_secretary_registry_mismatch_denies_before_callback_or_spawn(self):
+        events = []
+
+        def resolver(name, **kwargs):
+            events.append("resolve")
+            return True, ["secretary_task_inspect", "unexpected_safe_tool"], "ok"
+
+        runner, popen = self.runner(resolver, events=events)
+        result = runner.run(
+            "task", toolsets=["secretary_background"],
+            expected_tools=["secretary_task_inspect"],
+            policy=policy(),
+            before_dispatch=lambda: events.append("callback") or True,
+        )
+        self.assertEqual(result.status, "denied")
+        self.assertIn("registry mismatch", result.reason)
+        self.assertEqual(events, ["resolve"])
+        self.assertFalse(hasattr(popen, "argv"))
+
+    def test_dangerous_tool_words_are_denied_without_resolution(self):
+        cases = (
+            "terminal", "read_file", "write_file",
+            "mcp__filesystem__read_file", "send_message", "secrets",
+            "credentials", "readFile", "writeFile", "mcpServer",
+            "sendMessage", "secretStore", "credentialStore",
+        )
+        for tool in cases:
+            with self.subTest(tool=tool):
+                events = []
+
+                def resolver(name, **kwargs):
+                    events.append("resolve")
+                    return True, [tool], "ok"
+
+                runner, popen = self.runner(resolver, events=events)
+                result = runner.run(
+                    "task", toolsets=["context_engine"], expected_tools=[tool],
+                    policy=policy(),
+                    before_dispatch=lambda: events.append("callback") or True,
+                )
+                self.assertEqual(result.status, "denied")
+                self.assertIn("outside the bounded task scope", result.reason)
+                self.assertEqual(events, [])
+                self.assertFalse(hasattr(popen, "argv"))
+
     def test_missing_false_and_raising_callback_deny_without_spawn(self):
         def resolver(name, **kw):
             return True, [], "ok"

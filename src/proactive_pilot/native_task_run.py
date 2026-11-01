@@ -28,15 +28,19 @@ _TOOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _ROUTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}$")
 
 _BROAD_TOOLSETS = frozenset({"all", "everything", "*", "any", "all_tools"})
-_DENIED_TOOL_PARTS = (
+_TOOL_TOKEN_RE = re.compile(
+    r"[A-Z]+(?=[A-Z][a-z]|\d|\b)|[A-Z]?[a-z]+|[A-Z]+|\d+"
+)
+_DENIED_TOOL_WORDS = frozenset({
     "shell", "terminal", "bash", "zsh", "exec", "command", "process",
     "filesystem", "file", "directory", "path", "read", "write", "edit",
     "patch", "mount", "mcp", "cron", "schedule", "send", "message", "mail",
     "smtp", "browser", "web", "http", "network", "request", "fetch",
     "socket", "curl", "wget", "python", "node", "code", "eval", "plugin",
-    "service", "system", "desktop", "clipboard", "secret", "credential",
-    "token", "keychain", "env", "install", "package", "approval", "hook",
-)
+    "service", "system", "desktop", "clipboard", "secret", "secrets",
+    "credential", "credentials", "token", "keychain", "env", "install",
+    "package", "approval", "hook",
+})
 
 
 class _Denied(Exception):
@@ -157,8 +161,7 @@ def _validate_expected_tools(expected_tools: Any) -> tuple[str, ...]:
     for item in expected_tools:
         if not isinstance(item, str) or not _TOOL_RE.fullmatch(item):
             _reject("expected tool name is not an exact validated literal")
-        lowered = item.lower()
-        if any(part in lowered for part in _DENIED_TOOL_PARTS):
+        if _tool_is_denied(item):
             _reject(f"expected tool {item!r} is outside the bounded task scope")
         names.append(item)
     if len(set(names)) != len(names):
@@ -200,9 +203,15 @@ def _validate_hermes_bin(hermes_bin: Any) -> str:
     return hermes_bin
 
 
+def _tool_tokens(name: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    for chunk in re.findall(r"[A-Za-z0-9]+", name):
+        tokens.extend(match.lower() for match in _TOOL_TOKEN_RE.findall(chunk))
+    return tuple(tokens)
+
+
 def _tool_is_denied(name: str) -> bool:
-    lowered = name.lower()
-    return any(part in lowered for part in _DENIED_TOOL_PARTS)
+    return any(token in _DENIED_TOOL_WORDS for token in _tool_tokens(name))
 
 
 class NativeTaskRunner:
