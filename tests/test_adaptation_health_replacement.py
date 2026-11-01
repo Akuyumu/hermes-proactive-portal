@@ -210,6 +210,12 @@ class ReplacementUnitTests(unittest.TestCase):
         for reason in ("timeout", "429 rate limited", "collector budget exhausted"):
             registry = _registry()
             registry["sources"]["rss:dead"]["stale_reason"] = reason
+            if reason == "timeout":
+                # This contract is for an isolated transient. Chronic attempted
+                # timeouts at the existing threshold are tested separately in
+                # test_chronic_source_repair; rate limits and deferrals below
+                # keep the high-failure fixture and must still never churn.
+                registry["sources"]["rss:dead"]["failures"] = 1
             called = []
             events = sm.attempt_replacements(
                 registry, policy=_policy(), now=NOW,

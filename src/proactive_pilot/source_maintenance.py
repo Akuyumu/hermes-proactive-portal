@@ -13,7 +13,9 @@ Safety:
   privacy boundary, or the fetched evidence is not fresh/usable;
 * shared search/HTTP/attempt budgets and residual wallclock are checked on every
   attempt by the caller-provided probe/gate;
-* transient/rate-limit/deferred observations never churn sources;
+* an occasional transient is quiet, but repeated ACTUAL attempted failures at
+  the owner-configured threshold may use the existing bounded repair path;
+  rate-limit/Retry-After and credential/owner-action failures never churn;
 * old records are parked with failure history and provenance; stable opaque
   lineage ids survive pruning and restarts; dispute is locked and idempotent and
   permanently blocks the same rejected replacement from returning.
@@ -22,12 +24,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from . import publicfeeds as pf
-from .source_health import classify_failure
+from .source_health import classify_failure, retry_after_seconds
 
 PUBLIC_REGISTRY = "public_registry.json"
 ADAPTIVE_REGISTRY = "adaptive_registry.json"
@@ -41,9 +44,28 @@ _TYPED_DATE_OFFICIAL_KINDS = {
 _OFFICIAL_KINDS = _TYPED_DATE_OFFICIAL_KINDS | {"cna_rss"}
 _OFFICIAL_HOSTS = set(getattr(pf, "VETTED_FIXED_PUBLIC_HOSTS", set())) | set(
     getattr(pf, "ARTICLE_HOSTS", set()))
+# Broad noise-suppression vocabulary (kept for callers that ask whether an
+# observation should stay quiet at all). It is deliberately NOT the repair
+# eligibility predicate: a chronic timeout is noisy at first but may still be a
+# real attempted failure.
 _NEUTRAL_MARKERS = (
     "budget", "defer", "cadence", "per-run", "rate limit", "rate-limit", "429",
     "timeout", "timed out", "503", "502", "504", "temporar", "skip",
+)
+# Observations that are NOT evidence of an attempted read failure. A deferred,
+# budget-limited, cadence-cached or skipped observation must never be counted as
+# a source failure, so it can never make a source repair-eligible.
+_NON_EVIDENTIAL_MARKERS = (
+    "budget", "defer", "cadence", "per-run", "skip", "skipped",
+    "cached", "partial", "missing", "busy", "truncated", "not modified",
+)
+# Failure classes that never justify source churn. A 429/Retry-After owns its
+# own deadline; a credential/owner-action failure needs the owner, not a new
+# source. Both are excluded even after many recurrences.
+_NEVER_REPAIR_FAILURE_CLASSES = {"rate_limited", "owner_action"}
+_CREDENTIAL_FAILURE_MARKERS = (
+    "credential", "unauthorized", "unauthorised", "401", "authorization",
+    "authorisation", "invalid_grant", "token revoked",
 )
 
 
@@ -64,9 +86,51 @@ def _safe_dt(value: Any, now: datetime) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=now.tzinfo)
 
 
+def _is_non_evidential(reason: Any) -> bool:
+    """True when the observation was deferred/cached/partial/skipped, not failed."""
+    lowered = str(reason or "").lower()
+    return any(marker in lowered for marker in _NON_EVIDENTIAL_MARKERS)
+
+
 def _is_neutral(reason: Any) -> bool:
+    """Broad noise-suppression predicate; not sufficient to block chronic repair."""
     lowered = str(reason or "").lower()
     return any(marker in lowered for marker in _NEUTRAL_MARKERS)
+
+
+def _never_repair(reason: Any) -> bool:
+    """Rate limits and credential/owner-action failures must not churn sources."""
+    lowered = str(reason or "").lower()
+    if any(marker in lowered for marker in _CREDENTIAL_FAILURE_MARKERS):
+        return True
+    if "retry-after" in lowered or "retry after" in lowered:
+        return True
+    if retry_after_seconds(reason) > 0:
+        return True
+    return classify_failure(reason) in _NEVER_REPAIR_FAILURE_CLASSES
+
+
+def _counter(value: Any) -> int | None:
+    """Strict persisted counter: malformed evidence fails closed, never coerces."""
+    return value if type(value) is int and value >= 0 else None
+
+
+def _policy_counter(
+    policy: dict[str, Any], key: str, default: int, *, minimum: int
+) -> int | None:
+    """Read an owner-configured bound without lowering it or crashing on junk."""
+    raw = policy.get(key, default)
+    if type(raw) is bool:
+        return None
+    if isinstance(raw, float) and not math.isfinite(raw):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if isinstance(raw, float) and raw != value:
+        return None
+    return value if value >= minimum else None
 
 
 def maintenance_enabled(policy: dict[str, Any]) -> bool:
@@ -89,11 +153,22 @@ def _eligible(rec: dict[str, Any], policy: dict[str, Any], now: datetime) -> boo
     # Seeded and explicit saved ordinary sources ARE eligible when authorised.
     if not str(rec.get("interest") or rec.get("public_topic") or "").strip():
         return False
-    maintenance = rec.get("maintenance") if isinstance(rec.get("maintenance"), dict) else {}
-    if maintenance.get("state") in {"parked", "superseded", "disabled"}:
+    raw_maintenance = rec.get("maintenance")
+    if raw_maintenance is None:
+        maintenance: dict[str, Any] = {}
+    elif isinstance(raw_maintenance, dict):
+        maintenance = raw_maintenance
+    else:
+        return False  # malformed persisted maintenance fails closed
+    state = maintenance.get("state")
+    if state is not None and not isinstance(state, str):
         return False
-    attempts = int(maintenance.get("attempts", 0) or 0)
-    if attempts >= max(1, int(policy.get("source_replacement_max_attempts", 3))):
+    if state in {"parked", "superseded", "disabled"}:
+        return False
+    attempts = _counter(maintenance.get("attempts", 0))
+    max_attempts = _policy_counter(
+        policy, "source_replacement_max_attempts", 3, minimum=1)
+    if attempts is None or max_attempts is None or attempts >= max_attempts:
         return False
     next_at = str(maintenance.get("next_attempt_at") or "")
     if next_at:
@@ -102,14 +177,24 @@ def _eligible(rec: dict[str, Any], policy: dict[str, Any], now: datetime) -> boo
             return False  # malformed schedule fails closed, never crashes a cycle
         if parsed_next > now:
             return False
-    reason = str(rec.get("stale_reason") or "")
-    if _is_neutral(reason):
+    raw_reason = rec.get("stale_reason")
+    if raw_reason is not None and not isinstance(raw_reason, str):
+        return False  # malformed failure evidence fails closed
+    reason = (raw_reason or "").strip()
+    if not reason:
         return False
-    failures = int(rec.get("failures", 0) or 0)
-    threshold = max(1, int(policy.get("source_replacement_failure_threshold", 3)))
-    if failures < threshold:
+    if _is_non_evidential(reason):
         return False
-    if classify_failure(reason) in {"retryable", "rate_limited"}:
+    failures = _counter(rec.get("failures", 0))
+    threshold = _policy_counter(
+        policy, "source_replacement_failure_threshold", 3, minimum=1)
+    if failures is None or threshold is None or failures < threshold:
+        return False
+    # Occasional transients are already quiet above. Past the SAME owner
+    # threshold, a retryable timeout/502/503/504/temporarily-unavailable may use
+    # the existing bounded repair path. Rate limits/Retry-After and credential
+    # failures still never churn.
+    if _never_repair(reason):
         return False
     return True
 
