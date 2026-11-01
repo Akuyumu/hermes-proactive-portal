@@ -1,40 +1,86 @@
-# hermes-proactive-secretary
+# Proactive Secretary for Hermes
 
-A conservative, opt-in proactive secretary for [Hermes](https://hermes-agent.nousresearch.com). It reads only the sources you explicitly authorise, judges whether anything is genuinely worth interrupting you for, and stays silent otherwise. It never sends mail, changes calendars or tasks, books, purchases, publishes, or expands its own access.
+**Keep an eye on what matters, without checking everything yourself.**
 
-Version **0.6.2** is a pre-1.0 release. The default posture is user-agnostic: no accounts, no public seeds, no personal interests, and no assumed location. Every source and permission is opt-in. This patch keeps transient discovery failures and privacy-budget deferrals from consuming bounded replacement attempts or advancing the cooldown.
+Proactive Secretary gives [Hermes](https://hermes-agent.nousresearch.com) a background attention layer: check the sources you choose, look for something worth mentioning, and prepare useful work when you have asked for it. The aim is fewer unnecessary interruptions—not another stream of notifications.
 
-## Features
+You choose what it can read and how much attention it can ask for. It starts with no connected accounts, assumed interests or assumed location. It can deliver notices through your configured Hermes notification route, but it never sends emails, changes calendars or tasks, books, buys or publishes on your behalf.
 
-- **Read-only by design**: bounded collection from only the mail, calendar, tasks and public feeds you explicitly grant.
-- **Low-noise judgment**: deterministic gates plus an optional zero-tool model judgment; one short message at most per run.
-- **Requested reminders**: durable, deterministic exact-time or event-bound reminders, separate from the ordinary attention envelope.
-- **Conversational onboarding**: the first eligible one-to-one chat starts a resumable interview; no settings edit required.
-- **Private preparation (opt-in)**: bounded, cited private drafts for accepted responsibilities; handoff never executes.
-- **Public discovery (opt-in)**: bounded, keyless public sources and topics; private facts never become public queries.
-- **Adaptive public monitoring**: with consent, verify and reversibly replace defective public sources; feedback shapes future monitoring, and configuration suggestions await approval.
-- **Native controls**: owned `--no-agent` cron jobs, ordinary chat commands, and a custom Settings ▸ Plugins page.
-- **Honest states**: installed, configured, scheduled and delivery-confirmed stay distinct; emitted is not delivered.
+> **Project status:** pre-1.0. This branch includes an opt-in context-refresh feature beyond the published 0.6.2 release. Installing from the repository does not retrieve unpublished local commits. Features depend on your permissions, working integrations and Hermes compatibility.
 
-## How it works
+## What can it do for you?
 
-```mermaid
-flowchart LR
-    A[Your authorised sources] --> G[Deterministic gates]
-    P[Explicit public sources] --> G
-    G -->|nothing due| Q[Silence]
-    G -->|evidence| H{Host supports<br/>configured-only route?}
-    H -->|no| D[Deterministic reminders<br/>and controls only]
-    H -->|yes| E[Zero-tool judgment]
-    E --> N[Attention-gated notice]
-    N --> F[Foreground action,<br/>only with exact approval]
-```
+| You want… | The secretary helps by… |
+|---|---|
+| Less checking | Periodically reviewing authorised mail, calendar, tasks and public sources for things that need attention. |
+| A reminder you actually requested | Keeping a durable reminder for a specified time or an event on an authorised calendar. |
+| A head start on work | Preparing a private, evidence-backed draft for a responsibility you explicitly accepted. |
+| Updates on your interests | Watching chosen public topics and sources, with optional discovery and source upkeep. |
+| More relevant monitoring | Using optional, compact advisory notes from your conversations—without treating them as permission. |
 
-The secretary collects bounded, read-only evidence; applies quiet hours, a daily ceiling, cooldown, dedupe and expiry; and writes at most one short message per run to stdout. The native Hermes scheduler owns actual delivery.
+These examples describe supported uses, not guarantees of coverage or delivery.
 
-## Install
+## 1. Notice what deserves your attention
 
-**Desktop:** [Install in Hermes](hermes://plugin/install?repo=Akuyumu/hermes-proactive-secretary&enable=1) opens the native confirmation dialog. If your browser does not open the link, use **Capabilities → Plugins → Install from Git**, entering `Akuyumu/hermes-proactive-secretary`.
+Connect only the sources you want checked. The secretary can review mail metadata and short redacted previews, upcoming calendar events, dated tasks, and supported public feeds or pages. Private sources need separately authorised, working adapters; public-source monitoring can work without a private connector.
+
+Checks are periodic, not real-time. Quiet hours, a daily ceiling, spacing between messages and duplicate suppression help keep ordinary alerts manageable. The ceiling is a maximum, never a quota to fill. When nothing qualifies, silence is the intended result.
+
+It also distinguishes a successful check from a blocked, unavailable or incomplete source. An unreadable source is not evidence that nothing happened.
+
+## 2. Remember what you explicitly asked for
+
+Requested reminders are separate from general monitoring. You can ask your assistant to register a reminder for an exact time or relative to an event on an authorised calendar. Once registered, reminders are stored durably and dispatched without a model decision.
+
+Because you asked for them, they bypass ordinary alert caps, quiet hours and cooldowns. **A global pause still stops them.** They may fire late after you resume, and delivery depends on the scheduler and messaging route; exact punctuality is not guaranteed.
+
+## 3. Prepare privately—without taking over
+
+If you opt into private preparation, the secretary can work on a responsibility you clearly accepted: for example, preparing a renewal checklist or a short briefing from available evidence.
+
+It produces a bounded private draft with citations, and a later notice may tell you the work is ready. It does not accept responsibilities from ambiguous conversation, turn drafts into finished user documents, or execute the next step. Sending, publishing, booking, purchasing or changing a calendar or task remains a separate foreground decision under your control.
+
+Preparation is off by default, needs explicit scope and a compatible model configuration, and has its own optional scheduled job.
+
+## 4. Follow public topics and keep sources useful
+
+Choose public topics, feeds or supported pages you care about. Optional discovery can look for related public material within the permissions and limits you set. Supported formats include release feeds, RSS/Atom, Reddit RSS, ordinary public pages and selected official information feeds—not every website or social platform.
+
+With separate consent, public-source upkeep can try to replace a persistently broken source. It must verify an equivalent source with usable evidence; a same-topic search result is not enough. The original is parked rather than deleted, and you can dispute the replacement and restore it.
+
+Feedback can refine an interest or temporarily snooze it. A temporary snooze expires; silence or “thanks” is not a request to stop. Proposed settings changes stay proposals until you approve them.
+
+Public discovery is designed to keep private facts out of search queries. Permission to read public sources never grants access to a mailbox, calendar or other private source. Unsupported routes remain limitations, not hidden successes.
+
+## 5. Keep useful context without importing everything
+
+**Optional context refresh** lets your assistant maintain a small, expiring set of advisory notes from context already available in a private conversation: preferences, interests or ongoing projects that may help the secretary judge relevance.
+
+Enable **Allow assistant context refresh** in the plugin settings to use it. It is off by default. The assistant may add or update notes, but:
+
+- It does not import your whole vault, memory store or chat history.
+- Notes have size limits and expiry, and can be revoked.
+- Advisory notes cannot overwrite owner-declared notes or grant access.
+- The assistant may miss something relevant or interpret it incorrectly.
+
+Refresh adds no separate model or network call. Disabling it or pausing stops new writes; existing notes remain until revoked or expired. See [context refresh](docs/context-refresh.md) for details.
+
+## You control the pace and permissions
+
+Setup is conversational: on a fresh profile, an eligible one-to-one chat starts an interview about your preferences and source permissions. `/secretary setup` is also available. The optional Desktop settings page groups setup, sources and notification controls; the command line remains available for inspection and repair.
+
+| Chat control | What it does |
+|---|---|
+| `/secretary status` | Show setup, jobs, limits and readiness. |
+| `/secretary pause` | Stop collection and delivery, including requested reminders. |
+| `/secretary resume` | Clear the pause; it does not invent missing jobs or permissions. |
+| `/secretary disable` | Pause and remove only this plugin’s owned jobs and runners. |
+
+**Installing, configuring, scheduling and confirming delivery are different steps.** Finishing onboarding does not schedule checks, and saving a destination does not prove a message reached you.
+
+## Get started
+
+**Desktop:** [Install in Hermes](hermes://plugin/install?repo=Akuyumu/hermes-proactive-secretary&enable=1), or use **Capabilities → Plugins → Install from Git** with `Akuyumu/hermes-proactive-secretary`.
 
 **Terminal:**
 
@@ -43,45 +89,31 @@ hermes plugins install Akuyumu/hermes-proactive-secretary --enable
 hermes secretary doctor
 ```
 
-Follow Hermes' dependency and capability consent prompts. This private repository requires Git access on the installing machine. For exact-commit installs and other options, see the [official plugin guide](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins#managing-plugins).
+The repository is currently private, so the installing machine needs Git access. Follow the native dependency and capability prompts, then complete onboarding and review your settings.
 
-## Onboard and arm
-
-Onboarding is conversational. Send any ordinary message in a one-to-one DM with the bot: on a fresh profile the interview starts there. `/secretary setup` is a fallback and can resume a gap-only interview. Onboarding records a destination as user-confirmed, never live-verified, and **arms no jobs**.
-
-Configuration or onboarding alone does not arm or deliver anything. After reviewing the preview, arm explicitly, starting with local/no-send:
+When you are ready to schedule checks, start with local-only output:
 
 ```bash
-hermes secretary setup --deliver local   # safe local/no-send first
-hermes secretary setup --deliver telegram
-hermes secretary status --json
-hermes secretary doctor
+hermes secretary setup --deliver local
 ```
 
-The plugin creates and records ownership of the monitoring and reminders jobs. Use `--with-preparation` only if you explicitly want the optional preparation job. If you cannot verify a destination, keep `--deliver local`; the honest state is `unverified`.
+This schedules work but sends no chat messages. Move to an existing delivery target such as Telegram only after reviewing the destination. Private preparation needs an additional explicit opt-in. The [operations guide](docs/operations.md) covers these steps and delivery verification.
 
-## Compatibility
+## A few honest limits
 
-Model-dependent work requires an explicit host contract: `register_auxiliary_task(..., fallback_policy="configured_only")`. The plugin detects that keyword on the host signature; a wrapper that merely accepts `**kwargs` is not proof. On a host without the contract, model work is blocked before dispatch while deterministic controls and requested reminders continue.
+This is not a universal personal assistant running unattended. It cannot guarantee complete coverage, correct judgment, successful delivery or that nothing was missed. Private drafts need your review. Some features depend on adapters and compatible Hermes model routing; deterministic reminders and controls can still work when model-based features are unavailable.
 
-The plugin does not patch Hermes or install this host contract for you. Installation alone is not proof of compatibility; verify the installed host with `hermes secretary status` and `hermes secretary doctor`. Do not bypass the gate or assume an arbitrary upstream version supports it.
+Read-only does not mean offline: public checks contact external services, and model-assisted judgment or preparation may send bounded evidence to your configured model provider. Context notes are not a replacement for durable knowledge management.
 
-## Requirements
+## Details when you need them
 
-- Hermes with the native plugin and cron surfaces; Linux or macOS. Windows and fresh-machine portability are not independently certified.
-- Python dependencies provided by the Hermes runtime; the plugin does not install a second runtime.
-- Optional connectors only when already authorised: Himalaya CLI for read-only mail metadata; the external `productivity-secretary` library for calendar/tasks, or the Google Workspace calendar adapter with its installed skill and existing authorisation; a native messaging target such as a Telegram DM.
-
-The source is MIT-licensed, but the canonical repository is currently private. Installation requires access to `Akuyumu/hermes-proactive-secretary`.
-
-## Documentation
-
-- [Operations guide](docs/operations.md): detailed setup, settings, reminders, preparation, privacy, migration and troubleshooting.
-- [Adaptive maintenance](docs/adaptive-maintenance.md): per-source public truth, reversible replacement and configuration proposals.
-- [Onboarding design](docs/agentic-onboarding-design.md): the conversational product contract.
-- [Notification contract](docs/notification-contract.md): attention limits and delivery honesty.
-- [Agent setup](AGENT_SETUP.md) and the [operational skill](skills/proactive-secretary/SKILL.md): agent-assisted installation.
-- [GitHub Releases](https://github.com/Akuyumu/hermes-proactive-secretary/releases): change history and per-version qualification.
+- [Operations guide](docs/operations.md): setup, integrations, settings, reminders and troubleshooting.
+- [Context refresh](docs/context-refresh.md): advisory notes, controls and limits.
+- [Adaptive maintenance](docs/adaptive-maintenance.md): source replacement and feedback, including qualification limits.
+- [Notification contract](docs/notification-contract.md): how interruption limits and delivery claims work.
+- [Onboarding design](docs/agentic-onboarding-design.md): the conversational setup experience.
+- [Agent setup](AGENT_SETUP.md) and [operational skill](skills/proactive-secretary/SKILL.md): assistant-guided installation.
+- [GitHub Releases](https://github.com/Akuyumu/hermes-proactive-secretary/releases): published changes and qualification notes.
 
 ## License
 
