@@ -26,10 +26,12 @@ T0 = datetime.fromisoformat("2026-10-20T10:00:00+08:00")
 
 
 class FakeRunner:
-    def __init__(self, result, on_run=None):
+    def __init__(self, result, on_run=None, before_dispatch_action=None):
         self.result = result
         self.on_run = on_run
+        self.before_dispatch_action = before_dispatch_action
         self.calls = []
+        self.dispatched = False
 
     def run(self, instructions, *, toolsets, expected_tools, policy,
             before_dispatch=None):
@@ -39,9 +41,12 @@ class FakeRunner:
             "expected_tools": expected_tools,
             "policy": policy,
         })
+        if self.before_dispatch_action is not None:
+            self.before_dispatch_action()
         if before_dispatch is not None and before_dispatch() is not True:
             return NativeTaskResult(
                 status="denied", reason="before_dispatch denied dispatch")
+        self.dispatched = True
         if self.on_run is not None:
             self.on_run()
         return self.result
@@ -127,6 +132,9 @@ class AgenticTaskTests(unittest.TestCase):
     def _snapshot(self):
         return R.export_records(self.store)
 
+    def _set_clock(self, when):
+        self.store.clock._now = when
+
     def test_happy_path_executed_and_verified_is_recorded_success(self):
         claim = self._claim()
         runner = FakeRunner(
@@ -145,6 +153,7 @@ class AgenticTaskTests(unittest.TestCase):
         self.assertTrue(outcome.recorded)
         self.assertEqual(outcome.runner_status, "executed_unverified")
         self.assertEqual(len(runner.calls), 1)
+        self.assertTrue(runner.dispatched)
         call = runner.calls[0]
         self.assertEqual(call["toolsets"], ["secretary_background"])
         self.assertEqual(call["expected_tools"], ["secretary_task_inspect"])
@@ -152,6 +161,8 @@ class AgenticTaskTests(unittest.TestCase):
         self.assertNotIn(claim["claim_token"], call["instructions"])
         record = R.inspect(self.store, self.rec["id"], include_claim=True)
         self.assertEqual(record["ready"]["status"], "queued")
+        self.assertTrue(record["ready"]["artifact_ref"])
+        self.assertEqual(outcome.artifact_hash, record["ready"]["hash"])
         self.assertIn("verified", record["checkpoint"]["summary"])
         self.assertTrue(outcome.artifact_ref.startswith("artifact:"))
         self.assertTrue(outcome.artifact_hash)
@@ -271,6 +282,110 @@ class AgenticTaskTests(unittest.TestCase):
         self.assertEqual(runner.calls, 1)
         self.assertNotIn("private", repr(outcome))
         self.assertNotIn("/home/owner", repr(outcome))
+
+    def test_update_after_entry_before_dispatch_denies_and_does_not_dispatch(self):
+        claim = self._claim()
+        runner = FakeRunner(
+            NativeTaskResult(status="executed_unverified", exit_code=0),
+            before_dispatch_action=lambda: R.update(
+                self.store, self.rec["id"],
+                desired_outcome="Changed after entry", now=T0),
+        )
+
+        outcome = self._run(claim, runner)
+
+        self.assertEqual(outcome.status, "denied")
+        self.assertFalse(outcome.verified)
+        self.assertFalse(outcome.recorded)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertFalse(runner.dispatched)
+        record = R.inspect(self.store, self.rec["id"], include_claim=True)
+        self.assertEqual(record["status"], R.ACCEPTED)
+        self.assertEqual(record["ready"]["status"], "")
+
+    def test_claim_expiry_before_dispatch_denies_with_fixed_initial_now(self):
+        claim = self._claim()
+        expires = datetime.fromisoformat(claim["expires_at"])
+        runner = FakeRunner(
+            NativeTaskResult(status="executed_unverified", exit_code=0),
+            before_dispatch_action=lambda: self._set_clock(
+                expires + timedelta(seconds=1)),
+        )
+
+        outcome = self._run(claim, runner)
+
+        self.assertEqual(outcome.status, "denied")
+        self.assertFalse(outcome.verified)
+        self.assertFalse(outcome.recorded)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertFalse(runner.dispatched)
+
+    def test_gate_revoked_after_initial_admission_denies_without_dispatch(self):
+        claim = self._claim()
+        gate_state = {"allowed": True}
+
+        def gate():
+            return gate_state["allowed"]
+
+        runner = FakeRunner(
+            NativeTaskResult(status="executed_unverified", exit_code=0),
+            before_dispatch_action=lambda: gate_state.__setitem__(
+                "allowed", False),
+        )
+
+        outcome = self._run(claim, runner, gate=gate)
+
+        self.assertEqual(outcome.status, "denied")
+        self.assertFalse(outcome.verified)
+        self.assertTrue(outcome.recorded)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertFalse(runner.dispatched)
+        record = R.inspect(self.store, self.rec["id"], include_claim=True)
+        self.assertIn("non-success", record["checkpoint"]["summary"])
+
+    def test_source_version_change_after_entry_denies_without_dispatch(self):
+        claim = self._claim()
+        runner = FakeRunner(
+            NativeTaskResult(status="executed_unverified", exit_code=0),
+            before_dispatch_action=lambda: R.update(
+                self.store, self.rec["id"],
+                source_version="conversation:2", now=T0),
+        )
+
+        outcome = self._run(claim, runner)
+
+        self.assertEqual(outcome.status, "denied")
+        self.assertFalse(outcome.verified)
+        self.assertFalse(outcome.recorded)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertFalse(runner.dispatched)
+        record = R.inspect(self.store, self.rec["id"], include_claim=True)
+        self.assertEqual(record["source_version"], "conversation:2")
+
+    def test_claim_expiry_after_child_artifact_cannot_record_success(self):
+        claim = self._claim()
+        expires = datetime.fromisoformat(claim["expires_at"])
+
+        def write_then_expire():
+            self._write_artifact(claim)
+            self._set_clock(expires + timedelta(seconds=1))
+
+        runner = FakeRunner(
+            NativeTaskResult(status="executed_unverified", exit_code=0),
+            on_run=write_then_expire,
+        )
+
+        outcome = self._run(claim, runner)
+
+        self.assertEqual(outcome.status, "unverified")
+        self.assertFalse(outcome.verified)
+        self.assertFalse(outcome.recorded)
+        self.assertEqual(outcome.runner_status, "executed_unverified")
+        self.assertTrue(runner.dispatched)
+        record = R.inspect(self.store, self.rec["id"], include_claim=True)
+        self.assertEqual(record["status"], R.ACCEPTED)
+        self.assertEqual(record["ready"]["status"], "queued")
+        self.assertNotIn("agentic task verified", record["checkpoint"]["summary"])
 
     def test_secrets_and_claim_token_never_appear_in_outcome_or_summary(self):
         claim = self._claim()

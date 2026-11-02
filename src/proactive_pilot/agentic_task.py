@@ -132,6 +132,49 @@ def _record(
         return False
 
 
+def _fresh_now(store: Any, admitted_at: datetime) -> datetime:
+    current = store.clock.now()
+    return current if current >= admitted_at else admitted_at
+
+
+def _claim_still_current(
+    store: Any,
+    responsibility_id: str,
+    claim_token: Any,
+    *,
+    expected: dict[str, Any],
+    admitted_at: datetime,
+) -> bool:
+    try:
+        now = _fresh_now(store, admitted_at)
+        packet = R.claimed_brief(
+            store, responsibility_id, claim_token, now=now)
+        current = R.inspect(store, responsibility_id, include_claim=True)
+    except Exception:  # noqa: BLE001 - an unreadable fence fails closed
+        return False
+    if current.get("status") != R.ACCEPTED:
+        return False
+    if int(packet.get("generation", -1)) != int(expected.get("generation", 0)):
+        return False
+    if int(current.get("generation", -1)) != int(expected.get("generation", 0)):
+        return False
+    if str(packet.get("source_version", "")) != str(expected.get("source_version", "")):
+        return False
+    if str(current.get("source_version", "")) != str(expected.get("source_version", "")):
+        return False
+    claim = current.get("claim") or {}
+    original = expected.get("claim") or {}
+    if str(claim.get("token", "")) != str(original.get("token", "")):
+        return False
+    if str(claim.get("expires_at", "")) != str(original.get("expires_at", "")):
+        return False
+    if int(claim.get("generation", -1)) != int(original.get("generation", -1)):
+        return False
+    if str(claim.get("source_version", "")) != str(original.get("source_version", "")):
+        return False
+    return True
+
+
 def _validate_max_turns(max_turns: Any) -> int:
     if isinstance(max_turns, bool) or not isinstance(max_turns, int):
         raise AgenticTaskRefused("max_turns must be a positive integer")
@@ -244,8 +287,11 @@ def run_agentic_task(
     store mutation. Runtime denials/timeouts/verification failures return a
     non-success outcome and never mark the responsibility successful.
     """
+    admitted_at = now if now is not None else store.clock.now()
+
     try:
-        brief = R.claimed_brief(store, responsibility_id, claim_token, now=now)
+        brief = R.claimed_brief(
+            store, responsibility_id, claim_token, now=admitted_at)
     except (R.ResponsibilityError, CorruptStateError) as exc:
         raise AgenticTaskRefused(_scrub(exc, claim_token)) from None
 
@@ -286,7 +332,9 @@ def run_agentic_task(
             preparation.check_gate(gate_fn)
         except Exception:  # noqa: BLE001 - denial is handled by the runner
             return False
-        return True
+        return _claim_still_current(
+            store, responsibility_id, claim_token,
+            expected=before, admitted_at=admitted_at)
 
     try:
         result = runner.run(
@@ -304,7 +352,8 @@ def run_agentic_task(
             store, responsibility_id, claim_token,
             generation=before["generation"],
             source_version=before["source_version"],
-            summary=summary, artifact_refs=None, now=now)
+            summary=summary, artifact_refs=None,
+            now=_fresh_now(store, admitted_at))
         return AgenticTaskOutcome(
             responsibility_id=str(responsibility_id),
             status="error",
@@ -335,7 +384,8 @@ def run_agentic_task(
             store, responsibility_id, claim_token,
             generation=before["generation"],
             source_version=before["source_version"],
-            summary=summary, artifact_refs=None, now=now)
+            summary=summary, artifact_refs=None,
+            now=_fresh_now(store, admitted_at))
         return AgenticTaskOutcome(
             responsibility_id=str(responsibility_id),
             status=status,
@@ -348,7 +398,8 @@ def run_agentic_task(
 
     try:
         after, handoff = _verify_transition(
-            store, responsibility_id, claim_token, before=before, now=now)
+            store, responsibility_id, claim_token, before=before,
+            now=_fresh_now(store, admitted_at))
     except _VerificationFailed as exc:
         reason = _scrub(f"artifact verification failed: {exc}", claim_token)
         summary = _summary("non-success", reason, diagnostics, claim_token)
@@ -356,7 +407,8 @@ def run_agentic_task(
             store, responsibility_id, claim_token,
             generation=before["generation"],
             source_version=before["source_version"],
-            summary=summary, artifact_refs=None, now=now)
+            summary=summary, artifact_refs=None,
+            now=_fresh_now(store, admitted_at))
         return AgenticTaskOutcome(
             responsibility_id=str(responsibility_id),
             status="unverified",
@@ -378,7 +430,7 @@ def run_agentic_task(
         source_version=after["source_version"],
         summary=summary,
         artifact_refs=[artifact_ref] if artifact_ref else None,
-        now=now,
+        now=_fresh_now(store, admitted_at),
     )
     return AgenticTaskOutcome(
         responsibility_id=str(responsibility_id),
