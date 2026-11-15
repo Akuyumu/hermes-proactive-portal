@@ -38,7 +38,7 @@ class PackagingAndSchemaTests(unittest.TestCase):
         module_version = _version_from(ROOT / "src" / "proactive_pilot" / "__init__.py",
                                        r'__version__\s*=\s*"([^"]+)"')
         self.assertEqual(manifest_version, module_version)
-        self.assertEqual(manifest_version, "0.6.2")
+        self.assertEqual(manifest_version, "1.0.0")
         report = exporter.scan(ROOT)
         self.assertTrue(report["ok"], report["problems"])
         for name in ("desktop/plugin.js", "dashboard/plugin_api.py", "dashboard/manifest.json"):
@@ -70,7 +70,7 @@ class PackagingAndSchemaTests(unittest.TestCase):
         imported = exporter._import_registration(extracted)
         self.assertTrue(imported["ok"], imported)
         dashboard = json.loads((extracted / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(dashboard["version"], "0.6.2")
+        self.assertEqual(dashboard["version"], "1.0.0")
         self.assertEqual(dashboard["api"], "plugin_api.py")
 
     def test_doctor_requires_the_real_custom_ui_and_api(self):
@@ -114,8 +114,12 @@ class PackagingAndSchemaTests(unittest.TestCase):
         schema_keys = set(re.findall(r"(?m)^  ([a-z][a-z0-9_]*):\s*$", match.group(1)))
         self.assertTrue(schema_keys)
         allowed = set(userconfig.NATIVE_FLAT_FIELDS) | {
-            "primary_provider", "primary_model", "fallback_provider", "fallback_model"}
+            "primary_provider", "primary_model", "fallback_provider", "fallback_model",
+            "portal_reasoning_effort"}
         self.assertLessEqual(schema_keys, allowed)
+        import yaml
+        spec = yaml.safe_load(text)["config_schema"]["portal_reasoning_effort"]
+        self.assertEqual((spec["type"], spec["default"]), ("str", ""))
 
 
 class _ApiBase(unittest.TestCase):
@@ -234,15 +238,25 @@ class SettingsApiTests(_ApiBase):
             "values": {"api_key": "not-allowed"}
         })
         self.assertEqual(unknown.status_code, 400)
-        untyped = self.client.post("/settings", json={
+        invalid = self.client.post("/settings", json={
             "revision": self.client.get("/settings").json()["revision"],
-            "values": {"daily_normal_cap": "12"}
+            "values": {"daily_normal_cap": "2.5"}
         })
-        self.assertEqual(untyped.status_code, 400)
+        self.assertEqual(invalid.status_code, 400)
         stale = self.client.post("/settings", json={
             "revision": "old-revision", "values": {"timezone": "Asia/Tokyo"}})
         self.assertEqual(stale.status_code, 409)
         self.assertEqual(self.h.snapshot(), before)
+
+        # Canonical digit text is accepted by the optional string cap control
+        # with the same revision/consent semantics as any ordinary edit.
+        revision = self.client.get("/settings").json()["revision"]
+        accepted = self.client.post("/settings", json={
+            "revision": revision, "values": {"daily_normal_cap": "12"}})
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(accepted.json()["values"]["daily_normal_cap"], 12)
+        self.assertEqual(
+            self.client.get("/settings").json()["values"]["daily_normal_cap"], 12)
 
     def test_permission_expansion_is_previewed_and_requires_explicit_ack(self):
         config = self.h.ctx.settings["user_config"]

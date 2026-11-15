@@ -1,5 +1,11 @@
 # Agentic secretary: conversational onboarding and bounded autonomy
 
+> **Historical design note.** This document describes the original
+> conversational-onboarding design and remains useful as a design contract.
+> It is not the current installation authority. For current setup, upgrades and
+> repository details, use [Installation](INSTALLATION.md) and the
+> [operations guide](operations.md).
+
 This document describes the product behaviour shipped by the plugin. It is
 generic: it contains no owner identity, account, destination or private fact.
 The implementation lives in the plugin source; this text is the design contract
@@ -113,24 +119,24 @@ a private backup precedes a write.
 
 ## 8. Desktop setup entry
 
-The settings page is an ordinary Desktop contribution. The normal package install
-installs both the agent half and the Desktop half; the package contains
+> This section is historical design context, not current install authority.
+
+The settings page is an ordinary Desktop contribution. The package contains
 `desktop/plugin.js`, `dashboard/plugin_api.py` and `dashboard/manifest.json`.
 There is no native `--desktop` plugin-install flag and no desktop SHA pin, and the
-current Desktop plugin form has no Desktop-target checkbox (its tooltip is stale).
+Desktop plugin form may differ between client versions.
 
-The code-supported Desktop-only compatibility URI is:
+The current native install URI is the unified plugin link:
 
 ```
-hermes://plugin-desktop/install?repo=Akuyumu/hermes-proactive-secretary&enable=1
+hermes://plugin/install?repo=Akuyumu/hermes-proactive-portal&enable=1
 ```
 
-Its Desktop hint is `agent:false, desktop:probe.desktop`. The download runs on the
+An older Desktop-only URI was previously documented, but it is deprecated in
+favour of the unified native link above. The optional client component and
+refresh behaviour depend on the installed client. The download runs on the
 client computer, so that computer needs working private Git access; a backend
-cannot fetch the private repository for the user. If a repository form cannot
-inject the action/link, the normal plugin install still installs both halves;
-adding a button to that form needs a local Desktop half or an upstream form
-enhancement. No internal marker file, manual writer or scanner bypass is used.
+cannot fetch the private repository for the user.
 
 Onboarding never depends on the Desktop page. The conversational interview runs
 from any eligible one-to-one foreground chat and remains available when only the

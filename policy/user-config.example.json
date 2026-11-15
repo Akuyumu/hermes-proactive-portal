@@ -23,7 +23,7 @@
   },
   "notification": {
     "cooldown_minutes": 30,
-    "daily_normal_cap": 5,
+    "daily_normal_cap": null,
     "destination": "local",
     "notify_address": "the user",
     "persona": "Hermes",

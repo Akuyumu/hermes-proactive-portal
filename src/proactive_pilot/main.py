@@ -494,6 +494,45 @@ def _run_once(args: argparse.Namespace, *, evaluator=None, location_http=None) -
             _emit("")
             return 1
 
+        # Existing monitoring lane consumes at most one pending portal notice
+        # before any collector/model work.  Diagnostic and offline modes never
+        # touch the queue; an empty queue is a zero-write fall-through.
+        if not (getattr(args, "check", False)
+                or getattr(args, "collect_only", False)
+                or getattr(args, "dry_run", False)
+                or getattr(args, "no_model", False)
+                or getattr(args, "fixture", None)):
+            from .portal_notices import dispatch_notice
+            notice = dispatch_notice(
+                store,
+                clock,
+                policy=policy,
+                prefs=prefs,
+                state=state,
+                native_ctx=getattr(args, "native_ctx", None),
+            )
+            notice_status = str(notice.get("status") or "")
+            if notice.get("message"):
+                _emit(str(notice["message"]))
+                return 0
+            if notice_status in {
+                "corrupt_queue",
+                "invalid_input",
+                "state_error",
+                "save_failed",
+                "origin_denied",
+                "origin_unavailable",
+            }:
+                print(
+                    "proactive-secretary: portal notice dispatch failed: "
+                    f"{notice.get('reason') or notice_status}",
+                    file=sys.stderr,
+                )
+                _emit("")
+                return 1
+            # empty or blocked: retain all existing quiet/cap/pref behaviour and
+            # continue through the unchanged collection/delivery path.
+
         health_state = load_source_health(state)
         for record in health_state["sources"].values():
             if record["delivery_state"] == "emitting":

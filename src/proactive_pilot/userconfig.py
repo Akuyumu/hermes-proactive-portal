@@ -38,7 +38,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 CONFIG_SCHEMA = 1
 CONFIG_VERSION = 1
 DEFAULT_TIMEZONE = "UTC"
-DEFAULT_DAILY_NORMAL_CAP = 5
+# Optional ordinary-message ceiling. ``None`` is the canonical "unset" value:
+# no deterministic daily-count ceiling is applied. It is never a hidden target
+# or a silent five-message quota.
+DEFAULT_DAILY_NORMAL_CAP: int | None = None
 NATIVE_PLUGIN_ID = "hermes-proactive-secretary"
 NATIVE_SETTINGS_KEY = "user_config"
 
@@ -123,6 +126,9 @@ def default_config() -> dict[str, Any]:
         # Internal marker: neutral generic defaults deliberately suppress any
         # inherited seed feeds. Never persisted (leading underscore).
         "_explicit_public_sources": True,
+        # Internal marker: a generated default never explicitly chose a daily
+        # ceiling, so an explicit legacy value may still be preserved.
+        "_explicit_daily_cap": False,
         "adaptive": {
             "mode": "disabled",
             "privacy_review": False,
@@ -227,6 +233,49 @@ def _nonnegative_int(raw: Any, name: str, default: int) -> int:
     return raw
 
 
+def _optional_nonnegative_int(raw: Any, name: str) -> int | None:
+    """Normalise an OPTIONAL nonnegative integer limit.
+
+    ``None`` and a blank/whitespace-only string mean the limit is unset (here:
+    no deterministic daily-count ceiling; it is never a hidden default and never
+    a target). Explicit integers -- including ``0`` -- are preserved with their
+    existing semantics. Booleans, negatives, fractions and other non-numeric
+    values are rejected rather than guessed or coerced.
+
+    Plain digit strings are accepted because the native form field has no
+    nullable number type: the owner types an optional number as text and leaves
+    it blank to clear it. Existing saved integers therefore keep working.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise ConfigError(
+            f"{name} must be a nonnegative integer or blank (not true/false)")
+    if _is_int(raw):
+        if raw < 0:
+            raise ConfigError(
+                f"{name} must be a nonnegative integer or blank, got {raw}")
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        if not text.isdigit():
+            raise ConfigError(
+                f"{name} must be a nonnegative integer or blank, got {text!r}")
+        try:
+            return int(text)
+        except ValueError:
+            # Some Unicode characters (e.g. superscript digits) satisfy
+            # str.isdigit() but are not accepted by int(); fail closed.
+            raise ConfigError(
+                f"{name} must be a nonnegative integer or blank, got {text!r}"
+            ) from None
+    raise ConfigError(
+        f"{name} must be a nonnegative integer or blank, "
+        f"got {type(raw).__name__}")
+
+
 def _bounded_bool(raw: Any, name: str, default: bool) -> bool:
     if raw is None:
         return default
@@ -325,9 +374,13 @@ def validate_config(raw: Any) -> dict[str, Any]:
     base_notif["quiet_end_hour"] = _bounded_int(
         notif.get("quiet_end_hour"), "notification.quiet_end_hour", 0, 23,
         base_notif["quiet_end_hour"])
-    base_notif["daily_normal_cap"] = _nonnegative_int(
-        notif.get("daily_normal_cap"), "notification.daily_normal_cap",
-        base_notif["daily_normal_cap"])
+    base_notif["daily_normal_cap"] = _optional_nonnegative_int(
+        notif.get("daily_normal_cap"), "notification.daily_normal_cap")
+    # Presence (including an explicit null/blank) is different from omission: a
+    # partial edit that omits the field must preserve the owner's saved value,
+    # while an explicit blank clears it.
+    config["_explicit_daily_cap"] = _field_present(
+        raw, "notification.daily_normal_cap")
     base_notif["cooldown_minutes"] = _bounded_int(
         notif.get("cooldown_minutes"), "notification.cooldown_minutes", 0, 1440,
         base_notif["cooldown_minutes"])
@@ -546,7 +599,7 @@ SEEDED_PATHS = (
 _NEUTRAL_EXAMPLE_VALUES = {
     "timezone": "UTC",
     "notification.destination": "local",
-    "notification.daily_normal_cap": 5,
+    "notification.daily_normal_cap": None,
     "notification.quiet_start_hour": 0,
     "notification.quiet_end_hour": 8,
     "sources.public_feeds": False,
@@ -730,6 +783,14 @@ def policy_overrides(config: dict[str, Any]) -> dict[str, Any]:
         "_user_config_version": config.get("version", CONFIG_VERSION),
     }
     overrides.update(typed)
+    # Preserve an explicitly saved legacy daily ceiling when the typed config
+    # never mentions that field. An explicit typed value (including null/blank,
+    # which clears the cap) always wins; omission must not silently erase it.
+    if not config.get("_explicit_daily_cap"):
+        legacy_cap = advanced.get("legacy_policy") if isinstance(advanced, dict) else None
+        if isinstance(legacy_cap, dict) and "daily_normal_cap" in legacy_cap:
+            overrides["daily_normal_cap"] = copy.deepcopy(
+                legacy_cap["daily_normal_cap"])
     # Explicit legacy migration may retain library alias discovery where the
     # original policy omitted account scope. Neutral defaults never set this.
     for kind in advanced.get("legacy_account_discovery", []):
@@ -943,7 +1004,12 @@ def native_flat_values(config: Mapping[str, Any]) -> dict[str, Any]:
         "timezone": validated["timezone"],
         "context_refresh": validated["context_refresh"],
         "destination": notif["destination"],
-        "daily_normal_cap": notif["daily_normal_cap"],
+        # The native form has no nullable number type, so this one optional
+        # numeric control uses blank text for unset while an explicit saved
+        # integer is projected unchanged. validate_config accepts both.
+        "daily_normal_cap": (
+            "" if notif["daily_normal_cap"] is None
+            else notif["daily_normal_cap"]),
         "quiet_start_hour": notif["quiet_start_hour"],
         "quiet_end_hour": notif["quiet_end_hour"],
         "cooldown_minutes": notif["cooldown_minutes"],
@@ -1051,6 +1117,9 @@ class LoadedConfig:
             "source": self.source,
             "version": self.version,
             "timezone": self.config["timezone"],
+            # None is the honest "no deterministic daily ceiling" value; it is
+            # never serialised as 0 or restored to a hidden five.
+            "daily_normal_cap": self.config["notification"]["daily_normal_cap"],
             "sources": dict(self.config["sources"]),
             "mail_accounts": list(self.config["mail"]["accounts"]),
             "calendars": list(self.config["calendar"]["calendars"]),

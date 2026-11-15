@@ -144,12 +144,20 @@ ROUTES_OK = {"primary_provider": "provider-a", "primary_model": "model-a",
 
 
 class AllowanceAndSettingsTests(unittest.TestCase):
-    def test_allowance_is_any_nonnegative_integer(self):
+    def test_allowance_is_optional_nonnegative_integer(self):
         for value in (0, 5, 1000, 10 ** 9):
             svc = onboarding.OnboardingService(Ctx())
             svc.update(settings={"daily_allowance": value})
             self.assertEqual(svc.inspect()["state"]["settings"]["daily_allowance"], value)
-        for bad in (-1, True, False, 1.5, "5"):
+        # The canonical string control accepts digit text, blank and None.
+        for raw, expected in (("5", 5), (" 0 ", 0), ("", None), ("   ", None),
+                              (None, None)):
+            svc = onboarding.OnboardingService(Ctx())
+            svc.update(settings={"daily_allowance": raw})
+            self.assertEqual(
+                svc.inspect()["state"]["settings"]["daily_allowance"], expected)
+        # Booleans, negatives, fractions and non-numeric text stay rejected.
+        for bad in (-1, True, False, 1.5, "1.5", "many"):
             svc = onboarding.OnboardingService(Ctx())
             with self.assertRaises(onboarding.OnboardingError):
                 svc.update(settings={"daily_allowance": bad})
@@ -169,9 +177,13 @@ class AllowanceAndSettingsTests(unittest.TestCase):
     def test_manifest_route_fields_are_separate_and_validated(self):
         import yaml
         schema = yaml.safe_load((ROOT / "plugin.yaml").read_text(encoding="utf-8"))["config_schema"]
-        self.assertEqual(set(schema) - set(uc.NATIVE_FLAT_FIELDS), set(models.ROUTE_SETTING_KEYS))
+        self.assertEqual(set(schema) - set(uc.NATIVE_FLAT_FIELDS),
+                         set(models.ROUTE_SETTING_KEYS) | {"portal_reasoning_effort"})
         for key in models.ROUTE_SETTING_KEYS:
             self.assertEqual(schema[key]["default"], "")
+        self.assertEqual(
+            (schema["portal_reasoning_effort"]["type"],
+             schema["portal_reasoning_effort"]["default"]), ("str", ""))
         _clean, errors = models.validate_route_settings({"primary_provider": "p"})
         self.assertTrue(any("together" in error for error in errors))
         _clean, errors = models.validate_route_settings(

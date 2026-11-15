@@ -265,7 +265,11 @@ class ManifestSeamTests(unittest.TestCase):
         schema = manifest["config_schema"]
         route_fields = {"primary_provider", "primary_model",
                         "fallback_provider", "fallback_model"}
-        self.assertEqual(set(schema), set(uc.NATIVE_FLAT_FIELDS) | route_fields)
+        self.assertEqual(set(schema), set(uc.NATIVE_FLAT_FIELDS) | route_fields
+                         | {"portal_reasoning_effort"})
+        self.assertEqual(
+            (schema["portal_reasoning_effort"]["type"],
+             schema["portal_reasoning_effort"]["default"]), ("str", ""))
         self.assertNotIn("properties", schema)
         for key, spec in schema.items():
             self.assertIsInstance(spec, dict)
@@ -277,7 +281,7 @@ class ManifestSeamTests(unittest.TestCase):
                     if key in uc.NATIVE_FLAT_FIELDS}
         self.assertEqual(ordinary, uc.native_flat_values(uc.default_config()))
         self.assertEqual(defaults["destination"], "")
-        self.assertEqual(defaults["daily_normal_cap"], 5)
+        self.assertEqual(defaults["daily_normal_cap"], "")
         self.assertEqual({key: defaults[key] for key in route_fields},
                          {key: "" for key in route_fields})
 
@@ -392,7 +396,7 @@ class ConfigureProjectionTests(_DataDirMixin):
         self.assertEqual(rc, 0, payload)
         self.assertEqual(payload["status"], "written")
         self.assertEqual(ctx.settings["timezone"], "UTC")
-        self.assertEqual(ctx.settings["daily_normal_cap"], 5)
+        self.assertEqual(ctx.settings["daily_normal_cap"], "")
         self.assertEqual(ctx.settings["destination"], "local")
         self.assertFalse(ctx.settings["mail_enabled"])
 
@@ -488,7 +492,7 @@ from hermes_cli.plugins_settings import save_plugin_settings, plugin_settings_fi
 pid = "hermes-proactive-secretary"
 plugin_dir = {str(ROOT)!r}
 before = {{f["key"]: f.get("value") for f in plugin_settings_fields(pid, plugin_dir)}}
-written = save_plugin_settings(pid, plugin_dir, {{"daily_normal_cap": 9, "mail_enabled": True}})
+written = save_plugin_settings(pid, plugin_dir, {{"daily_normal_cap": "9", "mail_enabled": True}})
 after = {{f["key"]: f.get("value") for f in plugin_settings_fields(pid, plugin_dir)}}
 from hermes_cli.config import load_config_readonly
 payload = load_config_readonly()
@@ -507,16 +511,18 @@ print("RESULT:" + json.dumps({{"before": before, "written": written,
             result = json.loads(line.split("RESULT:", 1)[1])
             route_fields = {"primary_provider", "primary_model",
                             "fallback_provider", "fallback_model"}
-            self.assertEqual(set(result["before"]), set(uc.NATIVE_FLAT_FIELDS) | route_fields)
-            self.assertEqual(result["before"]["daily_normal_cap"], 5)
+            self.assertEqual(set(result["before"]), set(uc.NATIVE_FLAT_FIELDS)
+                             | route_fields | {"portal_reasoning_effort"})
+            self.assertEqual(result["before"]["portal_reasoning_effort"], "")
+            self.assertEqual(result["before"]["daily_normal_cap"], "")
             self.assertEqual(result["before"]["destination"], "")
             self.assertEqual({key: result["before"][key] for key in route_fields},
                              {key: "" for key in route_fields})
             self.assertEqual(sorted(result["written"]), ["daily_normal_cap", "mail_enabled"])
-            self.assertEqual(result["after"]["daily_normal_cap"], 9)
+            self.assertEqual(result["after"]["daily_normal_cap"], "9")
             self.assertTrue(result["after"]["mail_enabled"])
             self.assertEqual(result["settings"],
-                             {"daily_normal_cap": 9, "mail_enabled": True})
+                             {"daily_normal_cap": "9", "mail_enabled": True})
 
             with tempfile.TemporaryDirectory(dir=ROOT) as cfg_tmp:
                 path = _write_config(Path(cfg_tmp), _file_config(cap=3))

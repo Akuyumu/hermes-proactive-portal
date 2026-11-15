@@ -107,13 +107,17 @@ def run_self_test() -> int:
     from .gates import _expired
     outcomes.append(_Result("expiry_helper", _expired({"expiry": "2026-10-01T00:00:00+08:00"}, day) is True, ""))
 
-    # 8. hard cap: five (default ceiling) normal deliveries then sixth suppressed
+    # 8. hard cap: five (explicit configured ceiling) normal deliveries then sixth suppressed
     state = {"delivered": [{"at": f"2026-10-02T{9 + i:02d}:00:00+08:00", "signature": s, "urgent": False}
                            for i, s in enumerate(("a", "b", "c", "d", "e"))]}
     prop = fixture_evaluator("changed_event").evaluate(packet, policy)
-    # avoid cooldown interference
+    # Avoid cooldown interference. Use a scenario-local copy so this explicit
+    # ceiling never mutates the shared policy for later scenarios.
     state.pop("last_delivery_at", None)
-    dec_cap = decide(prop, packet, clock=day, policy=policy, prefs=policy["_preferences"], state=state)
+    cap_policy = json.loads(json.dumps(policy))
+    cap_policy["daily_normal_cap"] = 5
+    dec_cap = decide(prop, packet, clock=day, policy=cap_policy,
+                     prefs=cap_policy["_preferences"], state=state)
     outcomes.append(_Result("hard_cap_suppresses_6th", not dec_cap["send"] and dec_cap["reason"] == "daily cap", dec_cap["reason"]))
 
     # 9. changed event passes validation and would send

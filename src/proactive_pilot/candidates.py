@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from .collectors import SourceResult
-from .policy import is_noise
+from .policy import daily_normal_cap, is_noise
 
 SCHEMA_VERSION = 1
 MAX_PREVIEW_CHARS = 240
@@ -307,7 +307,9 @@ def build_packet(
         "schema": SCHEMA_VERSION,
         "generated_at": now.isoformat(),
         "quiet_hours": _quiet_label(policy),
-        "daily_normal_cap": int(policy.get("daily_normal_cap", 5)),
+        # None is the honest unset value (no deterministic daily ceiling); it is
+        # never coerced to 0 or restored to a hidden five.
+        "daily_normal_cap": daily_normal_cap(policy),
         "coverage": coverage,
         "known_task_refs": list(baseline.get("task_refs", []))[:200],
         "candidates": selected,

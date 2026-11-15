@@ -287,7 +287,7 @@ class NoticeGuardTests(unittest.TestCase):
 
     def test_cap_blocks(self):
         state = {"delivered": [{"at": NOW.isoformat(), "signature": s} for s in ("a", "b", "c", "d", "e")]}
-        ok, reason = notice_allowed(state, _policy(), {"explicit": []}, NOW)
+        ok, reason = notice_allowed(state, _policy(daily_normal_cap=5), {"explicit": []}, NOW)
         self.assertFalse(ok)
         self.assertEqual(reason, "daily cap")
 

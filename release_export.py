@@ -1,4 +1,4 @@
-"""Reproducible code-only 0.6.2 export builder and installed-candidate doctor.
+"""Reproducible code-only 1.0.0 export builder and installed-candidate doctor.
 
 This is not a new package manager. It uses the plugin's existing manifest and
 Python modules, applies the same export rules the release review requires, and
@@ -10,7 +10,7 @@ Rules enforced by :func:`build_package`:
 * every shipped file comes from an explicit allowlist of code/docs/policy/skill/
   runner trees (no ``.build-context``, tests, git metadata, caches, private
   runtime state or scratch files);
-* the manifest and ``src/proactive_pilot/__init__.py`` both say 0.6.2;
+* the manifest and ``src/proactive_pilot/__init__.py`` both say 1.0.0;
 * sanitisation terms and absolute personal home paths are rejected;
 * file order, timestamps and hashes are deterministic.
 """
@@ -19,20 +19,23 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.6.2"
+VERSION = "1.0.0"
 SHIPPED_DIRS = ("src", "policy", "skills", "runners", "public_samples", "fixtures",
                 "desktop", "dashboard", "docs")
 # Nested trees contain executable/assets as well as docs. Keep the same
@@ -197,28 +200,152 @@ print("ok")
                 "detail": (proc.stderr or proc.stdout or "")[-400:]}
 
 
+def _resolve_native_cli() -> tuple[Path | None, str]:
+    """Locate the native ``hermes_cli`` package used by the current runtime.
+
+    The published ``hermes`` launcher may pick a different, cold-managed Python
+    and bootstrap a fresh dependency generation.  Resolve the module that is
+    already importable by the caller instead; the child can then run the very
+    same interpreter and native validator.
+    """
+    try:
+        spec = importlib.util.find_spec("hermes_cli")
+    except Exception as exc:  # noqa: BLE001 - report an unavailable SDK honestly
+        return None, f"{type(exc).__name__}: {exc}"
+    if spec is None:
+        return None, "native hermes_cli package is not importable"
+    locations = list(spec.submodule_search_locations or ())
+    if locations:
+        package_dir = Path(locations[0])
+    elif spec.origin and spec.origin not in ("built-in", "frozen"):
+        package_dir = Path(spec.origin).parent
+    else:
+        return None, "native hermes_cli package location could not be resolved"
+    if not (package_dir / "main.py").is_file():
+        return None, f"native hermes_cli.main is missing from {package_dir}"
+    return package_dir, ""
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Kill only the process group created for this validator child."""
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    if proc.poll() is None:
+        proc.kill()
+
+
+def _reap_process(proc: subprocess.Popen, timeout: float = 5) -> None:
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=timeout)
+
+
+def _run_native_subprocess(command: list[str], *, env: dict[str, str],
+                           timeout: float) -> tuple[int | None, str, str, bool]:
+    """Run one bounded validator child and reap its entire process group.
+
+    Output goes to temporary files rather than pipes: a surviving descendant
+    holding an inherited pipe cannot make the parent wait past the direct
+    child's exit.  The group is always killed before the synthetic directory is
+    removed, so cleanup cannot race a late writer.
+    """
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                errors="replace") as stdout_file, \
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                   errors="replace") as stderr_file:
+        proc = subprocess.Popen(command, env=env, stdout=stdout_file,
+                                stderr=stderr_file, text=True,
+                                start_new_session=True)
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_process_group(proc)
+            _reap_process(proc)
+        except BaseException:
+            _kill_process_group(proc)
+            _reap_process(proc)
+            raise
+        finally:
+            # Descendants may outlive the direct child; kill the isolated group
+            # even on success before the caller removes its temporary tree.
+            _kill_process_group(proc)
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        return proc.returncode, stdout_file.read(), stderr_file.read(), timed_out
+
+
+def _remove_temp_tree(path: str) -> None:
+    """Remove the synthetic tree after the child group is gone.
+
+    A short retry absorbs filesystem teardown rather than swallowing a genuine
+    failure: the final attempt still raises so the doctor cannot fake success.
+    """
+    for attempt in range(20):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
+
+
 def _native_host_doctor(installed: Path) -> dict[str, Any]:
-    """Run the canonical native plugin doctor against an isolated profile."""
-    hermes = shutil.which("hermes")
-    if not hermes:
+    """Run the canonical native plugin doctor with the current coherent Python."""
+    package_dir, problem = _resolve_native_cli()
+    if package_dir is None:
         return {"available": False, "ok": False,
-                "reason": "canonical hermes CLI is not on PATH"}
-    with tempfile.TemporaryDirectory(prefix="secretary-doctor-") as tmp:
+                "reason": problem, "launch_mode": "python-module"}
+    command = [sys.executable, "-m", "hermes_cli.main",
+               "plugins", "doctor", "--ci", str(installed)]
+    tmp = tempfile.mkdtemp(prefix="secretary-doctor-")
+    try:
         home = Path(tmp) / "home"
         profile = Path(tmp) / "profile"
         home.mkdir()
         profile.mkdir()
         env = dict(os.environ, HOME=str(home), HERMES_HOME=str(profile),
-                   TMPDIR=str(Path(tmp)), PYTHONDONTWRITEBYTECODE="1")
+                   TMPDIR=tmp, PYTHONDONTWRITEBYTECODE="1")
+        # The same interpreter already resolves the package; pinning its parent
+        # keeps that exact installed source importable even when the inherited
+        # environment is otherwise sparse.  Existing dependency sites remain
+        # available through the interpreter and any inherited PYTHONPATH.
+        pythonpath = [str(package_dir.parent)]
+        if env.get("PYTHONPATH"):
+            pythonpath.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath)
         try:
-            proc = subprocess.run([hermes, "plugins", "doctor", "--ci", str(installed)],
-                                  env=env, capture_output=True, text=True,
-                                  timeout=60)
-        except Exception as exc:  # noqa: BLE001
-            return {"available": True, "ok": False, "reason": type(exc).__name__}
-        return {"available": True, "ok": proc.returncode == 0,
-                "returncode": proc.returncode,
-                "detail": (proc.stdout or proc.stderr or "")[-600:]}
+            returncode, stdout, stderr, timed_out = _run_native_subprocess(
+                command, env=env, timeout=60)
+        except Exception as exc:  # noqa: BLE001 - report, never fake success
+            return {"available": True, "ok": False, "launch_mode": "python-module",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "native_package": str(package_dir)}
+        detail = (stdout or stderr or "")[-600:]
+        if timed_out:
+            return {"available": True, "ok": False, "launch_mode": "python-module",
+                    "reason": "TimeoutExpired", "timed_out": True,
+                    "returncode": returncode, "detail": detail,
+                    "native_package": str(package_dir)}
+        return {"available": True, "ok": returncode == 0,
+                "launch_mode": "python-module", "timed_out": False,
+                "returncode": returncode, "detail": detail,
+                "stdout": stdout[-2000:], "stderr": stderr[-2000:],
+                "native_package": str(package_dir)}
+    finally:
+        _remove_temp_tree(tmp)
 
 
 def doctor(installed: Path) -> dict[str, Any]:

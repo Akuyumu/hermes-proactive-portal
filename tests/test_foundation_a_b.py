@@ -120,8 +120,8 @@ class NeutralDefaultsTests(unittest.TestCase):
         policy = apply_user_config(load_policy(None), config)
         self.assertEqual(policy["feed_seed_sources"], [source])
 
-    def test_default_allowance_is_five_and_any_nonnegative_integer(self):
-        self.assertEqual(uc.default_config()["notification"]["daily_normal_cap"], 5)
+    def test_default_allowance_is_none_and_explicit_nonnegative_integer(self):
+        self.assertIsNone(uc.default_config()["notification"]["daily_normal_cap"])
         self.assertEqual(uc.validate_config({"schema": 1, "version": 1,
                                              "notification": {"daily_normal_cap": 250}})
                          ["notification"]["daily_normal_cap"], 250)
@@ -156,9 +156,9 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(uc.policy_overrides(second)["daily_normal_cap"], 3)
         self.assertEqual(uc.policy_overrides(first)["feed_seed_sources"], [])
 
-    def test_omitted_legacy_cap_gets_new_default_five(self):
+    def test_omitted_legacy_cap_has_no_hidden_default_five(self):
         config, _ = uc.migrate_legacy({"timezone": "UTC"})
-        self.assertEqual(config["notification"]["daily_normal_cap"], 5)
+        self.assertIsNone(config["notification"]["daily_normal_cap"])
 
     def test_explicit_zero_and_large_legacy_caps_are_preserved(self):
         for cap in (0, 7, 250):
@@ -242,8 +242,8 @@ class NativeSettingsTests(unittest.TestCase):
         # root with a "properties" wrapper).
         props = manifest["config_schema"]
         self.assertNotIn("properties", props)
-        self.assertEqual(props["daily_normal_cap"]["default"], 5)
-        self.assertEqual(props["daily_normal_cap"]["minimum"], 0)
+        self.assertEqual(props["daily_normal_cap"]["default"], "")
+        self.assertNotIn("minimum", props["daily_normal_cap"])
         self.assertIn("timezone", props)
         self.assertIn("public_sources", props)
         self.assertNotIn("api_key", props)
@@ -251,7 +251,11 @@ class NativeSettingsTests(unittest.TestCase):
         # and the manifest declares no unmapped duplicate preference.
         route_fields = {"primary_provider", "primary_model",
                         "fallback_provider", "fallback_model"}
-        self.assertEqual(set(props), set(uc.NATIVE_FLAT_FIELDS) | route_fields)
+        self.assertEqual(set(props), set(uc.NATIVE_FLAT_FIELDS) | route_fields
+                         | {"portal_reasoning_effort"})
+        self.assertEqual(
+            (props["portal_reasoning_effort"]["type"],
+             props["portal_reasoning_effort"]["default"]), ("str", ""))
         self.assertEqual(props["collector_budget_seconds"]["minimum"], 5)
         self.assertEqual(props["max_candidates_per_kind"]["maximum"], 500)
 

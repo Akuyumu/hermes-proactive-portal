@@ -18,6 +18,14 @@ The schedule is positional. Script jobs use ``--script`` (a filename under the
 profile's scripts directory) together with ``--no-agent``; there is no
 ``--command`` flag and no JSON output.
 
+A normal-agent job is the same native create verb *without* ``--script`` or
+``--no-agent``: the prompt is the positional argument after the schedule, and
+optional native pins are passed as separate argv tokens using the supported
+spellings ``--model``, ``--provider``, ``--reasoning-effort``, ``--skill``
+(repeatable), ``--workdir`` and ``--deliver``. Omitting a pin inherits the host's
+normal native agent configuration; this module never invents a global fallback
+for it.
+
 Hard rules:
 - The backend is only touched from explicit user commands (``setup`` /
   ``disable`` / ``uninstall``), never at import or ``register()`` time.
@@ -49,12 +57,13 @@ LEGACY_PILOT_JOB_NAME = "hermes-proactive-secretary-pilot"
 PILOT_JOB_NAME = MONITORING_JOB_NAME
 REMINDER_JOB_NAME = "hermes-proactive-secretary-reminders"
 PREPARATION_JOB_NAME = "hermes-proactive-secretary-preparation"
+PORTAL_JOB_NAME = "hermes-proactive-secretary-portal"
 OWNED_JOB_NAMES: tuple[str, ...] = (MONITORING_JOB_NAME, REMINDER_JOB_NAME)
 LEGACY_OWNED_JOB_NAMES: tuple[str, ...] = (LEGACY_PILOT_JOB_NAME,)
 OPTIONAL_JOB_NAMES: tuple[str, ...] = (PREPARATION_JOB_NAME,)
 KNOWN_JOB_NAMES: tuple[str, ...] = (
     MONITORING_JOB_NAME, REMINDER_JOB_NAME, PREPARATION_JOB_NAME,
-    LEGACY_PILOT_JOB_NAME,
+    PORTAL_JOB_NAME, LEGACY_PILOT_JOB_NAME,
 )
 OWNED_PLUGIN = "hermes-proactive-secretary"
 JOB_OWNERSHIP_SCHEMA = 1
@@ -64,21 +73,68 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _same_profile_path(left: Path, right: Path) -> bool:
+    """Compare two home paths without requiring either to exist."""
+    def key(value: Path) -> str:
+        try:
+            return os.path.normcase(
+                str(Path(value).expanduser().resolve(strict=False)))
+        except (OSError, RuntimeError):
+            return os.path.normcase(os.path.abspath(os.path.expanduser(str(value))))
+
+    return key(left) == key(right)
+
+
 class CronError(RuntimeError):
     """The Hermes cron surface could not be reached or used safely."""
 
 
+def _load_served_profile_child_env():
+    """Return the native served-profile child-env builder (lazy import)."""
+    from tools.environments.local import served_profile_child_env
+    return served_profile_child_env
+
+
 @dataclass
 class CronJobSpec:
-    """Declarative description of one native cron job this plugin owns."""
+    """Declarative description of one native cron job this plugin owns.
+
+    Script jobs set ``script`` and leave ``prompt`` empty. Normal-agent jobs set
+    ``prompt`` and leave ``script`` empty. The optional native pins below are
+    only emitted when explicitly supplied; an empty value means "inherit the
+    host's normal native configuration", not "resolve to some plugin default".
+    """
 
     name: str
     schedule: str
-    script: str
+    script: str = ""
     deliver: str = "local"
     workdir: str = ""
     description: str = ""
     env: dict[str, str] = field(default_factory=dict)
+    prompt: str = ""
+    model: str = ""
+    provider: str = ""
+    reasoning: str = ""
+    skills: list[str] = field(default_factory=list)
+    context_from: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NormalAgentJobSpec(CronJobSpec):
+    """Backward-compatible explicit lane for a native normal-agent job.
+
+    ``script`` must stay empty: this spec can never silently turn into the
+    legacy ``--no-agent`` script lane. Delivery defaults to empty here so an
+    omitted value inherits the host's native delivery instead of this plugin
+    inventing ``local``.
+    """
+
+    deliver: str = ""
+
+
+# A descriptive alias for callers that spell the lane out in full.
+NormalAgentCronJobSpec = NormalAgentJobSpec
 
 
 @dataclass
@@ -97,6 +153,8 @@ class CronBackend(Protocol):
     def add_job(self, spec: CronJobSpec) -> dict[str, Any]: ...
     def remove_job(self, job_id: str) -> dict[str, Any]: ...
     def rename_job(self, job_id: str, name: str) -> dict[str, Any]: ...
+    def pause_job(self, job_id: str) -> dict[str, Any]: ...
+    def resume_job(self, job_id: str) -> dict[str, Any]: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +172,15 @@ _FIELD_KEYS = {
     "mode": "mode",
     "workdir": "workdir",
     "last run": "last_run",
+    # Normal-agent detail is only compared when the native text output actually
+    # exposes it; absent fields are reported as bounded verification gaps.
+    "prompt": "prompt",
+    "model": "model",
+    "provider": "provider",
+    "reasoning": "reasoning",
+    "reasoning effort": "reasoning",
+    "skills": "skills",
+    "context from": "context_from",
 }
 
 
@@ -153,9 +220,84 @@ def _find_job(jobs: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
     return next((j for j in jobs if str(j.get("name") or "") == name), None)
 
 
+def _is_agent_spec(spec: CronJobSpec) -> bool:
+    """True only for the normal-agent lane (a real prompt, no script)."""
+    return bool(str(getattr(spec, "prompt", "") or "").strip())
+
+
+def _mode_is_agent(mode: str) -> bool:
+    text = str(mode or "").strip().lower()
+    return bool(text) and "no-agent" not in text and "agent" in text
+
+
+def _normalize_skills(value: Any) -> list[str]:
+    """Normalize a skills pin to an ordered list without inventing values."""
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return [str(value)]
+
+
+def _normalize_context_from(value: Any) -> list[str]:
+    """Normalize a native ``context_from`` pin to an ordered list of ids.
+
+    A single string is one reference (never comma-split, because a job id may
+    contain punctuation); list/tuple entries are stripped and blank entries
+    dropped. Missing values mean native inheritance (no context pin).
+    """
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return [str(value)]
+
+
+def _same_agent_field(job: dict[str, Any], field_name: str, expected: Any,
+                      *, skills: bool = False) -> bool:
+    """Compare one field only when the native text row exposes it."""
+    if field_name not in job:
+        return True
+    actual = job.get(field_name)
+    if skills:
+        return _normalize_skills(actual) == _normalize_skills(expected)
+    return str(actual or "") == str(expected or "")
+
+
 def _same_job(job: dict[str, Any], spec: CronJobSpec) -> bool:
     if str(job.get("schedule") or "") != spec.schedule:
         return False
+    if _is_agent_spec(spec):
+        # A normal-agent row must never be mistaken for, or silently treated as,
+        # the script/no-agent lane.
+        if str(job.get("script") or ""):
+            return False
+        mode = str(job.get("mode") or "")
+        if mode and not _mode_is_agent(mode):
+            return False
+        if not _same_agent_field(job, "prompt", spec.prompt):
+            return False
+        if not _same_agent_field(job, "model", spec.model):
+            return False
+        if not _same_agent_field(job, "provider", spec.provider):
+            return False
+        if not _same_agent_field(job, "reasoning", spec.reasoning):
+            return False
+        if not _same_agent_field(job, "skills", spec.skills, skills=True):
+            return False
+        if "context_from" in job and (
+                _normalize_context_from(job.get("context_from"))
+                != _normalize_context_from(getattr(spec, "context_from", []))):
+            return False
+        if spec.deliver and str(job.get("deliver") or "") != spec.deliver:
+            return False
+        if spec.workdir and str(job.get("workdir") or "") != spec.workdir:
+            return False
+        return True
     if str(job.get("script") or "") != spec.script:
         return False
     if str(job.get("deliver") or "") != spec.deliver:
@@ -163,6 +305,90 @@ def _same_job(job: dict[str, Any], spec: CronJobSpec) -> bool:
     if spec.workdir and str(job.get("workdir") or "") != spec.workdir:
         return False
     return True
+
+
+_UNSAFE_ARGV = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _validate_text(label: str, value: Any, *, required: bool) -> str:
+    if not isinstance(value, str):
+        raise CronError(f"{label} must be a string")
+    text = value
+    if required and not text.strip():
+        raise CronError(f"{label} must not be empty")
+    if _UNSAFE_ARGV.search(text):
+        raise CronError(f"{label} contains control characters/newlines; refusing argv injection")
+    if text.startswith("-"):
+        raise CronError(f"{label} must not start with '-' (would be parsed as a flag)")
+    return text
+
+
+def validate_job_spec(spec: CronJobSpec) -> None:
+    """Reject empty, malformed, injected, or ambiguous script/agent specs.
+
+    Validation happens before any backend call, so a rejected spec can never
+    create or remove a native job.
+    """
+    _validate_text("job name", getattr(spec, "name", ""), required=True)
+    _validate_text("schedule", getattr(spec, "schedule", ""), required=True)
+    script = getattr(spec, "script", "") or ""
+    prompt = getattr(spec, "prompt", "") or ""
+    model = getattr(spec, "model", "") or ""
+    provider = getattr(spec, "provider", "") or ""
+    reasoning = getattr(spec, "reasoning", "") or ""
+    raw_skills = getattr(spec, "skills", [])
+    if not isinstance(raw_skills, (str, list, tuple)):
+        raise CronError("skills must be a string or list of strings")
+    if isinstance(raw_skills, (list, tuple)) and any(
+            not isinstance(item, str) for item in raw_skills):
+        raise CronError("skills must be a list of strings")
+    skills = _normalize_skills(raw_skills)
+    raw_context = getattr(spec, "context_from", [])
+    if not isinstance(raw_context, (str, list, tuple)):
+        raise CronError("context_from must be a string or list of strings")
+    if isinstance(raw_context, (list, tuple)) and any(
+            not isinstance(item, str) for item in raw_context):
+        raise CronError("context_from must be a list of strings")
+    context_from = _normalize_context_from(raw_context)
+    unsupported_context = [ref for ref in context_from if ref != "self"]
+    if unsupported_context:
+        raise CronError(
+            "this backend can only express native self context via --continuity; "
+            "unsupported context_from reference(s): "
+            + ", ".join(unsupported_context)
+        )
+    agent_pins = bool(model or provider or reasoning or skills)
+
+    if script:
+        _validate_text("script", script, required=True)
+        if prompt or agent_pins or context_from:
+            raise CronError(
+                "ambiguous cron job spec: script/--no-agent and normal-agent "
+                "prompt/native pins cannot be combined"
+            )
+    else:
+        if prompt:
+            _validate_text("prompt", prompt, required=True)
+        elif agent_pins or context_from:
+            raise CronError("normal-agent native pins require a non-empty prompt")
+        else:
+            raise CronError("cron job spec needs either a script or a normal-agent prompt")
+        for label, value in (
+            ("model", model), ("provider", provider), ("reasoning", reasoning),
+        ):
+            if value:
+                _validate_text(label, value, required=False)
+        for skill in skills:
+            _validate_text("skills entry", skill, required=True)
+        for reference in context_from:
+            _validate_text("context_from entry", reference, required=True)
+
+    deliver = getattr(spec, "deliver", "") or ""
+    if deliver:
+        _validate_text("deliver", deliver, required=False)
+    workdir = getattr(spec, "workdir", "") or ""
+    if workdir:
+        _validate_text("workdir", workdir, required=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -219,9 +445,19 @@ def record_owned_job(ownership: dict[str, Any], spec: CronJobSpec, job: dict[str
         "created_at": created_at or _now_iso(),
         "schedule": spec.schedule,
         "script": spec.script,
+        "prompt": getattr(spec, "prompt", "") or "",
         "deliver": spec.deliver,
         "workdir": spec.workdir,
+        "mode": str(job.get("mode") or ("agent" if _is_agent_spec(spec) else "no-agent")),
     }
+    if _is_agent_spec(spec):
+        record.update({
+            "model": getattr(spec, "model", "") or "",
+            "provider": getattr(spec, "provider", "") or "",
+            "reasoning": getattr(spec, "reasoning", "") or "",
+            "skills": _normalize_skills(getattr(spec, "skills", [])),
+            "context_from": _normalize_context_from(getattr(spec, "context_from", [])),
+        })
     ownership.setdefault("jobs", {})[spec.name] = record
     return record
 
@@ -257,12 +493,55 @@ class HermesCronBackend:
         self.list_verb = list_verb or os.environ.get("HERMES_CRON_LIST_VERB") or "list"
         self.remove_verb = remove_verb or os.environ.get("HERMES_CRON_REMOVE_VERB") or "remove"
 
+    def _subprocess_env(self) -> dict[str, str]:
+        """Request-owned child env bound to the active profile home.
+
+        The native SDK builds the env for a process acting for the active
+        (possibly served) profile. For a routed request it drops the launch
+        profile's ``.env`` residue and bridged ``TERMINAL_*`` values and scrubs
+        every provider/tool credential, then pins the target home and applies
+        the SDK's own ``HOME``/``TMPDIR`` semantics. Cron metadata needs no
+        provider credentials, so credentials are explicitly not inherited.
+
+        The plugin's data override belongs only to a child serving the same
+        home as this process; it is never leaked to a routed foreign profile.
+        A missing or failing native helper aborts before any spawn.
+        """
+        try:
+            from proactive_pilot import ownerpaths
+        except Exception as exc:  # noqa: BLE001 - cannot prove the profile binding
+            raise CronError(
+                f"cannot load the active profile resolver: {exc}") from exc
+        try:
+            active = Path(ownerpaths.hermes_home())
+            launch = Path(ownerpaths.launch_home())
+        except Exception as exc:  # noqa: BLE001 - fail closed, never read launch A
+            raise CronError(
+                f"cannot resolve the active Hermes profile for cron: {exc}") from exc
+        try:
+            build_env = _load_served_profile_child_env()
+            env = build_env(target_home=str(active), inherit_credentials=False)
+        except Exception as exc:  # noqa: BLE001 - never fall back to launch env
+            raise CronError(
+                f"cannot build a sanitized cron child environment: {exc}") from exc
+        if not isinstance(env, dict):
+            raise CronError(
+                "native served_profile_child_env returned an unexpected shape")
+        if _same_profile_path(active, launch):
+            data_root = os.environ.get(ownerpaths.DATA_ENV)
+            if data_root is not None:
+                env[ownerpaths.DATA_ENV] = data_root
+        else:
+            env.pop(ownerpaths.DATA_ENV, None)
+        return env
+
     def _run(self, argv: list[str]) -> subprocess.CompletedProcess:
         if self._runner is not None:
             return self._runner(argv)
+        env = self._subprocess_env()
         return subprocess.run(
             argv, shell=False, capture_output=True, text=True,
-            timeout=self.timeout, check=False,
+            timeout=self.timeout, check=False, env=env,
         )
 
     def _cron_argv(self, *args: str) -> list[str]:
@@ -394,15 +673,42 @@ class HermesCronBackend:
         return dict(after)
 
     def add_job(self, spec: CronJobSpec) -> dict[str, Any]:
-        argv = self._cron_argv(
-            self.create_verb, spec.schedule,
-            "--name", spec.name,
-            "--script", spec.script,
-            "--no-agent",
-            "--deliver", spec.deliver,
-        )
-        if spec.workdir:
-            argv += ["--workdir", spec.workdir]
+        validate_job_spec(spec)
+        if _is_agent_spec(spec):
+            # Normal native agent lane: real prompt positional, and deliberately
+            # no --script/--no-agent. Optional pins are separate argv tokens;
+            # omitted pins inherit the host's normal native configuration.
+            argv = self._cron_argv(
+                self.create_verb, spec.schedule, spec.prompt,
+                "--name", spec.name,
+            )
+            if spec.deliver:
+                argv += ["--deliver", spec.deliver]
+            if spec.workdir:
+                argv += ["--workdir", spec.workdir]
+            if getattr(spec, "model", ""):
+                argv += ["--model", spec.model]
+            if getattr(spec, "provider", ""):
+                argv += ["--provider", spec.provider]
+            if getattr(spec, "reasoning", ""):
+                argv += ["--reasoning-effort", spec.reasoning]
+            for skill in _normalize_skills(getattr(spec, "skills", [])):
+                argv += ["--skill", skill]
+            # The native CLI expresses context_from=['self'] as a single boolean
+            # --continuity flag. There is no --context-from flag, and validation
+            # has already rejected any unsupported non-self reference.
+            if _normalize_context_from(getattr(spec, "context_from", [])):
+                argv += ["--continuity"]
+        else:
+            argv = self._cron_argv(
+                self.create_verb, spec.schedule,
+                "--name", spec.name,
+                "--script", spec.script,
+                "--no-agent",
+                "--deliver", spec.deliver,
+            )
+            if spec.workdir:
+                argv += ["--workdir", spec.workdir]
         try:
             proc = self._run(argv)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -413,6 +719,40 @@ class HermesCronBackend:
                 f"{(proc.stderr or proc.stdout or '').strip()[:240]}"
             )
         return {"name": spec.name, "created": True, "argv": argv}
+
+    def _set_job_state(self, job_id: str, verb: str, expected_state: str) -> dict[str, Any]:
+        try:
+            proc = self._run(self._cron_argv(verb, str(job_id)))
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise CronError(f"cannot {verb} cron job {job_id!r}: {exc}") from exc
+        if proc.returncode != 0:
+            raise CronError(
+                f"cron {verb} {job_id!r} failed (exit {proc.returncode}): "
+                f"{(proc.stderr or proc.stdout or '').strip()[:240]}"
+            )
+        match = next(
+            (j for j in self.list_jobs() if _job_id(j) == str(job_id)),
+            None,
+        )
+        if match is None:
+            raise CronError(f"cron job {job_id!r} is not present after {verb}")
+        state = str(match.get("state") or "")
+        if state != expected_state:
+            raise CronError(
+                f"cron job {job_id!r} state is {state or 'unknown'!r} after {verb}; "
+                f"expected {expected_state!r}"
+            )
+        return {"id": str(job_id)}
+
+    def pause_job(self, job_id: str) -> dict[str, Any]:
+        result = self._set_job_state(job_id, "pause", "paused")
+        result["paused"] = True
+        return result
+
+    def resume_job(self, job_id: str) -> dict[str, Any]:
+        result = self._set_job_state(job_id, "resume", "active")
+        result["resumed"] = True
+        return result
 
     def remove_job(self, job_id: str) -> dict[str, Any]:
         try:
@@ -431,6 +771,107 @@ class HermesCronBackend:
 # Idempotent, verified helpers
 # --------------------------------------------------------------------------- #
 
+def _select_created_row(jobs: list[dict[str, Any]], spec: CronJobSpec,
+                        before_ids: set[str]) -> dict[str, Any] | None:
+    """Select exactly one new row with the target name and a genuinely new id."""
+    candidates = [
+        row for row in jobs
+        if str(row.get("name") or "") == spec.name
+        and _job_id(row)
+        and _job_id(row) not in before_ids
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise CronError(
+            f"cron job {spec.name!r} creation is ambiguous: multiple new rows share "
+            "the name; refusing to guess or adopt one"
+        )
+    return None
+
+
+def _verify_normal_agent_row(row: dict[str, Any], spec: CronJobSpec) -> list[str]:
+    """Verify id+mode+any exposed native fields; return honest verification gaps.
+
+    A missing id or mode is inconclusive and fails. Prompt/model/... detail that
+    the native text listing does not expose is reported as a bounded gap instead
+    of being fabricated; an exposed value that differs is always a hard failure.
+    """
+    job_id = _job_id(row)
+    if not job_id:
+        raise CronError(
+            f"cron job {spec.name!r} was created but the readback has no exact job id"
+        )
+    gaps: list[str] = []
+    mode = str(row.get("mode") or "")
+    if not mode:
+        raise CronError(
+            f"cron job {spec.name!r} was created but the readback does not expose "
+            "its mode; cannot prove normal-agent mode"
+        )
+    if not _mode_is_agent(mode):
+        raise CronError(
+            f"cron job {spec.name!r} readback mode {mode!r} is not normal-agent"
+        )
+    if str(row.get("script") or ""):
+        raise CronError(
+            f"cron job {spec.name!r} readback unexpectedly has script "
+            f"{row.get('script')!r}; refusing to claim a normal-agent job"
+        )
+    checks = (
+        ("prompt", spec.prompt, False),
+        ("model", getattr(spec, "model", ""), False),
+        ("provider", getattr(spec, "provider", ""), False),
+        ("reasoning", getattr(spec, "reasoning", ""), False),
+        ("skills", getattr(spec, "skills", []), True),
+        ("deliver", spec.deliver, False),
+        ("workdir", spec.workdir, False),
+    )
+    for field_name, expected, is_skills in checks:
+        if is_skills and not _normalize_skills(expected):
+            continue
+        if not is_skills and not str(expected or ""):
+            continue
+        if field_name not in row:
+            gaps.append(field_name)
+            continue
+        actual = row.get(field_name)
+        if is_skills:
+            matches = _normalize_skills(actual) == _normalize_skills(expected)
+        else:
+            matches = str(actual or "") == str(expected or "")
+        if not matches:
+            raise CronError(
+                f"cron job {spec.name!r} readback {field_name}={actual!r} does not "
+                f"match requested {expected!r}"
+            )
+    expected_context = _normalize_context_from(
+        getattr(spec, "context_from", []))
+    if expected_context:
+        if "context_from" not in row:
+            gaps.append("context_from")
+        elif _normalize_context_from(row.get("context_from")) != expected_context:
+            raise CronError(
+                f"cron job {spec.name!r} readback context_from="
+                f"{row.get('context_from')!r} does not match requested "
+                f"{expected_context!r}"
+            )
+    return gaps
+
+
+def ensure_normal_agent_job(backend: CronBackend, spec: CronJobSpec, *,
+                            ownership: dict[str, Any] | None = None,
+                            ownership_path: str | os.PathLike[str] | None = None,
+                            now: str | None = None) -> CronJobResult:
+    """Explicit normal-agent creation path (never the script/--no-agent lane)."""
+    if not _is_agent_spec(spec):
+        raise CronError("ensure_normal_agent_job requires a non-empty prompt")
+    if str(getattr(spec, "script", "") or ""):
+        raise CronError("normal-agent jobs must not set a script")
+    return ensure_job(backend, spec, ownership=ownership,
+                      ownership_path=ownership_path, now=now)
+
+
 def ensure_job(backend: CronBackend, spec: CronJobSpec, *,
                ownership: dict[str, Any] | None = None,
                ownership_path: str | os.PathLike[str] | None = None,
@@ -440,8 +881,12 @@ def ensure_job(backend: CronBackend, spec: CronJobSpec, *,
     When ``ownership`` is supplied, ownership is enforced: a same-named job that
     was NOT recorded by this plugin is refused (never adopted or overwritten),
     and every created/updated job's id is recorded. Without ``ownership`` the
-    legacy name-based behaviour is preserved for direct callers/tests.
+    legacy name-based behaviour is preserved for script jobs; the normal-agent
+    lane is stricter and refuses to adopt an existing same-named row it cannot
+    prove it owns.
     """
+    validate_job_spec(spec)
+    agent = _is_agent_spec(spec)
     jobs = backend.list_jobs()
     existing = _find_job(jobs, spec.name)
     record = owned_job_record(ownership, spec.name) if ownership is not None else None
@@ -454,31 +899,62 @@ def ensure_job(backend: CronBackend, spec: CronJobSpec, *,
                 "this plugin did not create it. Remove or rename the conflicting job, "
                 "then re-run setup."
             )
+        if agent and ownership is None:
+            raise CronError(
+                f"refusing to adopt existing cron job {spec.name!r} "
+                f"(id={job_id or '?'}) without an exact ownership record"
+            )
         if _same_job(existing, spec):
-            return CronJobResult(spec.name, "already-present", "unchanged")
+            detail = "unchanged"
+            if agent:
+                gaps = _verify_normal_agent_row(existing, spec)
+                detail = ("unchanged; " + (
+                    "verification=partial (readback does not expose: "
+                    + ", ".join(gaps) + ")" if gaps else "verification=full"))
+            return CronJobResult(spec.name, "already-present", detail)
         if not job_id:
             raise CronError(f"cron job {spec.name!r} has no id to remove")
         backend.remove_job(job_id)
         if (next((j for j in backend.list_jobs() if _job_id(j) == job_id), None) is not None
                 or _find_job(backend.list_jobs(), spec.name) is not None):
             raise CronError(f"cron job {spec.name!r} did not disappear before update")
+        before_ids = {_job_id(j) for j in jobs if _job_id(j)}
         backend.add_job(spec)
-        updated = _find_job(backend.list_jobs(), spec.name)
+        after = backend.list_jobs()
+        updated = _select_created_row(after, spec, before_ids)
         if updated is None:
-            raise CronError(f"cron job {spec.name!r} did not reappear after update")
+            raise CronError(
+                f"cron job {spec.name!r} did not reappear with a new exact id after update"
+            )
+        detail = "shape changed; recreated"
+        if agent:
+            gaps = _verify_normal_agent_row(updated, spec)
+            if gaps:
+                detail += ("; verification=partial (readback does not expose: "
+                           + ", ".join(gaps) + ")")
         if ownership is not None:
             record_owned_job(ownership, spec, updated, created_at=(record or {}).get("created_at") or now)
             save_job_ownership(ownership_path, ownership)
-        return CronJobResult(spec.name, "updated", "shape changed; recreated")
+        return CronJobResult(spec.name, "updated", detail)
 
+    before_ids = {_job_id(j) for j in jobs if _job_id(j)}
     backend.add_job(spec)
-    created = _find_job(backend.list_jobs(), spec.name)
+    after = backend.list_jobs()
+    created = _select_created_row(after, spec, before_ids)
     if created is None:
-        raise CronError(f"cron job {spec.name!r} was not confirmed after creation")
+        raise CronError(
+            f"cron job {spec.name!r} was not confirmed with a new exact id after creation"
+        )
+    detail = ""
+    if agent:
+        gaps = _verify_normal_agent_row(created, spec)
+        detail = ("id={}; verification={}".format(
+            _job_id(created), "full" if not gaps else
+            "partial (readback does not expose: " + ", ".join(gaps) + ")"))
     if ownership is not None:
         record_owned_job(ownership, spec, created, created_at=now)
         save_job_ownership(ownership_path, ownership)
-    return CronJobResult(spec.name, "created")
+    return CronJobResult(spec.name, "created", detail)
 
 
 def remove_job(backend: CronBackend, name: str, *,
@@ -829,7 +1305,9 @@ class InMemoryCronBackend:
         return [dict(j) for j in self.jobs]
 
     def add_job(self, spec: CronJobSpec) -> dict[str, Any]:
+        validate_job_spec(spec)
         self._counter += 1
+        agent = _is_agent_spec(spec)
         job = {
             "id": f"job-{self._counter}",
             "name": spec.name,
@@ -837,10 +1315,20 @@ class InMemoryCronBackend:
             "script": spec.script,
             "deliver": spec.deliver,
             "workdir": spec.workdir,
-            "mode": "no-agent",
+            "mode": "agent" if agent else "no-agent",
             "state": "active",
             "last_run": "",
         }
+        if agent:
+            job.update({
+                "prompt": spec.prompt,
+                "model": getattr(spec, "model", ""),
+                "provider": getattr(spec, "provider", ""),
+                "reasoning": getattr(spec, "reasoning", ""),
+                "skills": _normalize_skills(getattr(spec, "skills", [])),
+                "context_from": _normalize_context_from(
+                    getattr(spec, "context_from", [])),
+            })
         self.jobs.append(job)
         return job
 
@@ -856,6 +1344,21 @@ class InMemoryCronBackend:
                 job["name"] = str(name)
                 return dict(job)
         raise CronError(f"cron job {job_id!r} is not present to rename")
+
+    def _set_job_state(self, job_id: str, state: str, flag: str) -> dict[str, Any]:
+        for job in self.jobs:
+            if _job_id(job) == str(job_id):
+                job["state"] = state
+                result = {"id": str(job_id)}
+                result[flag] = True
+                return result
+        raise CronError(f"cron job {job_id!r} is not present to {flag}")
+
+    def pause_job(self, job_id: str) -> dict[str, Any]:
+        return self._set_job_state(job_id, "paused", "paused")
+
+    def resume_job(self, job_id: str) -> dict[str, Any]:
+        return self._set_job_state(job_id, "active", "resumed")
 
 
 def build_job_specs(*, deliver: str = "local", workdir: str = "",

@@ -13,6 +13,7 @@ from .evaluator import EvaluatorResult
 from .policy import (
     active_snooze,
     cooldown_active,
+    daily_normal_cap,
     in_quiet_hours,
     local_day,
     preference_blocks,
@@ -413,7 +414,11 @@ def _expired(prior: dict[str, Any], now: Any) -> bool:
 def _over_cap(state: dict[str, Any], policy: dict[str, Any], now: Any, urgency: str) -> bool:
     if urgency == "urgent":
         return False  # urgency bypasses the ordinary cap
-    cap = max(0, int(policy.get("daily_normal_cap", 5)))
+    cap = daily_normal_cap(policy)
+    if cap is None:
+        # Unset means no deterministic daily-count ceiling. Quiet hours,
+        # cooldown, dedupe, approvals and urgent/reminder exceptions still apply.
+        return False
     today = local_day(now, policy)
     count_today = sum(
         1 for row in state.get("delivered", [])

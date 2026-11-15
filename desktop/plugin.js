@@ -488,6 +488,12 @@ function SettingsEditor({ ctx, statusQuery }) {
         value: mode === 'list' ? listText(values[key]) : String(values[key] ?? ''),
         onChange: event => {
           if (mode === 'list') return set(key, event.target.value)
+          if (mode === 'optional-number') {
+            // The optional cap is stored as blank (unset) or digit text, matching
+            // the host schema's string field. A legacy saved integer is shown
+            // readably and is only rewritten when the owner edits it.
+            return set(key, event.target.value)
+          }
           if (mode === 'number') {
             const next = event.target.value === '' ? 0 : Number(event.target.value)
             return set(key, Number.isFinite(next) ? next : 0)
@@ -616,7 +622,7 @@ function SettingsEditor({ ctx, statusQuery }) {
         children: [
           jsx('h4', { className: 'font-medium', children: 'Notification preferences' }),
           textField('destination', 'Where messages are sent', 'Empty records messages locally; it does not verify delivery.', 'text'),
-          textField('daily_normal_cap', 'Most ordinary messages per day', '0 stops ordinary discretionary messages; requested reminders stay separate.', 'number'),
+          textField('daily_normal_cap', 'Most ordinary messages per day', '0 stops ordinary discretionary messages; leave blank for no daily ceiling. Requested reminders stay separate.', 'optional-number'),
           textField('quiet_start_hour', 'Quiet hours begin (0-23)', 'Ordinary messages wait from this local hour.', 'number'),
           textField('quiet_end_hour', 'Quiet hours end (0-23)', 'Ordinary messages may resume from this local hour.', 'number'),
           textField('cooldown_minutes', 'Minimum gap between messages (minutes)', 'A short breathing space between ordinary messages.', 'number')

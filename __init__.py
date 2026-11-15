@@ -12,6 +12,7 @@ from pathlib import Path
 # Sanitized diagnostics only; never a credential or raw provider output.
 _MODEL_REGISTRATION: dict = {}
 _CONVERSATION_REGISTRATION: dict = {}
+_PORTAL_NOTICE_REGISTRATION: dict = {}
 
 
 def _plugin_root() -> Path:
@@ -85,6 +86,17 @@ def register(ctx) -> None:
     except Exception as exc:  # noqa: BLE001 - deterministic CLI must still load
         _CONVERSATION_REGISTRATION.update({
             "error": f"{type(exc).__name__}: {exc}"})
+
+    # The proposal tool is optional: an old/fake host without native cron
+    # execution context must still load the CLI and existing tools.
+    try:
+        from .secretary_portal_notices import register_tool as register_portal_notice_tool
+        _PORTAL_NOTICE_REGISTRATION.update(register_portal_notice_tool(ctx))
+    except Exception as exc:  # noqa: BLE001 - registration stays optional
+        _PORTAL_NOTICE_REGISTRATION.update({
+            "portal_notice_tool": False,
+            "portal_notice_tool_error": f"{type(exc).__name__}: {exc}",
+        })
 
     ctx.register_cli_command(
         name="secretary",

@@ -1,0 +1,437 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index ac2566dea2d..ee87c5934f2 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -33,6 +33,10 @@ from agent.error_classifier import (
+     is_reasoning_field_rejection,
+     is_reasoning_required_rejection,
+ )
++from agent.auxiliary_fallback_policy import (
++    configured_only_preflight_error, is_configured_only_task,
++)
++from agent.auxiliary_fallback_recovery import strict_provider_fallback as _strict_provider_fallback
+ from agent.auxiliary_error_shapes import (
+     _botocore_error, _exc_http_status, _is_invalid_aux_response_error, _is_statusless_structured_provider_error,
+ )
+@@ -6063,6 +6067,7 @@ def _resolve_task_provider_model(
+     shaping still applies. api_mode is "chat_completions", "codex_responses", or None (auto).
+     """
+     cfg_provider = cfg_model = cfg_base_url = cfg_api_key = resolved_api_mode = None
++    task_config: dict[str, Any] = {}
+     if task:
+         task_config = _get_auxiliary_task_config(task)
+         cfg_provider = str(task_config.get("provider", "")).strip() or None
+@@ -6079,11 +6084,15 @@ def _resolve_task_provider_model(
+     # 'auto' is a sentinel ("inherit / auto-detect"), not a model id — leaking it to the wire
+     # yields a 200 with an error-text body that consumers accept as output. The explicit `model`
+     # kwarg needs the same normalization: MoA slots forward preset `model:` fields through it.
+-    if model and model.lower() == "auto":
++    if isinstance(model, str) and model.lower() == "auto":
+         model = None
+-    if cfg_model and cfg_model.lower() == "auto":
++    if isinstance(cfg_model, str) and cfg_model.lower() == "auto":
+         cfg_model = None
+     resolved_model = model or cfg_model
++    if error := configured_only_preflight_error(
++            task, task_config, provider=provider, model=model,
++            effective_provider=provider or cfg_provider, resolved_model=resolved_model):
++        raise AuxiliaryClientUnavailable(error)
+     # Any moa:// facade endpoint belongs to the facade, not the aggregator's real provider —
+     # drop it (mirrors _resolve_auto_route()).
+     if provider and str(provider).strip().lower() == "moa":
+@@ -7283,13 +7292,14 @@ def _resolve_call_client(
+     """Resolve the client for one aux call: vision chain, or cached text client with the
+     explicit-provider fallback_chain / auto-chain rescue; RuntimeError when nothing is configured."""
+     effective_provider = resolved_provider
++    strict = is_configured_only_task(task)
+     if task == "vision":
+         effective_provider, client, final_model = resolve_vision_provider_client(
+             provider=resolved_provider if resolved_provider != "auto" else provider,
+             model=resolved_model or model, base_url=resolved_base_url or base_url,
+             api_key=resolved_api_key or api_key, async_mode=async_mode, main_runtime=main_runtime,
+         )
+-        if client is None and resolved_provider != "auto" and not resolved_base_url:
++        if client is None and resolved_provider != "auto" and not resolved_base_url and not strict:
+             logger.warning("Vision provider %s unavailable, falling back to auto vision backends",
+                            resolved_provider)
+             effective_provider, client, final_model = resolve_vision_provider_client(
+@@ -7307,7 +7317,8 @@ def _resolve_call_client(
+             # Explicit provider with no credentials: honor the task fallback_chain before
+             # raising (fallback entries may use OAuth / credential-pool auth).
+             _explicit = (resolved_provider or "").strip().lower()
+-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
++            if _explicit and (_explicit not in {"auto", "openrouter", "custom"}
++                              or (strict and _explicit != "auto")):
+                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
+                     task, _explicit)
+                 if fb_client is None:
+@@ -7322,7 +7333,7 @@ def _resolve_call_client(
+                 effective_provider = resolved_provider
+             # Auto/custom with no credentials: walk the full auto chain (not just OpenRouter).
+             # model=None so each provider uses its own default.
+-            if client is None and not resolved_base_url:
++            if client is None and not resolved_base_url and not strict:
+                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
+                             task or "call", resolved_provider)
+                 client, final_model = _get_cached_client(
+@@ -7830,6 +7841,19 @@ def _aux_recovery_ladder(
+     resp, first_err, kwargs = yield from _ladder_parameter_rungs(first_err, route, kwargs, max_tokens)
+     if first_err is None:
+         return resp
++    if is_configured_only_task(task):
++        # Opt-in strict task: request-shape retries above are same-route; after that only its own
++        # configured fallback_chain may run, never credential/main/discovery rescue.
++        resp = yield from _strict_provider_fallback(first_err, route)
++        if resp is not None:
++            return resp
++        if _is_connection_error(first_err):
++            try:
++                _evict_cached_client_instance(client)
++            except Exception:
++                logger.debug("Auxiliary%s: cache eviction after connection error failed",
++                             tag, exc_info=True)
++        raise first_err
+     client_is_nous = (resolved_provider == "nous"
+                       or base_url_host_matches(base_info, "inference-api.nousresearch.com"))
+     resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous)
+diff --git a/agent/auxiliary_fallback_policy.py b/agent/auxiliary_fallback_policy.py
+new file mode 100644
+index 00000000000..33a3b7259e1
+--- /dev/null
++++ b/agent/auxiliary_fallback_policy.py
+@@ -0,0 +1,121 @@
++"""Trusted fallback policy for plugin-registered auxiliary tasks.
++
++The policy is registration metadata (``PluginContext.register_auxiliary_task``),
++never part of the user-writable ``auxiliary.<task>`` block, so a config edit
++cannot widen a strict task back onto ambient recovery.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Mapping as ABCMapping
++from typing import Any, Iterable, Mapping, Optional
++
++NATIVE = "native"
++CONFIGURED_ONLY = "configured_only"
++
++_ALIASES = {NATIVE: NATIVE, "default": NATIVE, CONFIGURED_ONLY: CONFIGURED_ONLY}
++
++
++class InvalidFallbackPolicyError(ValueError):
++    """Registration metadata carries a policy value the host will not trust."""
++
++
++def normalize_fallback_policy(value: Any) -> Optional[str]:
++    """Canonical policy for a registration value, or ``None`` when invalid."""
++    if isinstance(value, str):
++        return _ALIASES.get(value.strip().lower())
++    return None
++
++
++def fallback_policy_from_entries(task: Any, entries: Iterable[Mapping[str, Any]]) -> str:
++    """Policy stored on the matching registration entry; native when absent, invalid fails closed."""
++    if not task:
++        return NATIVE
++    wanted = str(task)
++    for entry in entries:
++        if entry.get("key") == wanted:
++            raw = entry.get("fallback_policy")
++            if raw is None:
++                return NATIVE
++            policy = normalize_fallback_policy(raw)
++            if policy is None:
++                raise InvalidFallbackPolicyError(
++                    f"Auxiliary task {wanted!r} has invalid registered fallback_policy {raw!r}")
++            return policy
++    return NATIVE
++
++
++def registered_fallback_policy(task: Any) -> str:
++    """Current trusted policy for ``task`` (native for built-ins and unregistered keys).
++
++    A registry read failure propagates: defaulting to native here would silently widen a strict
++    task back onto ambient recovery.
++    """
++    if not task:
++        return NATIVE
++    from hermes_cli.plugins import get_plugin_auxiliary_tasks
++    return fallback_policy_from_entries(task, get_plugin_auxiliary_tasks())
++
++
++def strict_route_validation_error(
++    task_config: Mapping[str, Any], *, provider: Any = None, model: Any = None,
++) -> Optional[str]:
++    """Why a ``configured_only`` task's route may not dispatch, or ``None`` when it is valid.
++
++    The primary pair only has to be string-typed here (its presence/auto rules stay with the
++    existing effective-route guard); every configured fallback entry must name an explicit
++    provider and model, because the legacy entry resolver accepts ``auto``.
++    """
++    for field, value in (("provider", task_config.get("provider")),
++                         ("model", task_config.get("model")),
++                         ("provider", provider), ("model", model)):
++        if value is not None and not isinstance(value, str):
++            return f"{field} must be a string"
++    chain = task_config.get("fallback_chain")
++    if chain is None:
++        return None
++    if not isinstance(chain, list):
++        return "fallback_chain must be a list"
++    for i, entry in enumerate(chain):
++        if not isinstance(entry, ABCMapping):
++            return f"fallback_chain[{i}] must be a mapping"
++        for field in ("provider", "model"):
++            value = entry.get(field)
++            if not isinstance(value, str):
++                return f"fallback_chain[{i}].{field} must be a string"
++            if not value.strip() or value.strip().lower() == "auto":
++                return f"fallback_chain[{i}].{field} must be an explicit provider or model"
++    return None
++
++
++def is_configured_only_task(task: Any) -> bool:
++    return registered_fallback_policy(task) == CONFIGURED_ONLY
++
++
++def missing_configured_route_message(task: Any) -> str:
++    return (f"Auxiliary task {str(task)!r} requires an explicit configured provider and model "
++            f"(fallback_policy='{CONFIGURED_ONLY}')")
++
++
++def configured_only_preflight_error(
++    task: Any, task_config: Mapping[str, Any], *, provider: Any = None,
++    model: Any = None, effective_provider: Any = None,
++    resolved_model: Any = None,
++) -> Optional[str]:
++    """Blocking preflight error for a ``configured_only`` task's route, or ``None``.
++
++    Runs before any client is built so a strict task can never dispatch onto ambient recovery.
++    Native/default and unregistered tasks always pass; the route type/chain checks and the
++    effective provider/model guard stay together so no call site can skip one of them.
++    """
++    if not is_configured_only_task(task):
++        return None
++    route_error = strict_route_validation_error(task_config, provider=provider, model=model)
++    if route_error:
++        return f"{missing_configured_route_message(task)}: {route_error}"
++    eff_provider = str(effective_provider or "").strip()
++    eff_model = str(resolved_model or "").strip()
++    if (eff_provider.lower() in {"", "auto"} or not eff_model
++            or eff_model.lower() == "auto"):
++        return missing_configured_route_message(task)
++    return None
+diff --git a/agent/auxiliary_fallback_recovery.py b/agent/auxiliary_fallback_recovery.py
+index d479845e534..1ff6002a7b9 100644
+--- a/agent/auxiliary_fallback_recovery.py
++++ b/agent/auxiliary_fallback_recovery.py
+@@ -1,12 +1,20 @@
+-"""Parameter-rejection recovery for auxiliary fallback candidates.
++"""Fallback candidate selection and parameter-rejection recovery for auxiliary requests.
+ 
+ The primary auxiliary request runs the full recovery ladder in ``auxiliary_client``; a fallback
+ candidate (per-task chain, main fallback chain, discovery) used to get a single shot, so a fallback
+ model that rejects ``temperature``, ``max_tokens`` or a reasoning field failed the whole task even
+ though the same parameter rungs would have recovered it on the primary path (#78273, #72351).
+ This module runs those rungs — and only those — around a candidate's request.
++
++It also owns the ``configured_only`` strict chain. It reads every facade global late through
++``agent.auxiliary_client`` so the historical patch targets on that module keep working.
+ """
+-from typing import Any, Awaitable, Callable, Dict, Optional
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional
++
++if TYPE_CHECKING:
++    from agent.auxiliary_client import _LadderRoute
+ 
+ 
+ def _parameter_ladder(first_err: Exception, client: Any, kwargs: dict[str, Any], *,
+@@ -48,3 +56,50 @@ async def send_with_parameter_rungs_async(
+     except Exception as first_err:
+         ladder = _parameter_ladder(first_err, client, kwargs, task=task, tag=" (async)")
+         return await _drive_ladder_async(ladder, lambda step: send(*step.args))
++
++
++def strict_provider_fallback(first_err: Exception, route: _LadderRoute):
++    """``configured_only`` recovery: the task's own ``fallback_chain`` only, then STOP.
++
++    No credential refresh, main-model, payment/discovery or main-chat rescue is reachable from
++    here; callers re-raise the primary (narrowed) error once the configured chain is exhausted.
++    """
++    from agent import auxiliary_client as ac
++    from agent.backend_identity import FailureScope
++
++    task, resolved_provider = route.task, route.resolved_provider
++    reason = next((label for predicate, label in ac._FALLBACK_REASONS if predicate(first_err)), None)
++    if reason is None:
++        return None
++    # Mirrors the ambient rung's failed-model scoping: auth/payment are provider-wide, model
++    # failures skip only the deployment that failed.
++    chain_failed_model = None if reason in ("auth error", "payment error") else route.final_model
++    chain_failure_scope = (
++        FailureScope.ENDPOINT
++        if reason == "payment error" and ac._custom_health_base_url(resolved_provider, route.base_info)
++        else None
++    )
++    fb_client, fb_model, fb_label = ac._try_configured_fallback_chain(
++        task, resolved_provider or "auto", reason=reason, failed_model=chain_failed_model,
++        failed_base_url=route.base_info, failure_scope=chain_failure_scope)
++    tried_lanes: set = set()
++    primary_route = dict(route.route_info) if route.route_info is not None else None
++    while fb_client is not None:
++        lane = (fb_label, fb_model, str(getattr(fb_client, "base_url", "") or ""))
++        if lane in tried_lanes:
++            break
++        tried_lanes.add(lane)
++        ac._record_route_info(route.route_info, ac._fallback_provider_from_label(fb_label), fb_model)
++        fb_resp = yield ac._LadderStep("fallback", (fb_client, fb_model, fb_label))
++        if fb_resp is not None:
++            return fb_resp
++        fb_client, fb_model, fb_label = ac._next_fallback_after_quarantine(
++            task, resolved_provider, False, route, chain_failed_model, chain_failure_scope,
++            task_chain_only=True)
++    if primary_route is not None and route.route_info is not None:
++        route.route_info.update(primary_route)
++    ac.logger.warning("Auxiliary %s%s: %s on %s and its configured fallback_chain is exhausted "
++                      "(configured_only). Raising the primary error.",
++                      task or "call", route.tag, reason, resolved_provider)
++    return None
++
+diff --git a/hermes_cli/cron.py b/hermes_cli/cron.py
+index df4678041fa..91698179d51 100644
+--- a/hermes_cli/cron.py
++++ b/hermes_cli/cron.py
+@@ -238,14 +238,29 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
+     monitor_source = job.get("monitor_script") or job.get("monitor_url")
+     mon_state = job.get("monitor_state") or {}
+     latest_execution = job.get("latest_execution") or {}
++    # Emit the real stored prompt only when it is a single-line value: that is
++    # exactly what the text reader can represent without rewriting the value.
++    # A multi-line prompt stays unavailable rather than being collapsed and
++    # presented as if it were the stored text.
++    prompt = job.get("prompt")
++    prompt_row = (prompt if isinstance(prompt, str)
++                  and "\n" not in prompt and "\r" not in prompt else "")
++    context_from = job.get("context_from") or []
++    if isinstance(context_from, str):
++        context_entries = [context_from.strip()] if context_from.strip() else []
++    else:
++        context_entries = [str(entry).strip() for entry in context_from
++                           if str(entry).strip()]
+     optional = [
+         ("Skills", ", ".join(skills) if skills else ""),
+         ("Script", job.get("script")),
+         ("Monitor", f"{monitor_source} (agent runs only on output change)" if monitor_source
+          else ""),
+         ("Changed", mon_state.get("last_changed_at") if monitor_source else ""),
+-        ("Mode", color("no-agent", Colors.DIM) + " (script stdout delivered directly)"
+-         if job.get("no_agent") else ""),
++        ("Mode", (color("no-agent", Colors.DIM) + " (script stdout delivered directly)")
++         if job.get("no_agent") else "agent (normal agent turn)"),
++        ("Prompt", prompt_row),
++        ("Context from", ", ".join(context_entries)),
+         ("Timezone", job.get("timezone")),
+         ("Grace", f"{job['grace_minutes']} min" if job.get("grace_minutes") is not None else ""),
+         ("Workdir", job.get("workdir")),
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index eda71a0ee43..21351f58025 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -39,6 +39,7 @@ from hermes_cli.plugins_manifest import (
+     manifest_key, parse_manifest_file, resolve_module_origin, resolve_plugin_load_order,
+     validate_config_schema,
+ )
++from hermes_cli.plugins_aux_tasks import build_auxiliary_task_entry, get_plugin_auxiliary_tasks
+ from hermes_cli.plugins_discovery import (
+     ENTRY_POINTS_GROUP, _get_disabled_plugins, _get_enabled_plugins, collect_directory_manifests,
+     discover_entrypoint_manifests, gate_manifest, plugin_discovery_suppressed, resolve_manifest_winners,
+@@ -856,6 +857,7 @@ class PluginContext(PluginCapabilityCtxMixin):
+         self, key: str, *, display_name: str, description: str,
+         defaults: Optional[dict[str, Any]] = None,
+         inherit_from: Optional[str] = None,
++        fallback_policy: Optional[str] = None,
+     ) -> PluginRegistration:
+         """Register an auxiliary LLM task with its own ``auxiliary.<key>`` config block (picker entry,
+         ``AUXILIARY_<KEY>_*`` env bridge, defaults merged into loaded configs). ``defaults`` may
+@@ -865,12 +867,16 @@ class PluginContext(PluginCapabilityCtxMixin):
+         the base's current config instead of snapshotting it (precedence: inherited base, then
+         ``defaults``, then user config in ``auxiliary.<key>``). An unknown or self-referential
+         ``inherit_from`` logs a warning and registers the task without inheritance.
+-        Raises ``ValueError`` for an empty/invalid key, a built-in key, or another plugin's key."""
+-        from hermes_cli.plugins_aux_tasks import build_auxiliary_task_entry
++        ``fallback_policy`` is trusted registration metadata: ``native``/``default`` (the default)
++        keep the existing ambient recovery; ``configured_only`` requires an explicit configured
++        provider/model and may recover only through this task's own ``fallback_chain``.
++        Raises ``ValueError`` for an empty/invalid key, a built-in key, another plugin's key, or an
++        unknown ``fallback_policy``."""
+         existing = self._manager._aux_tasks.get(key)
+         entry = build_auxiliary_task_entry(
+             self.manifest.name, self.plugin_id, key, display_name=display_name, description=description,
+-            defaults=defaults, inherit_from=inherit_from, registered=self._manager._aux_tasks)
++            defaults=defaults, inherit_from=inherit_from, fallback_policy=fallback_policy,
++            registered=self._manager._aux_tasks)
+         return self._register_entry("auxiliary_task", key, self._manager._aux_tasks, entry,
+                                     "Plugin %s registered auxiliary task: %s (%s)", key, display_name,
+                                     previous=existing)
+@@ -2127,12 +2133,6 @@ def get_plugin_commands() -> dict[str, dict]:
+     return _ensure_plugins_discovered()._plugin_commands
+ 
+ 
+-def get_plugin_auxiliary_tasks() -> list[dict[str, Any]]:
+-    """Plugin auxiliary-task registration dicts sorted by ``key`` (after idempotent discovery)."""
+-    manager = _ensure_plugins_discovered()
+-    return [manager._aux_tasks[k] for k in sorted(manager._aux_tasks)]
+-
+-
+ def get_plugin_toolsets() -> list[tuple]:
+     """Plugin toolsets as ``(key, label, description)`` tuples for the ``hermes tools`` TUI."""
+     manager = get_plugin_manager()
+diff --git a/hermes_cli/plugins_aux_tasks.py b/hermes_cli/plugins_aux_tasks.py
+index 1bf2dbe93f7..cae7a003150 100644
+--- a/hermes_cli/plugins_aux_tasks.py
++++ b/hermes_cli/plugins_aux_tasks.py
+@@ -8,16 +8,31 @@ from typing import Any, Dict, Optional
+ logger = logging.getLogger("hermes_cli.plugins")
+ 
+ 
++def get_plugin_auxiliary_tasks() -> list[dict[str, Any]]:
++    """Plugin auxiliary-task registration dicts sorted by ``key`` (after idempotent discovery)."""
++    from hermes_cli.plugins import _ensure_plugins_discovered
++    manager = _ensure_plugins_discovered()
++    return [manager._aux_tasks[k] for k in sorted(manager._aux_tasks)]
++
++
+ def build_auxiliary_task_entry(
+     me: str, owner_id: str, key: str, *, display_name: str, description: str,
+-    defaults: Optional[dict[str, Any]], inherit_from: Optional[str], registered: dict[str, dict[str, Any]],
++    defaults: Optional[dict[str, Any]], inherit_from: Optional[str],
++    fallback_policy: Optional[str] = None, registered: dict[str, dict[str, Any]],
+ ) -> dict[str, Any]:
+-    """Registry entry for a plugin auxiliary task, or ``ValueError`` for a bad key.
++    """Registry entry for a plugin auxiliary task, or ``ValueError`` for a bad key/policy.
+ 
+     ``me`` is the manifest name (for messages); ``owner_id`` is the canonical id ``ctx.llm`` is
+     bound to, so agent/plugin_llm.py can match it. ``registered`` is the manager's current
+-    ``_aux_tasks`` (re-registration by the same owner is allowed).
++    ``_aux_tasks`` (re-registration by the same owner is allowed). ``fallback_policy`` is trusted
++    registration metadata (never user config): ``native``/``default`` keep ambient recovery,
++    ``configured_only`` restricts recovery to the task's own configured fallback chain.
+     """
++    from agent.auxiliary_fallback_policy import normalize_fallback_policy
++    policy = "native" if fallback_policy is None else normalize_fallback_policy(fallback_policy)
++    if policy is None:
++        raise ValueError(f"Plugin '{me}' auxiliary task {key!r} has invalid fallback_policy "
++                         f"{fallback_policy!r} (expected 'native', 'default' or 'configured_only')")
+     if not key or not isinstance(key, str):
+         raise ValueError(f"Plugin '{me}' tried to register auxiliary task with invalid key {key!r}")
+     if not all(c.isalnum() or c == "_" for c in key):
+@@ -49,6 +64,7 @@ def build_auxiliary_task_entry(
+         "key": key, "display_name": display_name, "description": description,
+         "defaults": task_defaults,
+         "inherit_from": inherit_from,
++        "fallback_policy": policy,
+         "plugin": owner_id, "plugin_key": owner_id,
+     }
+     return entry

@@ -468,7 +468,12 @@ class HostFormSchemaTests(unittest.TestCase):
         self.assertTrue(fields)
         by_key = {field["key"]: field for field in fields}
         self.assertEqual(set(by_key), set(uc.NATIVE_FLAT_FIELDS) | {
-            "primary_provider", "primary_model", "fallback_provider", "fallback_model"})
+            "primary_provider", "primary_model", "fallback_provider", "fallback_model",
+            "portal_reasoning_effort"})
+        import yaml
+        spec = yaml.safe_load((ROOT / "plugin.yaml").read_text(
+            encoding="utf-8"))["config_schema"]["portal_reasoning_effort"]
+        self.assertEqual((spec["type"], spec["default"]), ("str", ""))
         for field in fields:
             self.assertTrue(field["label"], field["key"])
             self.assertTrue(field["description"], field["key"])

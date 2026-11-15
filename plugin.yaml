@@ -1,16 +1,16 @@
 name: hermes-proactive-secretary
-version: 0.6.2
+version: 1.0.0
 kind: standalone
 platforms:
   - linux
   - macos
 description: >-
-  Proactive secretary for your own authorised mail, calendar and tasks plus
-  public sources: read-only collectors, a zero-tool evaluator, bounded
-  notification gates, an explicit requested-reminder registry, and one-command
-  native-cron setup. One command installs and verifies the two default native jobs; an
-  explicit opt-in adds one preparation script job; one command truthfully
-  disables only owned jobs.
+  Proactive ordinary-profile Hermes sessions that investigate, prepare useful
+  work and notify through bounded notification gates using your existing
+  tools, memory and permissions, with optional public-source collection and
+  requested reminders. One command installs and verifies the two default native
+  jobs; an explicit opt-in adds one preparation script job; one command
+  truthfully disables only owned jobs.
 author: Hermes Plugin Community
 license: MIT
 tags:
@@ -27,6 +27,7 @@ provides_tools:
   - secretary_onboarding
   - secretary_context
   - secretary_responsibility
+  - secretary_propose_notice
 provides_hooks:
   - pre_llm_call
 
@@ -55,13 +56,17 @@ config_schema:
       explicit canary; entering a target here does not verify it.
     default: ""
   daily_normal_cap:
-    type: int
-    title: Most ordinary messages per day
+    type: str
+    title: Most ordinary messages per day (optional)
     description: >-
-      A daily ceiling, never a target. Use 0 to stop ordinary discretionary
-      messages. Important reminders you asked for are still tracked separately.
-    default: 5
-    minimum: 0
+      An optional ceiling on ordinary messages per local day, never a target.
+      Leave blank for no deterministic daily count limit: the secretary still
+      stays restrained and useful rather than aiming at a number. Enter a whole
+      number to set an explicit ceiling; 0 stops ordinary discretionary
+      messages. Negative, fractional or non-numeric values are rejected. Urgent
+      evidence and reminders you explicitly asked for keep their existing
+      exceptions, so this is not a total-all-messages cap.
+    default: ""
   quiet_start_hour:
     type: int
     title: Quiet hours begin (local hour)
@@ -251,14 +256,28 @@ config_schema:
     description: >-
       The provider for the secretary's own small task. Set both provider and
       model, or leave both empty to inherit the active chat model at first.
-      An explicit native auxiliary pin always wins and is never changed here.
+      The monitoring auxiliary route uses its existing routing rules. A native
+      portal job snapshots the selected pair only when you explicitly enable or
+      refresh it. An explicit native auxiliary pin always wins and is never
+      changed here.
     default: ""
   primary_model:
     type: str
     title: Secretary model name (optional)
     description: >-
       The model name paired with the provider above. Both fields must be set
-      together or both left empty.
+      together or both left empty. The monitoring auxiliary route uses its
+      existing routing rules; a native portal job snapshots the selected pair
+      only when you explicitly enable or refresh it.
+    default: ""
+  portal_reasoning_effort:
+    type: str
+    title: Background reasoning effort (optional)
+    description: >-
+      Reasoning effort for the native portal snapshot when you explicitly
+      enable or refresh it; blank inherits the native effort. Accepted native
+      levels: none, minimal, low, medium, high, xhigh, max, ultra. This does not
+      change the monitoring auxiliary route.
     default: ""
   fallback_provider:
     type: str
@@ -266,12 +285,15 @@ config_schema:
     description: >-
       One configured backup provider to try if the primary route fails. Set
       both backup provider and model, or leave both empty. There is no
-      escalation to the main/global model after this route fails.
+      escalation to the main/global model after this route fails. This backup
+      pair applies to the monitoring auxiliary route only; a pinned native
+      portal cron job does not inherit it.
     default: ""
   fallback_model:
     type: str
     title: Backup model name (optional)
     description: >-
       The model name paired with the backup provider. Both backup fields must
-      be set together or both left empty.
+      be set together or both left empty. This backup pair is auxiliary-only
+      and is not inherited by a pinned native portal cron job.
     default: ""

@@ -7,6 +7,7 @@ source, the network, or the scheduler at import time.
 Commands
     setup      one-command, idempotent, verified setup
     status     enabled/disabled, job state, last run, coverage, counts
+    portal     manage the proactive secretary portal job
     pause      global pause (stops collection AND delivery)
     resume     clear the global pause
     disable    pause + remove this plugin's own cron jobs
@@ -36,6 +37,7 @@ from typing import Any
 from . import cron as cron_mod
 from . import paths
 from . import runner_install
+from . import secretary_portal_controls as portal_controls
 from . import secretary_status
 from . import state_import
 
@@ -84,8 +86,10 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p = {name: subs.add_parser(name, parents=[common], help=help_)
          for name, help_ in (
              ("setup", "One-command setup: policy, state, native cron jobs, verification"),
-             ("status", "Show enabled state, jobs, last run, coverage and counts"),
-             ("pause", "Global pause: stop collection and delivery"),
+              ("status", "Show enabled state, jobs, last run, coverage and counts"),
+              ("portal", "Manage the proactive secretary portal job "
+                         "(preview | enable | status | pause | resume | remove)"),
+              ("pause", "Global pause: stop collection and delivery"),
              ("resume", "Clear the global pause"),
              ("disable", "Pause and remove this plugin's own cron jobs"),
              ("uninstall", "Alias of disable (runtime data is preserved)"),
@@ -102,6 +106,21 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
              ("reminders", "Requested reminders (dispatch | check | list | status | add | cancel)"),
              ("doctor", "Check the environment and wiring"),
           )}
+    portal = p["portal"]
+    portal.add_argument(
+        "portal_action",
+        choices=("preview", "enable", "status", "pause", "resume", "remove"),
+        help="portal lifecycle action",
+    )
+    portal.add_argument("--schedule", default="",
+                        help="native schedule for enable (default: service validation)")
+    portal.add_argument("--model", default="")
+    portal.add_argument("--provider", default="")
+    portal.add_argument("--reasoning-effort", default="", dest="reasoning_effort")
+    portal.add_argument("--skill", action="append", default=[],
+                        help="native skill pin (repeatable)")
+    portal.add_argument("--deliver", default="local")
+    portal.add_argument("--workdir", default="")
     p["setup"].add_argument("--force", action="store_true",
                             help="overwrite an existing policy file (default: keep it)")
     p["setup"].add_argument("--no-cron", action="store_true",
@@ -1251,8 +1270,24 @@ def pause_command(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         _emit({"ok": False, "error": str(exc)}, as_json=as_json, human=f"pause failed: {exc}")
         return 1
-    _emit({"ok": True, "paused": True}, as_json=as_json,
-          human="Proactive Secretary paused: collection and delivery are stopped.")
+    try:
+        portal = portal_controls.pause_portal(
+            _backend, paths.job_ownership_path())
+    except Exception as exc:  # noqa: BLE001 - deterministic pause is already saved
+        portal = {"ok": False, "portal": "error", "error": str(exc)}
+    if not portal.get("ok"):
+        detail = portal.get("detail") or portal.get("error") or "portal pause failed"
+        _emit({"ok": False, "paused": True, "portal": portal,
+               "error": "collection and delivery are paused, but the owned portal "
+                        f"job was not confirmed stopped: {detail}"},
+              as_json=as_json,
+              human=("Proactive Secretary paused for collection and delivery, but the "
+                     f"owned portal job was NOT confirmed stopped: {detail}"))
+        return 1
+    _emit({"ok": True, "paused": True, "portal": portal}, as_json=as_json,
+          human=("Proactive Secretary paused: collection and delivery are stopped"
+                 + ("" if portal.get("portal") == "not-opted-in"
+                    else f"; portal job {portal.get('portal')}")))
     return 0
 
 
@@ -1263,11 +1298,25 @@ def resume_command(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         _emit({"ok": False, "error": str(exc)}, as_json=as_json, human=f"resume failed: {exc}")
         return 1
+    try:
+        portal = portal_controls.resume_portal(
+            _backend, paths.job_ownership_path())
+    except Exception as exc:  # noqa: BLE001 - deterministic pause is already cleared
+        portal = {"ok": False, "portal": "error", "error": str(exc)}
+    if not portal.get("ok"):
+        detail = portal.get("detail") or portal.get("error") or "portal resume failed"
+        _emit({"ok": False, "paused": False, "portal": portal,
+               "error": "collection and delivery are resumed, but the owned portal "
+                        f"job was not confirmed resumed: {detail}"},
+              as_json=as_json,
+              human=("Global pause cleared for collection and delivery, but the owned "
+                     f"portal job was NOT confirmed resumed: {detail}"))
+        return 1
     jobs = _job_states()
     owned = [str(j.get("name") or "") for j in jobs.get("owned") or [] if isinstance(j, dict)]
     ready = ("no longer paused; jobs recorded: " + (", ".join(owned) if owned else "none")
              + "; delivery is still unverified until an explicit native canary")
-    _emit({"ok": True, "paused": False, "jobs": owned,
+    _emit({"ok": True, "paused": False, "portal": portal, "jobs": owned,
            "readiness": "not-paused" if owned else "no-owned-jobs",
            "delivery": "unverified"},
           as_json=as_json,
@@ -1324,8 +1373,10 @@ def _remove_own_jobs() -> list[dict[str, Any]]:
     if not backend.is_available():
         raise cron_mod.CronError("the Hermes cron surface is unavailable; cannot remove jobs")
     ownership = cron_mod.load_job_ownership(paths.job_ownership_path())
-    for name in (OWNED_JOB_NAMES + cron_mod.OPTIONAL_JOB_NAMES
-                 + cron_mod.LEGACY_OWNED_JOB_NAMES):
+    names = OWNED_JOB_NAMES + cron_mod.OPTIONAL_JOB_NAMES + cron_mod.LEGACY_OWNED_JOB_NAMES
+    if cron_mod.owned_job_record(ownership, cron_mod.PORTAL_JOB_NAME) is not None:
+        names += (cron_mod.PORTAL_JOB_NAME,)
+    for name in names:
         res = cron_mod.remove_job(
             backend, name,
             ownership=ownership, ownership_path=paths.job_ownership_path(),
@@ -1983,9 +2034,21 @@ def configure_command(args: argparse.Namespace) -> int:
 # dispatch
 # --------------------------------------------------------------------------- #
 
+def portal_command(args: argparse.Namespace, *, backend: Any = None) -> int:
+    """Lazy glue: the portal service owns actions, backend and JSON output."""
+    from . import secretary_portal as _portal
+
+    return _portal.portal_command(
+        args,
+        backend=_backend() if backend is None else backend,
+        native_ctx=get_native_context(),
+    )
+
+
 _DISPATCH = {
     "setup": setup_command,
     "status": status_command,
+    "portal": portal_command,
     "pause": pause_command,
     "resume": resume_command,
     "disable": disable_command,
@@ -2009,7 +2072,7 @@ def secretary_command(args: argparse.Namespace) -> int:
     _data_override(args)
     sub = getattr(args, "secretary_command", None)
     if not sub:
-        print("usage: hermes secretary {setup,status,pause,resume,disable,uninstall,"
+        print("usage: hermes secretary {setup,status,portal,pause,resume,disable,uninstall,"
               "migrate-jobs,self-test,run-once,prepare,responsibilities,watch,feedback,"
               "configure,doctor}")
         return 2

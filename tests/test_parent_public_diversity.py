@@ -395,7 +395,7 @@ def test_cadence_retention_quiet_pause_caps_unchanged():
     assert policy["feed_cadence_minutes"] == 60
     assert policy["max_public_registry"] == 12
     assert policy["public_findings_retention_days"] == 30
-    assert policy["daily_normal_cap"] == 5
+    assert policy["daily_normal_cap"] is None
     assert policy["cooldown_minutes"] == 30
     assert policy["quiet_end_hour"] == 8
     assert policy["generic_websites_opt_in"] is False

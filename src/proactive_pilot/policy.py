@@ -26,9 +26,11 @@ DEFAULT_POLICY: dict[str, Any] = {
     "context_refresh": False,
     "quiet_start_hour": 0,
     "quiet_end_hour": 8,
-    # A ceiling, never a target. Zero suppresses ordinary discretionary
-    # interruptions only; requested reminders and urgent evidence remain.
-    "daily_normal_cap": 5,
+    # Optional ceiling, never a target. ``None`` means no deterministic daily
+    # message-count ceiling (not a hidden five). An explicit 0 suppresses
+    # ordinary discretionary interruptions only; requested reminders and urgent
+    # evidence remain. This is an ordinary-message cap, never a total cap.
+    "daily_normal_cap": None,
     "cooldown_minutes": 30,
     "urgent_max_minutes": 60,
     "calendar_horizon_hours": 48,
@@ -346,6 +348,44 @@ def localize(now: datetime, policy: dict[str, Any]) -> datetime:
 
 def local_day(now: datetime, policy: dict[str, Any]) -> str:
     return localize(now, policy).date().isoformat()
+
+
+def daily_normal_cap(policy: dict[str, Any]) -> int | None:
+    """Return the explicit ordinary-message ceiling, or ``None`` when unset.
+
+    Unset (``None``/blank) means no deterministic daily-count ceiling; it is
+    never coerced to ``0`` or restored to a hidden five. Explicit nonnegative
+    integers (including ``0``) keep their existing meaning. Invalid values
+    (booleans, negatives, fractions, non-numeric text) raise ``ValueError``
+    instead of silently disabling the ceiling. This bounds ordinary
+    discretionary messages only -- urgent evidence and user-requested reminders
+    keep their existing exceptions.
+    """
+    raw = policy.get("daily_normal_cap")
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise ValueError(
+            "daily_normal_cap must be a nonnegative integer or blank, "
+            f"not boolean {raw!r}")
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        if not text.isdigit():
+            raise ValueError(
+                "daily_normal_cap must be a nonnegative integer or blank, "
+                f"not {raw!r}")
+        return int(text)
+    if isinstance(raw, int):
+        if raw < 0:
+            raise ValueError(
+                "daily_normal_cap must be a nonnegative integer or blank, "
+                f"not {raw!r}")
+        return raw
+    raise ValueError(
+        "daily_normal_cap must be a nonnegative integer or blank, "
+        f"not {raw!r}")
 
 
 def stored_local_day(value: Any, policy: dict[str, Any], now: datetime) -> str:

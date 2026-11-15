@@ -89,6 +89,8 @@ def test_dedupe_second_suppressed():
 
 def test_hard_cap():
     policy = _policy()
+    # Exercise the real ceiling explicitly; the default is now unset.
+    policy["daily_normal_cap"] = 5
     clock = SeededClock("2026-10-02T12:00:00")
     results = fixture_results("changed_event", clock)
     packet = build_packet(results, clock=clock, policy=policy, baseline={})

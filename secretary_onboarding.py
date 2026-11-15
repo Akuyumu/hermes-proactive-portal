@@ -22,7 +22,9 @@ from . import secretary_consent as consent
 
 STATE_KEY = "onboarding_state"
 SCHEMA = 1
-DEFAULT_ALLOWANCE = 5
+# Canonical unset: no deterministic daily-count ceiling. It is never a hidden
+# five-message quota and is never rendered as 0.
+DEFAULT_ALLOWANCE = None
 STEP_ORDER = ("basics", "destination", "allowance", "quiet", "autonomy",
               "preparation", "permissions", "review", "complete")
 GRANT_KEYS = ("memory", "mail", "calendar", "tasks", "public_sources", "discretionary")
@@ -132,6 +134,35 @@ def _require_int(value: Any, name: str, low: int, high: int | None) -> int:
     return value
 
 
+def _optional_allowance(value: Any) -> int | None:
+    """Validate the optional daily allowance with the canonical owner.
+
+    Blank/``None`` means unset; explicit nonnegative integers (including 0) are
+    preserved. Booleans, negatives, fractions and other non-numeric values are
+    refused rather than guessed.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    import sys
+    from pathlib import Path
+    src = str(Path(__file__).resolve().parent / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from proactive_pilot.userconfig import validate_config
+    try:
+        probe = validate_config({
+            "schema": 1,
+            "version": 1,
+            "notification": {"daily_normal_cap": value},
+        })
+    except Exception as exc:  # noqa: BLE001 - report one bounded validation error
+        raise OnboardingError(
+            "daily_allowance must be a nonnegative integer or blank") from exc
+    return probe["notification"]["daily_normal_cap"]
+
+
 def _safe_string_list(value: Any, name: str, pattern: re.Pattern[str]) -> list[str]:
     if value is None:
         return []
@@ -182,8 +213,7 @@ def validate_settings(patch: Any) -> dict[str, Any]:
             raise OnboardingError("persona must be a bounded non-empty string")
         out["persona"] = value.strip()[:64]
     if "daily_allowance" in patch:
-        out["daily_allowance"] = _require_int(
-            patch["daily_allowance"], "daily_allowance", 0, None)
+        out["daily_allowance"] = _optional_allowance(patch["daily_allowance"])
     for key in ("quiet_start_hour", "quiet_end_hour"):
         if key in patch:
             out[key] = _require_int(patch[key], key, 0, 23)
@@ -486,11 +516,22 @@ class OnboardingService:
                 ("setting:daily_allowance", "daily_normal_cap", "daily_allowance"),
                 ("setting:quiet_start_hour", "quiet_start_hour", "quiet_start_hour"),
                 ("setting:quiet_end_hour", "quiet_end_hour", "quiet_end_hour")):
-            if notif.get(field) is not None and f"notification.{field}" in known:
-                current = state["settings"].get(key)
-                if _safe_to_refresh(marker, "settings", key, current):
-                    state["settings"][key] = int(notif[field])
-                    decided.add(marker)
+            if f"notification.{field}" not in known:
+                continue
+            current = state["settings"].get(key)
+            if not _safe_to_refresh(marker, "settings", key, current):
+                continue
+            if key == "daily_allowance":
+                # Omission is not a decision (the field is not in ``known``);
+                # an explicit present blank clears, and an explicit existing
+                # integer is adopted as-is.
+                value = notif.get(field)
+                state["settings"][key] = value if type(value) is int else None
+            else:
+                if notif.get(field) is None:
+                    continue
+                state["settings"][key] = int(notif[field])
+            decided.add(marker)
 
         sources = config.get("sources") or {}
         # Onboarding's public grant is the typed public-feeds switch. The two

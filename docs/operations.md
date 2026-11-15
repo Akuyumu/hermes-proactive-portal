@@ -1,9 +1,11 @@
 # Operations guide
 
-Detailed setup, configuration, controls and troubleshooting for the Hermes
-proactive secretary. For the product overview, features and quick install, see
-the [README](../README.md). For per-version change history and qualification
-totals, see [GitHub Releases](https://github.com/Akuyumu/hermes-proactive-secretary/releases).
+Detailed setup, configuration, controls and troubleshooting for Hermes
+Proactive Portal. For the product overview, features and quick install, see
+the [README](../README.md). For step-by-step human setup and upgrades, see
+[Installation](INSTALLATION.md). For per-version change history and
+qualification totals, see
+[GitHub Releases](https://github.com/Akuyumu/hermes-proactive-portal/releases).
 
 ## First run: prepare, preview, consent
 
@@ -31,19 +33,20 @@ The unified package ships a custom Settings ▸ Plugins page (`desktop/plugin.js
 
 The custom page and backend appear only after the package is installed in the active profile’s `plugins/` root, `hermes-proactive-secretary` is added to `plugins.enabled`, the desktop half is enabled in Capabilities ▸ Plugins, and the gateway is restarted (backend routes mount at startup). Reload or rescan desktop plugins so the app copies and loads the `desktop/` half. These are host/app activation steps and are not performed by packaging.
 
-### Missing “Proactive Secretary” button
+### Missing the Proactive Portal settings page
 
 Install and enable the backend with the native command:
 
 ```bash
-hermes plugins install Akuyumu/hermes-proactive-secretary --enable
+hermes plugins install Akuyumu/hermes-proactive-portal --no-enable
+hermes plugins enable hermes-proactive-secretary
 hermes secretary doctor
 ```
 
 For the Desktop component, use **Capabilities → Plugins → Install from Git** or the documented unified link:
 
 ```text
-hermes://plugin/install?repo=Akuyumu/hermes-proactive-secretary&enable=1
+hermes://plugin/install?repo=Akuyumu/hermes-proactive-portal&enable=1
 ```
 
 Current Hermes documentation describes one confirmation dialog that detects both components and lets the user choose them. Older Desktop builds can differ; use the controls your installed version exposes rather than assume a component checkbox exists. A private-repository download requires Git access on the machine doing the download; backend access alone does not prove client access. Do not use internal marker files, bypass scanners or weaken checks. See the [official installation and Desktop-link guide](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins#one-click-install-links-desktop).
@@ -242,7 +245,7 @@ Maintainer commands from the source tree, using a Python environment with the He
 PYTHONPATH=src python3 -m unittest discover -s tests
 PYTHONPATH=src python3 -m proactive_pilot.selftest
 python3 release_export.py scan
-python3 release_export.py build --output ./dist/hermes-proactive-secretary-0.6.2.tar.gz
+python3 release_export.py build --output ./dist/hermes-proactive-portal-1.0.0.tar.gz
 python3 release_export.py doctor --installed /path/to/extracted-package
 ```
 
@@ -251,7 +254,7 @@ python3 release_export.py doctor --installed /path/to/extracted-package
 ## Qualification and limitations
 
 Qualification results are recorded per version in
-[GitHub Releases](https://github.com/Akuyumu/hermes-proactive-secretary/releases).
+[GitHub Releases](https://github.com/Akuyumu/hermes-proactive-portal/releases).
 They do not establish that a particular user's sources have useful live
 alternatives or that a physical device received a notification. Real connector
 access, model calls, messaging delivery and Desktop/device interaction require

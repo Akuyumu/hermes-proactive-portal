@@ -365,13 +365,16 @@ class SetupActions:
         try:
             loaded = self._load_effective()
             config = loaded.config
+            daily_cap = (config.get("notification") or {}).get("daily_normal_cap")
             result["config"] = {
                 "present": bool(loaded.present),
                 "source": str(loaded.source),
                 "error": "",
                 "timezone": str(config.get("timezone") or "")[:64],
                 "delivery_configured": bool((config.get("notification") or {}).get("destination")),
-                "daily_normal_cap": int((config.get("notification") or {}).get("daily_normal_cap") or 0),
+                # An unset optional cap is reported honestly as null; an
+                # explicit 0 or saved integer is never replaced by a hidden 0.
+                "daily_normal_cap": daily_cap if type(daily_cap) is int else None,
                 "quiet_start_hour": int((config.get("notification") or {}).get("quiet_start_hour") or 0),
                 "quiet_end_hour": int((config.get("notification") or {}).get("quiet_end_hour") or 0),
             }
@@ -492,6 +495,24 @@ class SetupActions:
                     raise SetupActionError("invalid_setting", f"{key} must be true or false.")
                 clean[key] = value
             elif key in int_keys:
+                if key == "daily_normal_cap":
+                    # The optional cap is the one numeric control with an
+                    # unset state. Delegate normalisation (blank -> None,
+                    # digit text -> int, explicit 0 kept, bad values refused)
+                    # to the canonical configuration validator.
+                    try:
+                        probe = userconfig.validate_config({
+                            "schema": userconfig.CONFIG_SCHEMA,
+                            "version": userconfig.CONFIG_VERSION,
+                            "notification": {"daily_normal_cap": value},
+                        })
+                    except userconfig.ConfigError as exc:
+                        raise SetupActionError(
+                            "invalid_setting",
+                            "daily_normal_cap must be a nonnegative whole number or blank.",
+                        ) from exc
+                    clean[key] = probe["notification"]["daily_normal_cap"]
+                    continue
                 if type(value) is not int:
                     raise SetupActionError("invalid_setting", f"{key} must be a whole number.")
                 clean[key] = value
@@ -560,8 +581,17 @@ class SetupActions:
         except Exception as exc:  # noqa: BLE001 - keep the validator's message bounded
             raise SetupActionError("invalid_setting", str(exc)[:300], status_code=400) from exc
         after = userconfig.native_flat_values(validated)
-        changed = {key: value for key, value in patch.items()
-                   if type(before.get(key)) is not type(value) or before.get(key) != value}
+        changed: dict[str, Any] = {}
+        for key, value in patch.items():
+            if key == "daily_normal_cap":
+                # Compare the canonical form values: an explicit blank against
+                # an already-unset cap is a true no-op, not a write.
+                if (type(before.get(key)) is not type(after.get(key))
+                        or before.get(key) != after.get(key)):
+                    changed[key] = after.get(key)
+                continue
+            if type(before.get(key)) is not type(value) or before.get(key) != value:
+                changed[key] = value
         expanding = self._expanding_keys(before, after) if changed else []
         return loaded, before, after, validated, changed, expanding
 
